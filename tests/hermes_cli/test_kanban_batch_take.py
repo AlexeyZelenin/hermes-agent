@@ -62,3 +62,12 @@ def test_batch_take_does_not_change_cards_when_planner_output_is_bad(kanban_home
     with kb.connect() as conn:
         assert kb.get_task(conn, task_id).status == "ready"
         assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
+
+
+def test_incomplete_parents_ignores_archived_historical_link(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="trashed parent")
+        assert kb.archive_task(conn, parent) is True
+        child = kb.create_task(conn, title="child", parents=[parent])
+
+        assert batch._incomplete_parents(conn, child) is False

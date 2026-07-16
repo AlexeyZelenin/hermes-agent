@@ -511,6 +511,27 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     assert child_after["status"] == "ready"
 
 
+def test_patch_ready_ignores_archived_historical_parent(client):
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "archived"}
+    ).status_code == 200
+    child = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "c", "parents": [parent["id"]]}
+    ).json()["task"]
+    assert child["status"] == "ready"
+
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}", json={"status": "todo"}
+    ).status_code == 200
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}", json={"status": "ready"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task"]["status"] == "ready"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 
