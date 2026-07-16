@@ -35,6 +35,11 @@ from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.project_vault import (
+    DecisionRegistryError,
+    DecisionValidationError,
+    record_task_decision,
+)
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -587,6 +592,15 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    decision = args.get("decision")
+    if decision is not None and isinstance(decision, dict):
+        # Decision prose is durable project knowledge, so apply the same
+        # secret redaction as the completion handoff before it reaches disk.
+        decision_json = redact_sensitive_text(json.dumps(decision), force=True)
+        try:
+            decision = json.loads(decision_json)
+        except json.JSONDecodeError:
+            return tool_error("decision could not be normalized safely")
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -622,6 +636,41 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"or (2) create continuation tasks with parents=[{tid}] "
                         f"and keep this task alive."
                     )
+
+            if decision is not None:
+                if not isinstance(decision, dict):
+                    return tool_error("decision must be an object with summary and rationale")
+                if not task or not task.project_id:
+                    return tool_error(
+                        "decision recording requires a project-linked task; "
+                        "create the task with project=<project slug> so Hermes can "
+                        "locate its Git-backed knowledge/decisions.md registry"
+                    )
+                try:
+                    from hermes_cli import projects_db as pdb
+                    with pdb.connect_closing() as project_conn:
+                        project = pdb.get_project(project_conn, task.project_id)
+                    if project is None or not project.primary_path:
+                        return tool_error(
+                            "decision recording requires the linked project to have "
+                            "a primary repository folder"
+                        )
+                    registry_path = record_task_decision(
+                        project_root=project.primary_path,
+                        board=board or os.environ.get("HERMES_KANBAN_BOARD") or kb.get_current_board(),
+                        task_id=tid,
+                        decision=decision,
+                    )
+                except (DecisionValidationError, DecisionRegistryError) as exc:
+                    return tool_error(f"decision recording failed: {exc}")
+                except Exception as exc:
+                    logger.exception("decision registry write failed")
+                    return tool_error(f"decision recording failed: {exc}")
+                if metadata is None:
+                    metadata = {}
+                else:
+                    metadata = dict(metadata)
+                metadata["decision_registry"] = str(registry_path)
 
             try:
                 ok = kb.complete_task(
@@ -1243,6 +1292,22 @@ KANBAN_COMPLETE_SCHEMA = {
                     "\"findings\": [...]}. Surfaced to downstream "
                     "workers alongside ``summary``."
                 ),
+            },
+            "decision": {
+                "type": "object",
+                "description": (
+                    "Optional durable project decision. For a project-linked task, "
+                    "Hermes appends it to the Git-backed knowledge/decisions.md "
+                    "registry before closing the task. Required fields: summary and "
+                    "rationale (non-empty strings); optional links is a list of "
+                    "related file paths or URLs."
+                ),
+                "properties": {
+                    "summary": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "links": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["summary", "rationale"],
             },
             "result": {
                 "type": "string",
