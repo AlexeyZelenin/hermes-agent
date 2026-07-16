@@ -648,6 +648,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
+        "executor": "hermes-worker",
         "created_at": None,
         "archived": False,
     }
@@ -675,6 +676,7 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    executor: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -698,6 +700,11 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if executor is not None:
+        normalized_executor = str(executor).strip().lower()
+        if normalized_executor not in {"hermes-worker", "claude-code", "codex"}:
+            raise ValueError("executor must be hermes-worker, claude-code, or codex")
+        meta["executor"] = normalized_executor
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -857,6 +864,7 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    executor: str = "hermes-worker"
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -943,6 +951,7 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            executor=(row["executor"] if "executor" in keys and row["executor"] else "hermes-worker"),
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1112,6 +1121,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    executor             TEXT NOT NULL DEFAULT 'hermes-worker',
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1864,6 +1874,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "executor" not in cols:
+        _add_column_if_missing(conn, "tasks", "executor", "executor TEXT NOT NULL DEFAULT 'hermes-worker'")
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -2408,6 +2420,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    executor: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2491,6 +2504,9 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    executor = str(executor or read_board_metadata(board if board else get_current_board()).get("executor") or "hermes-worker").strip().lower()
+    if executor not in {"hermes-worker", "claude-code", "codex"}:
+        raise ValueError("executor must be hermes-worker, claude-code, or codex")
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2634,10 +2650,10 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, executor, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2652,6 +2668,7 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        executor,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -8230,6 +8247,12 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    # External coding harnesses are a distinct execution path, not providers:
+    # one process owns exactly one native ACP session and then writes the
+    # ordinary Kanban completion/block transition itself.
+    if task.executor in {"claude-code", "codex"}:
+        env["HERMES_KANBAN_EXECUTOR"] = task.executor
+        cmd = [sys.executable, "-m", "agent.acp_task_executor"]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
