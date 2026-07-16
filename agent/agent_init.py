@@ -1870,6 +1870,41 @@ def init_agent(
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
         )
+    # Long-running Kanban workers use an absolute context checkpoint rather
+    # than the normal percentage-based compaction threshold.  Quality starts to
+    # drift around 100K live tokens even for models advertising much larger
+    # windows, so rotate the worker onto a fresh session at that point.  The
+    # small-context clamp and optional per-model override live in one pure
+    # helper to keep this initialization path deterministic and testable.
+    agent.kanban_context_handoff_enabled = False
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        _kanban_cfg = _agent_cfg.get("kanban", {})
+        if not isinstance(_kanban_cfg, dict):
+            _kanban_cfg = {}
+        _handoff_enabled = is_truthy_value(
+            _kanban_cfg.get("context_handoff_enabled"), default=True
+        )
+        if _handoff_enabled:
+            from agent.kanban_context_policy import resolve_handoff_threshold
+
+            _handoff_threshold = resolve_handoff_threshold(
+                _kanban_cfg,
+                agent.model,
+                int(getattr(agent.context_compressor, "context_length", 0) or 0),
+            )
+            agent.context_compressor.threshold_tokens = _handoff_threshold
+            _ctx_len = int(getattr(agent.context_compressor, "context_length", 0) or 0)
+            if _ctx_len > 0:
+                agent.context_compressor.threshold_percent = _handoff_threshold / _ctx_len
+            if hasattr(agent.context_compressor, "tail_token_budget"):
+                agent.context_compressor.tail_token_budget = int(
+                    _handoff_threshold * compression_target_ratio
+                )
+            # A worker checkpoint is valuable only when it starts a fresh
+            # session.  Keep the global in-place default for ordinary chats.
+            compression_in_place = False
+            agent.kanban_context_handoff_enabled = True
+
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:

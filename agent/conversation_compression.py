@@ -812,6 +812,37 @@ def compress_context(
             compressed.append({"role": "user", "content": todo_snapshot})
         _ensure_compressed_has_user_turn(messages, compressed)
 
+        # Kanban workers intentionally cross this boundary before context
+        # quality drifts. Persist the exact compacted summary in their workspace
+        # so a fresh worker session (or a later retry) has a durable, readable
+        # state handoff independent of Hermes' session store.
+        if getattr(agent, "kanban_context_handoff_enabled", False):
+            _workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+            _task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+            if _workspace and _task_id:
+                try:
+                    from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
+                    from agent.kanban_context_policy import write_handoff_checkpoint
+
+                    _summary_parts = [
+                        str(msg.get("content") or "").strip()
+                        for msg in compressed
+                        if isinstance(msg, dict) and msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                    ]
+                    if _summary_parts:
+                        _checkpoint = write_handoff_checkpoint(
+                            workspace=_workspace,
+                            task_id=_task_id,
+                            model=str(getattr(agent, "model", "")),
+                            prompt_tokens=int(approx_tokens or 0),
+                            summary="\n\n".join(_summary_parts),
+                        )
+                        logger.info("wrote Kanban context handoff checkpoint: %s", _checkpoint)
+                except Exception as _checkpoint_err:
+                    # A checkpoint enriches the handoff but must never make a
+                    # successful compaction unusable.
+                    logger.warning("Could not write Kanban context handoff checkpoint: %s", _checkpoint_err)
+
         agent._invalidate_system_prompt()
         new_system_prompt = agent._build_system_prompt(system_message)
         agent._cached_system_prompt = new_system_prompt

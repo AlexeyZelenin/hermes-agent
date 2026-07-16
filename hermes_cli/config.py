@@ -1490,6 +1490,16 @@ DEFAULT_CONFIG = {
     # implementations. Per-platform notification opt-out is handled by the
     # kanban dashboard (see ``hermes dashboard`` -> Notifications).
     "kanban": {
+        # Worker-only context policy. Long-running workers rotate to a fresh
+        # session after this many live prompt tokens, persisting their compacted
+        # state at <workspace>/.hermes/kanban-handoff.md first. This is
+        # deliberately absolute: reasoning quality, not model-window percent,
+        # is the trigger. Smaller context windows retain 20% safety headroom.
+        "context_handoff_enabled": True,
+        "context_handoff_tokens": 100_000,
+        # Optional exact model-name overrides, for example:
+        # "context_handoff_tokens_by_model": {"my-model": 80_000},
+        "context_handoff_tokens_by_model": {},
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
