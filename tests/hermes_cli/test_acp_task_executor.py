@@ -533,6 +533,150 @@ def test_acp_worker_passes_requested_model_to_session(monkeypatch, kanban_conn, 
     assert captured["session_model"] is None
 
 
+# ── per-project append-system-prompt (t_f21213bb) ────────────────────
+#
+# The manual `sb` flow runs `claude --append-system-prompt 'Source code is in
+# ../../src/SimpleBusiness'`. The ACP worker path has no such CLI flag, so a
+# project's append-system-prompt is frozen onto each task at create time,
+# exported to the worker as HERMES_KANBAN_APPEND_PROMPT, and prepended to the
+# worker prompt. These three tests cover each leg of that chain.
+
+
+def test_project_append_prompt_snapshotted_onto_linked_task(monkeypatch, kanban_conn, tmp_path):
+    """A project's append-system-prompt freezes onto its tasks; a later edit to
+    the project must not retro-change an already-created task (same snapshot
+    contract as executor/model)."""
+    projects_path = tmp_path / "projects.db"
+    monkeypatch.setattr(pdb, "projects_db_path", lambda: projects_path)
+    with pdb.connect_closing() as projects:
+        project_id = pdb.create_project(
+            projects,
+            name="SimpleBusiness",
+            folders=[str(tmp_path / "repo")],
+            executor="claude-code",
+            append_system_prompt="Source code is in ../../src/SimpleBusiness",
+        )
+
+    task_id = kb.create_task(kanban_conn, title="SB task", project_id=project_id)
+    assert (
+        kb.get_task(kanban_conn, task_id).append_system_prompt
+        == "Source code is in ../../src/SimpleBusiness"
+    )
+
+    with pdb.connect_closing() as projects:
+        assert pdb.update_project(projects, project_id, append_system_prompt="changed")
+    # Existing task keeps the snapshot; a new task picks up the new value.
+    assert (
+        kb.get_task(kanban_conn, task_id).append_system_prompt
+        == "Source code is in ../../src/SimpleBusiness"
+    )
+    task_id2 = kb.create_task(kanban_conn, title="SB task 2", project_id=project_id)
+    assert kb.get_task(kanban_conn, task_id2).append_system_prompt == "changed"
+
+
+def test_explicit_append_prompt_overrides_project(monkeypatch, kanban_conn, tmp_path):
+    """An explicit create_task append_system_prompt wins over the project's."""
+    projects_path = tmp_path / "projects.db"
+    monkeypatch.setattr(pdb, "projects_db_path", lambda: projects_path)
+    with pdb.connect_closing() as projects:
+        project_id = pdb.create_project(
+            projects, name="P", folders=[str(tmp_path / "repo")],
+            append_system_prompt="from project",
+        )
+    task_id = kb.create_task(
+        kanban_conn, title="t", project_id=project_id,
+        append_system_prompt="from caller",
+    )
+    assert kb.get_task(kanban_conn, task_id).append_system_prompt == "from caller"
+
+
+def test_unlinked_task_has_no_append_prompt(kanban_conn):
+    task_id = kb.create_task(kanban_conn, title="plain")
+    assert kb.get_task(kanban_conn, task_id).append_system_prompt is None
+
+
+def test_append_prompt_exported_in_spawn_env(monkeypatch, tmp_path):
+    """A task's append_system_prompt reaches the ACP worker as
+    HERMES_KANBAN_APPEND_PROMPT; a task without one leaves the key unset so
+    ordinary tasks are byte-for-byte unchanged."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "external").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    def _task(append):
+        return kb.Task(
+            id="t_acp_prompt", title="external", body=None, assignee="external",
+            status="running", priority=0, created_by="test", created_at=1,
+            started_at=None, completed_at=None, workspace_kind="dir",
+            workspace_path=None, claim_lock="test-lock", claim_expires=None,
+            tenant=None, current_run_id=9, executor="claude-code",
+            append_system_prompt=append,
+        )
+
+    captured = {}
+
+    class FakeProc:
+        pid = 5150
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    kb._default_spawn(_task("Source code is in ../../src/SimpleBusiness"), str(workspace))
+    assert (
+        captured["env"]["HERMES_KANBAN_APPEND_PROMPT"]
+        == "Source code is in ../../src/SimpleBusiness"
+    )
+
+    kb._default_spawn(_task(None), str(workspace))
+    assert "HERMES_KANBAN_APPEND_PROMPT" not in captured["env"]
+
+
+def test_run_task_prepends_append_prompt_to_worker_prompt(monkeypatch, kanban_conn, tmp_path):
+    """HERMES_KANBAN_APPEND_PROMPT from the dispatcher is prepended to the worker
+    prompt (the ACP stand-in for `claude --append-system-prompt`); absent, the
+    prompt is unchanged."""
+    from agent import acp_task_executor as executor
+
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    prompts = []
+
+    class FakeClient:
+        last_model = "claude-opus-4-8"
+        last_turn_usage = None
+
+        def __init__(self, **kwargs):
+            self.last_partial_text = ""
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            prompts.append(prompt)
+            return "done", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+
+    monkeypatch.setenv("HERMES_KANBAN_APPEND_PROMPT", "Source code is in ../../src/SimpleBusiness")
+    tid = kb.create_task(kanban_conn, title="SB task", assignee="external")
+    assert kb.claim_task(kanban_conn, tid, claimer="test-lock") is not None
+    executor.run_task(executor="claude-code", task_id=tid, workspace=str(tmp_path), board="test")
+    assert prompts[-1].startswith(
+        "[project context]\nSource code is in ../../src/SimpleBusiness\n\n"
+    )
+
+    monkeypatch.delenv("HERMES_KANBAN_APPEND_PROMPT")
+    tid2 = kb.create_task(kanban_conn, title="plain task", assignee="external")
+    assert kb.claim_task(kanban_conn, tid2, claimer="test-lock") is not None
+    executor.run_task(executor="claude-code", task_id=tid2, workspace=str(tmp_path), board="test")
+    assert "[project context]" not in prompts[-1]
+
+
 def test_steer_inbox_enqueue_drain_roundtrip(monkeypatch, tmp_path):
     """Operator steer messages queue to a per-task inbox under the board dir and
     drain (once) into a single combined turn; consumed lines are archived."""

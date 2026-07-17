@@ -204,8 +204,15 @@ def connect_closing(db_path: Optional[Path] = None):
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
 _OPTIONAL_PROJECT_COLUMNS = (
-    "board_slug", "primary_path", "icon", "color", "executor", "models"
+    "board_slug", "primary_path", "icon", "color", "executor", "models",
+    "append_system_prompt",
 )
+
+# Upper bound on a project's append-system-prompt. It is prepended to EVERY
+# task's worker prompt, so a pathologically large value would burn context on
+# every run; the real use case (e.g. "Source code is in ../../src/Foo") is a
+# line or two. 2000 chars is generous headroom without inviting abuse.
+_MAX_APPEND_PROMPT = 2000
 
 VALID_EXECUTORS = frozenset({"hermes-worker", "claude-code", "codex"})
 
@@ -237,6 +244,26 @@ def normalize_models(models: object | None) -> dict:
         for role, value in models.items()
         if str(value or "").strip()
     }
+
+
+def normalize_append_prompt(value: object | None) -> Optional[str]:
+    """Validate a project append-system-prompt: strip; empty -> None; cap length.
+
+    Threaded into each task's worker prompt as the equivalent of a manual
+    ``claude --append-system-prompt`` (which the ACP worker path has no CLI flag
+    for). Kept short on purpose (see ``_MAX_APPEND_PROMPT``).
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > _MAX_APPEND_PROMPT:
+        raise ValueError(
+            f"append_system_prompt too long ({len(text)} chars); "
+            f"max is {_MAX_APPEND_PROMPT}"
+        )
+    return text
 
 
 def _models_from_column(raw: object | None) -> dict:
@@ -295,6 +322,7 @@ class Project:
     primary_path: Optional[str] = None
     executor: str = "hermes-worker"
     models: dict = field(default_factory=dict)
+    append_system_prompt: Optional[str] = None
     archived: bool = False
     folders: List[ProjectFolder] = field(default_factory=list)
 
@@ -310,6 +338,7 @@ class Project:
             "primary_path": self.primary_path,
             "executor": self.executor,
             "models": dict(self.models),
+            "append_system_prompt": self.append_system_prompt,
             "archived": bool(self.archived),
             "created_at": self.created_at,
             "folders": [f.to_dict() for f in self.folders],
@@ -330,6 +359,11 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         primary_path=row["primary_path"] if "primary_path" in keys else None,
         executor=normalize_executor(row["executor"] if "executor" in keys else None),
         models=_models_from_column(row["models"] if "models" in keys else None),
+        append_system_prompt=(
+            row["append_system_prompt"]
+            if "append_system_prompt" in keys else None
+        )
+        or None,
         archived=bool(row["archived"]) if "archived" in keys else False,
     )
 
@@ -388,6 +422,7 @@ def create_project(
     board_slug: Optional[str] = None,
     executor: Optional[str] = None,
     models: Optional[dict] = None,
+    append_system_prompt: Optional[str] = None,
 ) -> str:
     """Create a project and return its id.
 
@@ -420,8 +455,9 @@ def create_project(
         conn.execute(
             "INSERT INTO projects "
             "(id, slug, name, description, icon, color, board_slug, "
-            " primary_path, executor, models, created_at, archived) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            " primary_path, executor, models, append_system_prompt, "
+            " created_at, archived) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (
                 pid,
                 unique,
@@ -433,6 +469,7 @@ def create_project(
                 primary,
                 normalize_executor(executor),
                 json.dumps(normalize_models(models)) if models else None,
+                normalize_append_prompt(append_system_prompt),
                 now,
             ),
         )
@@ -484,12 +521,13 @@ def update_project(
     board_slug: Optional[str] = None,
     executor: Optional[str] = None,
     models: Optional[dict] = None,
+    append_system_prompt: Optional[str] = None,
 ) -> bool:
     """Patch top-level project fields. Only provided fields change.
 
-    ``icon``, ``color``, and ``board_slug`` accept an empty string to clear
-    (store NULL) — passing ``None`` leaves the field untouched, so callers that
-    want to clear must send ``""``.
+    ``icon``, ``color``, ``board_slug``, and ``append_system_prompt`` accept an
+    empty string to clear (store NULL) — passing ``None`` leaves the field
+    untouched, so callers that want to clear must send ``""``.
     """
     sets: List[str] = []
     params: List[object] = []
@@ -518,6 +556,9 @@ def update_project(
         cleaned = normalize_models(models)
         sets.append("models = ?")
         params.append(json.dumps(cleaned) if cleaned else None)
+    if append_system_prompt is not None:
+        sets.append("append_system_prompt = ?")
+        params.append(normalize_append_prompt(append_system_prompt))
     if not sets:
         return False
     params.append(project_id)
