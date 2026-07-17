@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.budget_guard import (
+    BUDGET_GUARD_OFF_ENV,
     EXEMPT_PROTOCOL_TOOLS,
     BudgetGuard,
     BudgetGuardConfig,
@@ -34,12 +35,15 @@ def test_metered_provider_is_api_key():
 # ── config ───────────────────────────────────────────────────────────────────
 
 
-def test_config_defaults_hard_stop_off_and_100_dollar_limit():
+def test_config_defaults_fail_closed_with_generous_cap():
+    # Fail-closed: hard stop ON by default so an unattended run has a ceiling,
+    # with a generous default cap ordinary work will not trip.
     cfg = BudgetGuardConfig()
-    assert cfg.daily_limit_usd == 100.0
-    assert cfg.hard_stop_enabled is False
-    assert cfg.hard_threshold_usd == 100.0
-    assert cfg.warn_threshold_usd == 75.0
+    assert cfg.hard_stop_enabled is True
+    assert cfg.daily_limit_usd == 250.0
+    assert cfg.hard_threshold_usd == 250.0
+    assert cfg.warn_threshold_usd == 187.5
+    assert cfg.metering_dead_after == 3
     assert EXEMPT_PROTOCOL_TOOLS <= cfg.exempt_tools
 
 
@@ -51,6 +55,7 @@ def test_config_from_mapping_parses_all_fields():
             "hard_pct": 0.9,
             "hard_stop_enabled": "true",
             "warnings_enabled": False,
+            "metering_dead_after": 5,
             "exempt_tools": ["kanban_block", "custom_tool"],
         }
     )
@@ -59,6 +64,7 @@ def test_config_from_mapping_parses_all_fields():
     assert cfg.warn_threshold_usd == 25.0
     assert cfg.hard_stop_enabled is True
     assert cfg.warnings_enabled is False
+    assert cfg.metering_dead_after == 5
     assert cfg.exempt_tools == frozenset({"kanban_block", "custom_tool"})
 
 
@@ -66,7 +72,7 @@ def test_config_from_mapping_ignores_garbage():
     cfg = BudgetGuardConfig.from_mapping(None)
     assert cfg == BudgetGuardConfig()
     cfg2 = BudgetGuardConfig.from_mapping({"daily_limit_usd": "not-a-number"})
-    assert cfg2.daily_limit_usd == 100.0
+    assert cfg2.daily_limit_usd == 250.0
 
 
 # ── record_spend accounting ──────────────────────────────────────────────────
@@ -91,11 +97,21 @@ def test_record_spend_clamps_negative_and_none():
 # ── hard stop: api-key spend, opt-in ─────────────────────────────────────────
 
 
-def test_hard_stop_disabled_by_default_never_blocks():
+def test_hard_stop_enabled_by_default_blocks_over_cap():
+    # Fail-closed default: over the cap, non-exempt work is blocked out of the box.
     guard = BudgetGuard(BudgetGuardConfig(daily_limit_usd=10.0))
     guard.record_spend(1000.0, "api_key")
     decision = guard.before_call("terminal")
-    assert decision.allows_execution is True
+    assert decision.allows_execution is False
+    assert decision.code == "budget_hard_stop"
+
+
+def test_hard_stop_explicitly_disabled_never_blocks():
+    guard = BudgetGuard(
+        BudgetGuardConfig(daily_limit_usd=10.0, hard_stop_enabled=False)
+    )
+    guard.record_spend(1000.0, "api_key")
+    assert guard.before_call("terminal").allows_execution is True
 
 
 def test_hard_stop_blocks_api_key_over_limit_when_enabled():
@@ -180,6 +196,82 @@ def test_exempt_tool_stays_quiet_at_warn_threshold():
     assert guard.before_call("kanban_comment").action == "allow"
 
 
+# ── per-session override: conscious opt-out ──────────────────────────────────
+
+
+def test_session_override_disables_hard_stop_and_unblocks():
+    # Both directions: default fail-closed blocks at the cap, the env override
+    # removes the block for this session.
+    cfg = BudgetGuardConfig(daily_limit_usd=10.0)
+    blocked = BudgetGuard(cfg)
+    blocked.record_spend(50.0, "api_key")
+    assert blocked.before_call("terminal").allows_execution is False
+
+    overridden = BudgetGuard(cfg.with_session_overrides({BUDGET_GUARD_OFF_ENV: "1"}))
+    overridden.record_spend(50.0, "api_key")
+    assert overridden.before_call("terminal").allows_execution is True
+
+
+def test_session_override_absent_or_falsey_keeps_hard_stop():
+    cfg = BudgetGuardConfig(daily_limit_usd=10.0)
+    assert cfg.with_session_overrides({}).hard_stop_enabled is True
+    assert cfg.with_session_overrides({BUDGET_GUARD_OFF_ENV: "0"}).hard_stop_enabled is True
+    assert (
+        cfg.with_session_overrides({BUDGET_GUARD_OFF_ENV: "off"}).hard_stop_enabled is True
+    )
+
+
+def test_session_override_reads_process_env(monkeypatch):
+    monkeypatch.setenv(BUDGET_GUARD_OFF_ENV, "yes")
+    cfg = BudgetGuardConfig(daily_limit_usd=10.0)
+    assert cfg.with_session_overrides().hard_stop_enabled is False
+
+
+# ── metering-dead: broken pricing feed must not read a silent $0 ──────────────
+
+
+def test_metering_failure_counts_and_resets_on_clean_record():
+    guard = BudgetGuard()
+    guard.record_metering_failure("boom")
+    guard.record_metering_failure("boom")
+    assert guard.metering_failures == 2
+    # A successful record proves the feed is alive again.
+    guard.record_spend(1.0, "api_key")
+    assert guard.metering_failures == 0
+    assert guard.metering_broken is False
+
+
+def test_metering_broken_after_threshold_blocks_when_hard_stop_on():
+    guard = BudgetGuard(BudgetGuardConfig(metering_dead_after=2))
+    guard.record_metering_failure("boom")
+    assert guard.metering_broken is False  # one failure is not yet dead
+    guard.record_metering_failure("boom")
+    assert guard.metering_broken is True
+    decision = guard.before_call("terminal")
+    assert decision.allows_execution is False
+    assert decision.code == "budget_metering_dead"
+
+
+def test_metering_dead_lets_exempt_tools_through():
+    guard = BudgetGuard(BudgetGuardConfig(metering_dead_after=1))
+    guard.record_metering_failure("boom")
+    assert guard.before_call("terminal").allows_execution is False
+    assert guard.before_call("kanban_block").allows_execution is True
+
+
+def test_metering_dead_warns_only_when_hard_stop_disabled():
+    guard = BudgetGuard(
+        BudgetGuardConfig(metering_dead_after=1, hard_stop_enabled=False)
+    )
+    guard.record_metering_failure("boom")
+    first = guard.before_call("terminal")
+    assert first.action == "warn"
+    assert first.code == "budget_metering_dead_warning"
+    assert first.allows_execution is True
+    # One-time signal, does not repeat every call.
+    assert guard.before_call("terminal").action == "allow"
+
+
 # ── feed_budget_guard ────────────────────────────────────────────────────────
 
 
@@ -231,6 +323,60 @@ def test_feed_subscription_records_shadow_price_not_zero():
     )
     assert guard.subscription_spend_usd == pytest.approx(float(shadow.amount_usd))
     assert guard.api_key_spend_usd == 0.0
+
+
+def test_feed_unpriced_api_key_turn_flags_metering_not_silent_zero():
+    # A None cost on an api-key turn is the silent under-count that would leave
+    # the hard stop toothless — it must register as a metering failure, not $0.
+    guard = BudgetGuard()
+    feed_budget_guard(
+        guard,
+        model="claude-opus-4-8",
+        provider="anthropic",
+        base_url="",
+        api_key="",
+        usage=CanonicalUsage(input_tokens=1000),
+        cost_result=SimpleNamespace(status="estimated", amount_usd=None),
+    )
+    assert guard.metering_failures == 1
+    assert guard.api_key_spend_usd == 0.0
+
+
+def test_feed_exception_reports_metering_failure_and_does_not_raise():
+    guard = BudgetGuard()
+
+    class _Boom:
+        def __getattr__(self, name):  # any attribute access blows up
+            raise RuntimeError("pricing feed dead")
+
+    # Must not raise (loop safety) but must record the failure (not swallow it).
+    feed_budget_guard(
+        guard,
+        model="claude-opus-4-8",
+        provider="anthropic",
+        base_url="",
+        api_key="",
+        usage=CanonicalUsage(input_tokens=1000),
+        cost_result=_Boom(),
+    )
+    assert guard.metering_failures == 1
+
+
+def test_feed_systematic_break_makes_guard_fail_closed():
+    # End-to-end: a pricing feed that never prices api-key turns eventually
+    # trips the guard closed, instead of silently reading $0 forever.
+    guard = BudgetGuard(BudgetGuardConfig(metering_dead_after=3))
+    for _ in range(3):
+        feed_budget_guard(
+            guard,
+            model="claude-opus-4-8",
+            provider="anthropic",
+            base_url="",
+            api_key="",
+            usage=CanonicalUsage(input_tokens=1000),
+            cost_result=SimpleNamespace(status="estimated", amount_usd=None),
+        )
+    assert guard.before_call("terminal").code == "budget_metering_dead"
 
 
 def test_estimate_metered_cost_prices_claude_opus():

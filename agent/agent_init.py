@@ -1366,9 +1366,14 @@ def init_agent(
     try:
         from agent.budget_guard import BudgetGuard, BudgetGuardConfig
 
-        agent._budget_guard = BudgetGuard(
-            BudgetGuardConfig.from_mapping(_agent_cfg.get("budget_guard", {}))
-        )
+        _bg_cfg = BudgetGuardConfig.from_mapping(_agent_cfg.get("budget_guard", {}))
+        _bg_resolved = _bg_cfg.with_session_overrides()
+        if _bg_resolved.hard_stop_enabled != _bg_cfg.hard_stop_enabled:
+            _ra().logger.warning(
+                "Budget guard hard stop DISABLED for this session via "
+                "HERMES_BUDGET_GUARD_OFF; the daily cap will not block."
+            )
+        agent._budget_guard = BudgetGuard(_bg_resolved)
     except Exception as _bg_err:
         agent._budget_guard = None
         _ra().logger.warning("Budget guard config ignored: %s", _bg_err)

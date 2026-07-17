@@ -11,22 +11,36 @@ worker can still report status, block, or escalate. The 2026-07-16 incident:
 a worker hit the limit and could not even file a block, the dispatcher read
 that as a protocol violation, and the operator never got a signal.
 
-Design mirrors :mod:`agent.tool_guardrails`: warnings on by default, hard stops
-are explicit opt-in (``hard_stop_enabled=False``), so a misconfigured limit can
-never silently wedge a session — the hard threshold is unreachable until an
-operator turns it on. ``before_call`` returns a
+The daily hard stop is ON by default (fail-closed): an unattended nightly run
+must not be able to burn live-API-key dollars without a ceiling. The default cap
+is deliberately generous so ordinary work never trips it, and a single session
+can consciously opt out for one run via ``HERMES_BUDGET_GUARD_OFF=1`` (logged, so
+the opt-out is never silent). ``before_call`` returns a
 :class:`agent.tool_guardrails.ToolGuardrailDecision` so the runtime wires it
 through the exact same block path as the loop guardrail.
+
+Broken metering must not silently read $0 — a dead pricing feed would leave the
+hard stop toothless. :func:`feed_budget_guard` reports failures to the guard via
+:meth:`BudgetGuard.record_metering_failure`, which logs them and, once they
+persist, fails closed instead of pretending spend is zero.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+import os
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Mapping, Optional
 
 from agent.tool_guardrails import ToolGuardrailDecision
 
+_logger = logging.getLogger(__name__)
+
 SpendSource = Literal["api_key", "subscription"]
+
+# Per-session, conscious opt-out of the daily hard stop. Truthy disables the hard
+# stop for this process only, without touching the shared config.yaml.
+BUDGET_GUARD_OFF_ENV = "HERMES_BUDGET_GUARD_OFF"
 
 # Protocol lifelines: a throttled worker must always be able to report a block,
 # comment, or escalate a decision, so these bypass any hard stop.
@@ -60,16 +74,21 @@ def classify_spend_source(
 class BudgetGuardConfig:
     """Daily spend thresholds and the protocol-tool exempt list.
 
-    ``hard_stop_enabled`` defaults to ``False`` so the hard threshold is
-    unreachable out of the box (warn-only everywhere); an operator opts into
-    circuit-breaker behavior via the ``budget_guard`` config.yaml section.
+    ``hard_stop_enabled`` defaults to ``True`` (fail-closed): the generous
+    default cap bounds an unattended run out of the box. Operators can lower the
+    cap or turn the stop off in the ``budget_guard`` config.yaml section, and a
+    single session can opt out via the ``HERMES_BUDGET_GUARD_OFF`` env var (see
+    :meth:`with_session_overrides`). ``metering_dead_after`` is how many
+    consecutive metering failures mark the pricing feed dead (see
+    :meth:`BudgetGuard.record_metering_failure`).
     """
 
-    daily_limit_usd: float = 100.0
+    daily_limit_usd: float = 250.0
     warn_pct: float = 0.75
     hard_pct: float = 1.0
-    hard_stop_enabled: bool = False
+    hard_stop_enabled: bool = True
     warnings_enabled: bool = True
+    metering_dead_after: int = 3
     exempt_tools: frozenset[str] = field(default_factory=lambda: EXEMPT_PROTOCOL_TOOLS)
 
     @property
@@ -79,6 +98,21 @@ class BudgetGuardConfig:
     @property
     def hard_threshold_usd(self) -> float:
         return self.daily_limit_usd * self.hard_pct
+
+    def with_session_overrides(
+        self, env: Mapping[str, str] | None = None
+    ) -> "BudgetGuardConfig":
+        """Apply per-session env overrides — currently the conscious opt-out.
+
+        ``HERMES_BUDGET_GUARD_OFF=1`` disables the daily hard stop for this
+        session only, without editing the shared config.yaml. A deliberate,
+        visible knob for an operator who needs one run past the cap; the caller
+        logs when it takes effect so the opt-out is never silent.
+        """
+        source = os.environ if env is None else env
+        if self.hard_stop_enabled and _as_bool(source.get(BUDGET_GUARD_OFF_ENV), False):
+            return replace(self, hard_stop_enabled=False)
+        return self
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "BudgetGuardConfig":
@@ -98,6 +132,9 @@ class BudgetGuardConfig:
             hard_pct=_as_float(data.get("hard_pct"), defaults.hard_pct),
             hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
+            metering_dead_after=_as_int(
+                data.get("metering_dead_after"), defaults.metering_dead_after
+            ),
             exempt_tools=exempt_set,
         )
 
@@ -116,6 +153,7 @@ class BudgetGuard:
         self._api_key_usd = 0.0
         self._subscription_usd = 0.0
         self._warned: set[str] = set()
+        self._metering_failures = 0
 
     @property
     def api_key_spend_usd(self) -> float:
@@ -125,16 +163,47 @@ class BudgetGuard:
     def subscription_spend_usd(self) -> float:
         return self._subscription_usd
 
+    @property
+    def metering_failures(self) -> int:
+        return self._metering_failures
+
+    @property
+    def metering_broken(self) -> bool:
+        """True once metering has failed enough times in a row to be untrusted."""
+        return (
+            self._metering_failures > 0
+            and self._metering_failures >= self.config.metering_dead_after
+        )
+
     def record_spend(self, amount_usd: float | None, source: SpendSource) -> None:
         """Accumulate a turn's spend into the bucket for its payment source."""
         try:
             amount = max(0.0, float(amount_usd or 0.0))
         except (TypeError, ValueError):
             return
+        # A clean record proves the pricing feed is alive again.
+        self._metering_failures = 0
         if source == "subscription":
             self._subscription_usd += amount
         else:
             self._api_key_usd += amount
+
+    def record_metering_failure(self, error: object) -> None:
+        """Count a metering/pricing failure and surface it — never a silent $0.
+
+        A broken pricing feed would otherwise let spend read $0 forever, leaving
+        the hard stop toothless. Consecutive failures are counted; once they
+        cross ``metering_dead_after`` the guard treats metering as dead and (with
+        the hard stop enabled) fails closed in :meth:`before_call`.
+        """
+        self._metering_failures += 1
+        _logger.warning(
+            "Budget guard metering failure #%d — spend can no longer be tracked; "
+            "hard stop will fail closed once %d consecutive failures accrue: %s",
+            self._metering_failures,
+            self.config.metering_dead_after,
+            error,
+        )
 
     def before_call(
         self, tool_name: str, args: Mapping[str, Any] | None = None
@@ -143,6 +212,11 @@ class BudgetGuard:
         cfg = self.config
         if tool_name in cfg.exempt_tools:
             return ToolGuardrailDecision(tool_name=tool_name)
+
+        if self.metering_broken:
+            dead = self._metering_dead_decision(tool_name)
+            if dead is not None:
+                return dead
 
         if (
             cfg.hard_stop_enabled
@@ -195,6 +269,42 @@ class BudgetGuard:
             )
         return None
 
+    def _metering_dead_decision(
+        self, tool_name: str
+    ) -> Optional[ToolGuardrailDecision]:
+        """Gate a tool when the pricing feed is dead (spend is no longer known)."""
+        cfg = self.config
+        if cfg.hard_stop_enabled:
+            # Fail closed: with no trustworthy spend figure we cannot prove we
+            # are under the cap, so stop non-exempt work rather than run blind.
+            return ToolGuardrailDecision(
+                action="block",
+                code="budget_metering_dead",
+                message=(
+                    f"Blocked {tool_name}: budget metering has failed "
+                    f"{self._metering_failures} times in a row, so live-API-key "
+                    "spend can no longer be tracked. Failing closed to avoid "
+                    "un-capped burn. Protocol tools "
+                    f"({', '.join(sorted(cfg.exempt_tools))}) stay available to "
+                    "report a block or escalate; fix pricing/metering or set "
+                    f"{BUDGET_GUARD_OFF_ENV}=1 to override for this session."
+                ),
+                tool_name=tool_name,
+            )
+        if "metering_dead" not in self._warned:
+            self._warned.add("metering_dead")
+            return ToolGuardrailDecision(
+                action="warn",
+                code="budget_metering_dead_warning",
+                message=(
+                    f"Budget metering has failed {self._metering_failures} times "
+                    "in a row; the daily cap cannot be enforced. FYI only — the "
+                    "hard stop is disabled."
+                ),
+                tool_name=tool_name,
+            )
+        return None
+
 
 def feed_budget_guard(
     guard: Optional[BudgetGuard],
@@ -211,7 +321,9 @@ def feed_budget_guard(
     Subscription turns are priced at their shadow (would-be-metered) rate so
     warnings are meaningful even though the billed amount is $0; api-key turns
     use the real estimated cost. Never raises — a broken feed must not break the
-    agent loop.
+    agent loop — but it also never silently reads $0: a failure (an exception, or
+    an api-key turn the pricing feed could not price) is reported to the guard so
+    a systematically dead feed becomes visible and the hard stop fails closed.
     """
     if guard is None:
         return
@@ -227,9 +339,16 @@ def feed_budget_guard(
             guard.record_spend(float(amount), "subscription")
         else:
             amount = getattr(cost_result, "amount_usd", None)
-            guard.record_spend(float(amount) if amount is not None else 0.0, "api_key")
-    except Exception:  # pragma: no cover - defensive: telemetry must not break the loop
-        pass
+            if amount is None:
+                # Unpriced api-key turn: recording $0 here is exactly the silent
+                # under-count that leaves the hard stop toothless. Flag it.
+                guard.record_metering_failure(
+                    "api-key turn unpriced (cost amount_usd is None)"
+                )
+                return
+            guard.record_spend(float(amount), "api_key")
+    except Exception as exc:  # telemetry must not break the loop — but must not hide
+        guard.record_metering_failure(exc)
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -253,6 +372,16 @@ def _as_float(value: Any, default: float) -> float:
         return default
     try:
         parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= 0 else default
