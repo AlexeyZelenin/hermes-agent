@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type ComponentType,
+  type CSSProperties,
   type FocusEvent,
   type MouseEvent,
   type ReactNode,
@@ -39,6 +40,8 @@ import {
   Package,
   PanelLeftClose,
   PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   Plug,
   Puzzle,
   Radio,
@@ -104,6 +107,13 @@ import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import {
+  CHAT_DOCK_PUSH_MIN_WIDTH,
+  CHAT_DOCK_WIDTH,
+  chatDockMode,
+  loadChatDockOpen,
+  persistChatDockOpen,
+} from "@/lib/chat-dock";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
 
@@ -381,6 +391,25 @@ export default function App() {
   }, []);
   const isMobile = useBelowBreakpoint(1024);
   const isDesktopCollapsed = collapsed && !isMobile;
+
+  // Collapsible right-side chat dock. A single persistent ChatPage (see the
+  // host below) paints either full-page on `/chat` or as this dock elsewhere;
+  // the operator toggles it to keep the board and chat visible at once.
+  const [chatDockOpen, setChatDockOpen] = useState(loadChatDockOpen);
+  const setChatDock = useCallback((open: boolean) => {
+    setChatDockOpen(open);
+    persistChatDockOpen(open);
+  }, []);
+  const toggleChatDock = useCallback(() => {
+    setChatDockOpen((prev) => {
+      const next = !prev;
+      persistChatDockOpen(next);
+      return next;
+    });
+  }, []);
+  // Below the push threshold the dock overlays instead of pushing the board,
+  // so a half-screen window needs no widening to read both.
+  const chatDockNarrow = useBelowBreakpoint(CHAT_DOCK_PUSH_MIN_WIDTH);
   const tooltipWarmRef = useRef(0);
   const sidebarStatus = useSidebarStatus();
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
@@ -426,6 +455,37 @@ export default function App() {
     () => manifests.some((m) => m.tab.override === "/chat"),
     [manifests],
   );
+
+  // The dock is offered on every non-chat route once embedded chat is live
+  // (on `/chat` the same instance is already the full page). `dockMode` drives
+  // both the host's CSS and how much room the main column gives up.
+  const chatDockAvailable =
+    embeddedChat && !chatOverriddenByPlugin && !isChatRoute && !pluginsLoading;
+  const dockMode = chatDockMode({
+    available: chatDockAvailable,
+    open: chatDockOpen,
+    narrow: chatDockNarrow,
+  });
+  // ChatPage is "active" (terminal fits, PTY reconnects) whenever it is on
+  // screen — full-page on `/chat`, or docked open elsewhere.
+  const chatActive = isChatRoute || dockMode !== "hidden";
+
+  // Hotkey (mod+shift+J) toggles the dock; Escape dismisses an overlay so the
+  // board underneath is one keystroke away.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.shiftKey && (e.key === "j" || e.key === "J")) {
+        if (!chatDockAvailable) return;
+        e.preventDefault();
+        toggleChatDock();
+      } else if (e.key === "Escape" && dockMode === "overlay") {
+        setChatDock(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [chatDockAvailable, dockMode, toggleChatDock, setChatDock]);
 
   const builtinRoutes = useMemo(
     () => ({
@@ -738,6 +798,13 @@ export default function App() {
                   : "pt-2 sm:pt-4 lg:pt-6",
                 isDocsRoute && "min-h-0 flex-1",
               )}
+              // Push mode: yield a column to the dock so the board reflows
+              // beside it. Overlay/closed reserve nothing (dock floats/hidden).
+              style={
+                dockMode === "push"
+                  ? { paddingRight: CHAT_DOCK_WIDTH }
+                  : undefined
+              }
             >
               <PluginSlot name="pre-main" />
               <div
@@ -780,14 +847,55 @@ export default function App() {
                     ) : null
                   ) : (
                     <div
-                      data-chat-active={isChatRoute ? "true" : "false"}
+                      data-chat-active={chatActive ? "true" : "false"}
+                      data-dock-mode={dockMode}
                       className={cn(
-                        "min-h-0 min-w-0",
-                        isChatRoute ? "flex flex-1 flex-col" : "hidden",
+                        "flex flex-col",
+                        // Full-page on /chat: in-flow, fills the main column.
+                        isChatRoute && "min-h-0 min-w-0 flex-1",
+                        // Docked (push or overlay): fixed to the right edge,
+                        // full height, floating above page content. Same
+                        // element in both modes — only the main column's
+                        // padding differs — so ChatPage never remounts.
+                        !isChatRoute &&
+                          dockMode !== "hidden" &&
+                          "fixed right-0 top-14 bottom-0 z-30 " +
+                            "w-[min(100vw,var(--chat-dock-w))] lg:top-0 " +
+                            "border-l border-current/10 bg-background-base shadow-2xl",
+                        // Closed: kept mounted (PTY alive) but off-screen.
+                        !isChatRoute && dockMode === "hidden" && "hidden",
                       )}
-                      aria-hidden={!isChatRoute}
+                      style={
+                        !isChatRoute && dockMode !== "hidden"
+                          ? ({
+                              ["--chat-dock-w" as string]: `${CHAT_DOCK_WIDTH}px`,
+                            } as CSSProperties)
+                          : undefined
+                      }
+                      aria-hidden={!chatActive}
                     >
-                      <ChatPage isActive={isChatRoute} />
+                      {!isChatRoute && dockMode !== "hidden" && (
+                        <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-current/10 px-3">
+                          <span className="flex items-center gap-1.5 text-xs font-medium text-text-secondary">
+                            <MessageSquare className="size-3.5" />
+                            {t.app.nav.chat ?? "Chat"}
+                            <span className="text-[10px] uppercase tracking-wide text-text-tertiary">
+                              {dockMode}
+                            </span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setChatDock(false)}
+                            aria-label="Close chat dock"
+                            className="text-text-secondary hover:text-midground"
+                          >
+                            <PanelRightClose className="size-4" />
+                          </button>
+                        </div>
+                      )}
+                      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                        <ChatPage isActive={chatActive} />
+                      </div>
                     </div>
                   ))}
               </div>
@@ -796,6 +904,25 @@ export default function App() {
           </PageHeaderProvider>
         </div>
       </div>
+
+      {/* Visible handle to summon the chat dock when it is closed. */}
+      {chatDockAvailable && dockMode === "hidden" && (
+        <button
+          type="button"
+          onClick={() => setChatDock(true)}
+          aria-label="Open chat dock"
+          title="Open chat (⌘/Ctrl+Shift+J)"
+          className={cn(
+            "fixed right-0 top-1/2 z-30 -translate-y-1/2",
+            "flex items-center gap-1 rounded-l-md py-3 pl-2 pr-1.5",
+            "border border-r-0 border-current/10 bg-background-base shadow-lg",
+            "text-text-secondary hover:text-midground",
+          )}
+        >
+          <PanelRightOpen className="size-4" />
+          <MessageSquare className="size-3.5" />
+        </button>
+      )}
 
       <PluginSlot name="overlay" />
     </div>
