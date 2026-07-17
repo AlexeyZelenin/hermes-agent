@@ -430,6 +430,7 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "exit_reason": None,
         "restart_requested": False,
         "active_agents": 0,
+        "pending_reload": None,
         "platforms": {},
         "updated_at": _utc_now_iso(),
     })
@@ -800,6 +801,7 @@ def write_runtime_status(
     exit_reason: Any = _UNSET,
     restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET,
+    pending_reload: Any = _UNSET,
     platform: Any = _UNSET,
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
@@ -825,6 +827,12 @@ def write_runtime_status(
         payload["restart_requested"] = bool(restart_requested)
     if active_agents is not _UNSET:
         payload["active_agents"] = parse_active_agents(active_agents)
+    if pending_reload is not _UNSET:
+        # Unified "engine restart pending" signal for the dashboard badge:
+        # ``{"boot_rev", "disk_rev"}`` while the checkout has drifted past the
+        # gateway's boot snapshot (a self-redeploy merge or a user's vibe-code
+        # commit), ``None`` once it matches again. See gateway.self_redeploy.
+        payload["pending_reload"] = pending_reload
     if served_profiles is not _UNSET:
         # Profiles this gateway multiplexes (multi-profile mode). Absent/empty
         # for a single-profile gateway. Lets `hermes status` show per-profile

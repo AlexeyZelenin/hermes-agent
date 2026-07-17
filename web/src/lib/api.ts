@@ -1851,8 +1851,20 @@ export interface PlatformStatus {
   updated_at: string;
 }
 
+/** Short git-rev prefixes describing an engine restart that is pending because
+ * the checkout drifted past the running gateway's boot snapshot — either a
+ * self-redeploy merge or a user's own vibe-code commit. Absent/null when the
+ * running code matches disk. Drives the "restart pending" badge by the logo. */
+export interface PendingReload {
+  boot_rev: string;
+  disk_rev: string;
+}
+
 export interface StatusResponse {
   active_sessions: number;
+  /** Set while merged/vibe-coded engine changes await a gateway restart to
+   * take effect (the running process froze its modules at boot). */
+  pending_reload?: PendingReload | null;
   /** Phase 7: ``true`` when the dashboard's OAuth gate is engaged
    * (public bind, no ``--insecure``). Read alongside ``auth_providers``
    * to render a "gated / loopback" badge. */

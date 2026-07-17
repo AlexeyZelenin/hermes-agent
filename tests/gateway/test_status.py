@@ -436,6 +436,27 @@ class TestGatewayRuntimeStatus:
         assert payload["pid"] == os.getpid(), "PID should be overwritten, not preserved via setdefault"
         assert payload["start_time"] != 1000.0, "start_time should be overwritten on restart"
 
+    def test_write_runtime_status_persists_and_clears_pending_reload(self, tmp_path, monkeypatch):
+        """The dashboard "restart pending" badge reads this signal (t_25e5ee8c)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        # A fresh record defaults the field to None (no skew at boot).
+        status.write_runtime_status(gateway_state="running")
+        assert status.read_runtime_status()["pending_reload"] is None
+
+        # Skew observed -> the boot/disk revs are surfaced for the badge.
+        payload = {"boot_rev": "aaaaaaaaaa", "disk_rev": "bbbbbbbbbb"}
+        status.write_runtime_status(pending_reload=payload)
+        assert status.read_runtime_status()["pending_reload"] == payload
+
+        # An unrelated write must not drop the standing signal (merge semantics).
+        status.write_runtime_status(active_agents=1)
+        assert status.read_runtime_status()["pending_reload"] == payload
+
+        # Skew cleared (gateway restarted onto matching code) -> back to None.
+        status.write_runtime_status(pending_reload=None)
+        assert status.read_runtime_status()["pending_reload"] is None
+
     def test_write_runtime_status_overwrites_stale_argv_on_restart(self, tmp_path, monkeypatch):
         """Regression: gateway_state.json must not keep the previous launch argv."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

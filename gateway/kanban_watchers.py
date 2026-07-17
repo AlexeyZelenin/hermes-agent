@@ -24,6 +24,11 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# Sentinel distinct from any real ``pending_reload`` payload (``None`` or a
+# ``{"boot_rev", "disk_rev"}`` dict) so the dispatcher's first tick always
+# writes, clearing a stale value inherited from a prior gateway boot.
+_UNWRITTEN_PENDING_RELOAD = object()
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -1318,6 +1323,7 @@ class GatewayKanbanWatchersMixin:
         # is in-gateway agent/cron/API work (`_active_work_count`).
         from gateway import self_redeploy as _sr
         from gateway.code_skew import detect_code_skew as _detect_code_skew
+        from gateway.status import write_runtime_status as _write_runtime_status
 
         _under_service = bool(os.environ.get("INVOCATION_ID")) or os.environ.get(
             "XPC_SERVICE_NAME", "0"
@@ -1334,6 +1340,11 @@ class GatewayKanbanWatchersMixin:
             ),
             logger=logger,
         )
+        # Last ``pending_reload`` payload persisted to gateway_state.json so the
+        # dashboard badge (task t_25e5ee8c) can render "engine changed, restart
+        # to apply". Sentinel forces a write on the first tick, which also
+        # clears any stale value a previous gateway left behind after restart.
+        _pending_reload_written: object = _UNWRITTEN_PENDING_RELOAD
 
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
@@ -1362,6 +1373,21 @@ class GatewayKanbanWatchersMixin:
                     await self._notify_engine_redeploy(
                         _decision.boot_rev, _decision.disk_rev, _redeploy_mode
                     )
+                # Mirror the skew into gateway_state.json for the dashboard
+                # "restart pending" badge. Independent of auto_redeploy mode:
+                # the badge is the interactive default (notify + a reload
+                # button), so it surfaces even when auto-restart is off. Only
+                # write on change to avoid a status-file write every tick.
+                _pending = (
+                    {"boot_rev": _decision.boot_rev, "disk_rev": _decision.disk_rev}
+                    if _decision.disk_rev
+                    else None
+                )
+                if _pending != _pending_reload_written:
+                    await asyncio.to_thread(
+                        _write_runtime_status, pending_reload=_pending
+                    )
+                    _pending_reload_written = _pending
             except Exception:
                 logger.exception("kanban dispatcher: self-redeploy check failed")
 

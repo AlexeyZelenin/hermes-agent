@@ -86,6 +86,14 @@ export interface Translations {
       starting: string;
       stopped: string;
     };
+    /** "Restart pending" badge by the logo (self-redeploy + vibe-code).
+     * Optional so untranslated locales fall back to the English copy. */
+    pendingReload?: {
+      tooltip: string;
+      confirmTitle: string;
+      confirmBody: string;
+      confirmButton: string;
+    };
     nav: {
       analytics: string;
       chat: string;

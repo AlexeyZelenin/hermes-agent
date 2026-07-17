@@ -69,6 +69,13 @@ export const en: Translations = {
       starting: "Starting",
       stopped: "Stopped",
     },
+    pendingReload: {
+      tooltip: "Engine changed — restart to apply the update",
+      confirmTitle: "Restart the engine?",
+      confirmBody:
+        "The engine changed and the new code runs only after a restart. Running tasks keep going — they continue in the background across the restart.",
+      confirmButton: "Restart engine",
+    },
     nav: {
       analytics: "Analytics",
       chat: "Chat",

@@ -2764,6 +2764,12 @@ async def get_status(profile: Optional[str] = None):
             "gateway_exit_reason": gateway_exit_reason,
             "gateway_updated_at": gateway_updated_at,
             "active_agents": active_agents,
+            # Unified "engine restart pending" signal (task t_25e5ee8c): set by
+            # the gateway's self-redeploy tick when the checkout drifted past
+            # its boot snapshot (a self-redeploy merge or a user's vibe-code
+            # commit). Public so the dashboard badge works under the auth gate
+            # too; the payload is only two short git-rev prefixes.
+            "pending_reload": (runtime or {}).get("pending_reload"),
             "gateway_busy": gateway_busy,
             "gateway_drainable": gateway_drainable,
             "restart_drain_timeout": restart_drain_timeout,

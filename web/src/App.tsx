@@ -62,6 +62,7 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { cn } from "@/lib/utils";
+import { PendingReloadBadge } from "@/components/PendingReloadBadge";
 import { SidebarFooter } from "@/components/SidebarFooter";
 import { SidebarStatusStrip, gatewayLine } from "@/components/SidebarStatusStrip";
 import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
@@ -530,6 +531,8 @@ export default function App() {
         <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
           {t.app.brand}
         </Typography>
+
+        <PendingReloadBadge status={sidebarStatus} />
       </header>
 
       {mobileOpen && (
@@ -588,6 +591,8 @@ export default function App() {
                   <br />
                   Agent
                 </Typography>
+
+                <PendingReloadBadge status={sidebarStatus} />
               </div>
 
               <Button
