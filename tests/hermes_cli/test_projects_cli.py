@@ -39,6 +39,27 @@ def test_create_list_show(capsys, tmp_path):
     assert "My App" in capsys.readouterr().out
 
 
+def test_set_prompt_and_clear(capsys, tmp_path):
+    _run(["create", "SimpleBusiness", str(tmp_path), "--slug", "sb"])
+    capsys.readouterr()
+
+    assert _run(["set-prompt", "sb", "Source code is in ../../src/SimpleBusiness"]) == 0
+    out = capsys.readouterr().out
+    assert "Set append-prompt for sb" in out
+    assert "Source code is in ../../src/SimpleBusiness" in out
+    with pdb.connect_closing() as conn:
+        assert (
+            pdb.get_project(conn, "sb").append_system_prompt
+            == "Source code is in ../../src/SimpleBusiness"
+        )
+
+    # No value clears it (stores NULL).
+    assert _run(["set-prompt", "sb"]) == 0
+    assert "Cleared append-prompt for sb" in capsys.readouterr().out
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, "sb").append_system_prompt is None
+
+
 def test_add_remove_folder(tmp_path):
     _run(["create", "P", str(tmp_path / "a")])
     assert _run(["add-folder", "p", str(tmp_path / "b")]) == 0

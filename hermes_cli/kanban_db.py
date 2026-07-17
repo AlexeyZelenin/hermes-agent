@@ -1057,6 +1057,9 @@ class Task:
     # effort. NULL falls through to the board / global ``models_effort`` map,
     # then the executor default. Frozen at create time like ``model_override``.
     effort_override: Optional[str] = None
+    # Per-task append-system-prompt, frozen from the project at create time.
+    # Exported to the ACP executor which prepends it to the worker prompt.
+    append_system_prompt: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1157,6 +1160,7 @@ class Task:
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             effort_override=row["effort_override"] if "effort_override" in keys and row["effort_override"] else None,
+            append_system_prompt=row["append_system_prompt"] if "append_system_prompt" in keys and row["append_system_prompt"] else None,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1326,6 +1330,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- pins the session effort. NULL = fall through to the board / global
     -- models_effort map, then the executor default.
     effort_override      TEXT,
+    -- Per-task append-system-prompt, frozen from the task's project at create
+    -- time (the dispatcher has no projects.db access). Exported as
+    -- HERMES_KANBAN_APPEND_PROMPT so the ACP executor prepends it to the
+    -- worker prompt — the ACP-path equivalent of `claude --append-system-prompt`.
+    append_system_prompt TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2139,6 +2148,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # falls through to the board / global default (prior behaviour).
         conn.execute("ALTER TABLE tasks ADD COLUMN effort_override TEXT")
 
+    if "append_system_prompt" not in cols:
+        # Per-task append-system-prompt, frozen from the project. Existing rows
+        # get NULL (no append), preserving prior behaviour.
+        conn.execute("ALTER TABLE tasks ADD COLUMN append_system_prompt TEXT")
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2641,6 +2655,7 @@ def create_task(
     executor: Optional[str] = None,
     model_override: Optional[str] = None,
     effort_override: Optional[str] = None,
+    append_system_prompt: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2747,6 +2762,14 @@ def create_task(
     if effort_override is None and project_obj is not None:
         effort_override = _clean_effort_map(
             getattr(project_obj, "models_effort", None)).get("worker")
+    # Append-system-prompt: explicit override wins; else freeze the project's
+    # value (per-profile projects.db is unreachable at dispatch time). Stored on
+    # the task and exported to the ACP executor as HERMES_KANBAN_APPEND_PROMPT.
+    append_system_prompt = str(append_system_prompt or "").strip() or None
+    if append_system_prompt is None and project_obj is not None:
+        append_system_prompt = (
+            getattr(project_obj, "append_system_prompt", None) or None
+        )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2904,11 +2927,11 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, executor, model_override,
-                        effort_override,
+                        effort_override, append_system_prompt,
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2926,6 +2949,7 @@ def create_task(
                         executor,
                         model_override,
                         effort_override,
+                        append_system_prompt,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -5789,7 +5813,8 @@ def decompose_triage_task(
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path, "
-            "       executor, model_override, project_id, assignee "
+            "       executor, model_override, project_id, assignee, "
+            "       append_system_prompt "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5819,6 +5844,12 @@ def decompose_triage_task(
         root_executor = root_row["executor"] or "hermes-worker"
         root_model = root_row["model_override"]
         root_project_id = root_row["project_id"]
+        # Children inherit the root's project-frozen append-system-prompt too, so
+        # a fanned-out project task's subtasks keep the same orientation prompt.
+        root_append_prompt = (
+            root_row["append_system_prompt"]
+            if "append_system_prompt" in root_row.keys() else None
+        )
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -5846,8 +5877,8 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by, "
-                " executor, model_override, project_id) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)",
+                " executor, model_override, project_id, append_system_prompt) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5861,6 +5892,7 @@ def decompose_triage_task(
                     root_executor,
                     child_model,
                     root_project_id,
+                    root_append_prompt,
                 ),
             )
             _append_event(
@@ -9083,6 +9115,12 @@ def _default_spawn(
             env["HERMES_KANBAN_MODEL"] = effective_model
         if effective_effort:
             env["HERMES_KANBAN_EFFORT"] = effective_effort
+        # Project-frozen append-system-prompt: the ACP-path equivalent of a
+        # manual `claude --append-system-prompt`. The executor prepends it to
+        # the worker prompt. Only set when non-empty so ordinary tasks are
+        # byte-for-byte unchanged.
+        if task.append_system_prompt:
+            env["HERMES_KANBAN_APPEND_PROMPT"] = task.append_system_prompt
         cmd = [sys.executable, "-m", "agent.acp_task_executor"]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so

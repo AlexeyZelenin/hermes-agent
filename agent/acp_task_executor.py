@@ -227,6 +227,13 @@ def run_task(*, executor, task_id, workspace, board=None):
         context, run_id = kb.build_worker_context(conn, task_id), task.current_run_id
     command,args=command_for(executor)
     prompt=("You are the sole native external coding-harness session for this already-scoped task. Work only in the supplied cwd; do not orchestrate child tasks. Follow project rules and return a concise factual handoff with tests run. Never create test fixtures against live shared or host state: tests that need a kanban board must spin up an isolated one (set HERMES_KANBAN_HOME to a temp dir); tests that touch the OS keychain, credential stores, or other host state must use a temporary/throwaway store (e.g. a temp keychain via `security create-keychain`) or mock the calls - NEVER the real login keychain or live data, which prompts the user and pollutes their system. Clean up in teardown. If the cwd is a git repository and you changed files: run the relevant tests and COMMIT your work (conventional-commits message referencing the task id) before finishing - completing a code task with a dirty tree is a protocol violation; do not push.\n\n"+context)
+    # Project-frozen append-system-prompt (HERMES_KANBAN_APPEND_PROMPT): the
+    # ACP-path stand-in for a manual `claude --append-system-prompt`. This ACP
+    # server takes no such CLI flag, so the guidance rides at the head of the
+    # worker prompt, framed as project context. Empty/unset -> unchanged prompt.
+    append_prompt=os.getenv("HERMES_KANBAN_APPEND_PROMPT","").strip()
+    if append_prompt:
+        prompt="[project context]\n"+append_prompt+"\n\n"+prompt
     try:
         timeout=float(os.getenv("HERMES_ACP_TIMEOUT_SECONDS", "3600"))
         model=os.getenv("HERMES_KANBAN_MODEL","").strip() or None

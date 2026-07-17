@@ -111,6 +111,23 @@ def build_parser(
     p_model.add_argument("--strong", default=None,
                          help="Model for frontier chunks ('' clears)")
 
+    p_prompt = sub.add_parser(
+        "set-prompt",
+        help="Set the project's append-system-prompt (orients every task's worker)",
+        description=(
+            "Text prepended to every project task's worker prompt — the ACP "
+            "equivalent of a manual `claude --append-system-prompt`. Use it to "
+            "point the worker at out-of-tree source, e.g. "
+            "'Source code is in ../../src/SimpleBusiness'. Omit the value (or "
+            "pass an empty string) to clear."
+        ),
+    )
+    p_prompt.add_argument("project", help="Project id or slug")
+    p_prompt.add_argument(
+        "prompt", nargs="?", default="",
+        help="Prompt text (omit to clear)",
+    )
+
     p_bind = sub.add_parser("bind-board", help="Bind a kanban board to a project")
     p_bind.add_argument("project", help="Project id or slug")
     p_bind.add_argument(
@@ -173,6 +190,7 @@ def projects_command(args: argparse.Namespace) -> int:
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
         "set-model": _cmd_set_model,
+        "set-prompt": _cmd_set_prompt,
         "set-secret": _cmd_set_secret,
         "list-secrets": _cmd_list_secrets,
         "remove-secret": _cmd_remove_secret,
@@ -226,6 +244,8 @@ def _print_project(proj) -> None:
     if proj.models:
         roles = ", ".join(f"{k}={v}" for k, v in sorted(proj.models.items()))
         print(f"  models:  {roles}")
+    if proj.append_system_prompt:
+        print(f"  prompt:  {proj.append_system_prompt}")
     if proj.primary_path:
         print(f"  primary: {proj.primary_path}")
     if proj.folders:
@@ -385,6 +405,21 @@ def _cmd_set_model(args, conn, proj) -> int:
             merged.pop(role, None)
     pdb.update_project(conn, proj.id, models=merged)
     refreshed = pdb.get_project(conn, proj.id)
+    _print_project(refreshed)
+    return 0
+
+
+@_with_project
+def _cmd_set_prompt(args, conn, proj) -> int:
+    # Empty string clears (stores NULL); update_project treats "" as an explicit
+    # clear and None as "leave untouched", so always pass the (possibly empty)
+    # arg through rather than short-circuiting.
+    pdb.update_project(conn, proj.id, append_system_prompt=args.prompt)
+    refreshed = pdb.get_project(conn, proj.id)
+    if refreshed and refreshed.append_system_prompt:
+        print(f"Set append-prompt for {proj.slug}")
+    else:
+        print(f"Cleared append-prompt for {proj.slug}")
     _print_project(refreshed)
     return 0
 
