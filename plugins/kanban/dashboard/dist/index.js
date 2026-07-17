@@ -223,6 +223,18 @@
     return p.phantom_cards || p.phantom_refs || [];
   }
 
+  // A task is "persistent" only when it carries a saved identity — a
+  // non-empty string id (the tasks-table primary key). The /board endpoint
+  // never synthesises rows, but the client's cached grid can momentarily
+  // hold an entry with no id: an optimistic mutation, a mid-flight WS reload,
+  // or a malformed object. Rendering one of those produces a phantom empty
+  // card (blank id, an "(untitled)" title) that maps to nothing in the DB.
+  // Gate every rendered row on this so a card only ever appears for a task
+  // that actually exists.
+  function isPersistentTask(t) {
+    return !!t && typeof t.id === "string" && t.id.trim() !== "";
+  }
+
   // Takes an optional `t` so the prompt/alert text is localised. Callers
   // outside React components can pass null and fall through to English.
   function withCompletionSummary(patch, count, t) {
@@ -294,6 +306,41 @@
     if (!board) return url;
     const sep = url.indexOf("?") >= 0 ? "&" : "?";
     return `${url}${sep}board=${encodeURIComponent(board)}`;
+  }
+
+  // Deep-link the current view (project + open task) into the page URL so a
+  // manual refresh keeps the operator where they were instead of falling back
+  // to the default board (what feels like being "thrown into the Inbox"). The
+  // host mounts this plugin on a plain path route (``/kanban`` under
+  // BrowserRouter, which matches on pathname only), so writing our own query
+  // params is safe: react-router ignores the search string and a
+  // ``history.replaceState`` write fires no navigation, so nothing remounts.
+  // localStorage (``writeSelectedBoard``) still mirrors the board pick as a
+  // fallback for when the URL has no opinion (fresh tab, cleared address bar).
+  const URL_PARAM_BOARD = "board";
+  const URL_PARAM_TASK = "task";
+
+  function readViewFromUrl() {
+    try {
+      const p = new URLSearchParams(window.location.search);
+      return {
+        board: (p.get(URL_PARAM_BOARD) || "").trim() || null,
+        task: (p.get(URL_PARAM_TASK) || "").trim() || null,
+      };
+    } catch (_e) { return { board: null, task: null }; }
+  }
+
+  function writeViewToUrl(board, task) {
+    try {
+      const url = new URL(window.location.href);
+      if (board) url.searchParams.set(URL_PARAM_BOARD, board);
+      else url.searchParams.delete(URL_PARAM_BOARD);
+      if (task) url.searchParams.set(URL_PARAM_TASK, task);
+      else url.searchParams.delete(URL_PARAM_TASK);
+      if (url.href !== window.location.href) {
+        window.history.replaceState(window.history.state, "", url.href);
+      }
+    } catch (_e) { /* ignore malformed URL / hardened browser */ }
   }
 
   // The SDK's Select component fires ``onValueChange(value)`` directly
@@ -558,7 +605,9 @@
 
   function KanbanPage() {
     const { t } = useI18n();
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    // Restore the view from the deep-link URL first (survives a hard refresh
+    // and is shareable), then the localStorage pin, then the server default.
+    const [board, setBoard] = useState(() => readViewFromUrl().board || readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -583,7 +632,7 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(null);
+    const [selectedTaskId, setSelectedTaskId] = useState(() => readViewFromUrl().task);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
@@ -595,6 +644,13 @@
     // own task's counter so it reloads itself on live events instead of
     // showing stale data.
     const [taskEventTick, setTaskEventTick] = useState({});
+
+    // Mirror the selected board + open task into the URL as they change, so
+    // the address bar is always a deep-link back to the current view. Also
+    // upgrades a localStorage-only board pick into a shareable URL on mount.
+    useEffect(function () {
+      writeViewToUrl(board, selectedTaskId);
+    }, [board, selectedTaskId]);
 
     const cursorRef = useRef(0);
     const reloadTimerRef = useRef(null);
@@ -752,6 +808,9 @@
       if (!boardData) return null;
       const q = search.trim().toLowerCase();
       const filterTask = function (t) {
+        // Drop phantom/optimistic rows that carry no saved task id before
+        // anything renders them — a card must map to a real DB task.
+        if (!isPersistentTask(t)) return false;
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
         if (q) {
@@ -1058,6 +1117,9 @@
       setTenantFilter("");
       setAssigneeFilter("");
       setIncludeArchived(false);
+      // The open task belongs to the old board; close it so the deep-link
+      // doesn't point at a task the new board can't show.
+      setSelectedTaskId(null);
       clearSelected();
     }, [board, clearSelected]);
 
@@ -1211,7 +1273,7 @@
           onDelete: deleteTask,
           onOpen: setSelectedTaskId,
           onCreate: createTask,
-          allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
+          allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks.filter(isPersistentTask)); }, []),
           categories: (boardData && boardData.categories) || [],
         }),
         selectedTaskId ? h(TaskDrawer, {
@@ -1221,7 +1283,7 @@
           onOpenTask: setSelectedTaskId,
           onRefresh: loadBoard,
           renderMarkdown: renderMd,
-          allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
+          allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks.filter(isPersistentTask)); }, []),
           assignees: (boardData && boardData.assignees) || [],
           categories: (boardData && boardData.categories) || [],
           eventTick: taskEventTick[selectedTaskId] || 0,
