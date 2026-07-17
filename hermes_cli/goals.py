@@ -1611,6 +1611,12 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    soft_handoff_config=None,
+    context_occupancy_fn=None,
+    compaction_active_fn=None,
+    reset_session_fn=None,
+    session_id_fn=None,
+    spec_dir=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1635,6 +1641,15 @@ def run_kanban_goal_loop(
     (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
     (reason: str -> None).
 
+    When ``soft_handoff_config`` is supplied (with a ``context_occupancy_fn``
+    and ``reset_session_fn``), a *soft context-budget handoff* runs before each
+    continuation turn: if the live context window has crossed the soft
+    threshold, the worker's state is checkpointed to a versioned spec-file and
+    the loop resumes in a FRESH session with a clean window. This is a
+    pre-emptive, bounded layer ABOVE the hard defenses - the turn budget below
+    and Hermes' own auto-compaction remain the last line and are untouched.
+    Every missing-metric / failure path degrades to a normal in-session turn.
+
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
     ``"blocked_by_worker"``, or ``"stopped"``.
@@ -1655,6 +1670,7 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    handoffs_done = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -1715,7 +1731,30 @@ def run_kanban_goal_loop(
                 _log(f"kanban goal loop: block_fn failed ({exc})")
             return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
 
-        # Run another turn in the same session.
+        # Soft context-budget handoff (t_475e54f4): before spending another
+        # CONTINUATION turn, check whether the live context window has crossed
+        # the soft threshold. If so, checkpoint state to a versioned spec-file
+        # and resume in a FRESH session with a clean window instead of riding
+        # this one down into repeated compaction / the hard wall. The finalize
+        # nudge (verdict == done) is a one-shot and never handed off. Every
+        # failure / missing-metric path leaves ``prompt`` unchanged and runs
+        # the turn in the same session - the turn budget above stays the hard
+        # last-line defense.
+        if soft_handoff_config is not None and verdict != "done":
+            from hermes_cli import soft_handoff as _sh
+            outcome = _sh.maybe_handoff(
+                base_prompt=prompt, task_id=task_id, goal_text=goal_text,
+                progress=last_response, next_step=reason, handoffs_done=handoffs_done,
+                config=soft_handoff_config, occupancy_fn=context_occupancy_fn,
+                compaction_fn=compaction_active_fn, reset_fn=reset_session_fn,
+                session_id_fn=session_id_fn, spec_dir=spec_dir,
+                now_fn=lambda: datetime.now(timezone.utc).isoformat(), log=_log,
+            )
+            prompt = outcome.prompt
+            if outcome.handed_off:
+                handoffs_done += 1
+
+        # Run another turn (in the same session, or the fresh one after a handoff).
         try:
             last_response = run_turn(prompt) or ""
         except Exception as exc:
