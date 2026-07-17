@@ -17,14 +17,21 @@ strict:
   default (a *safe* absence) - it never falls through to another project or to
   ``os.environ``.
 
-Storage: on macOS (the *standard of care*) secrets live encrypted in the OS
-login Keychain via :class:`KeychainProjectSecretStore` - never a plaintext file,
-so they are excluded from Time Machine and backups. Other platforms fall back to
-:class:`FileProjectSecretStore`: a gitignored, ``0600`` JSON file at
-``$HERMES_HOME/projects/<project_id>/secrets.json``, co-located with the
-per-profile ``projects.db``. Both sit behind the :class:`ProjectSecretStore`
-interface, so :func:`get_default_store` swaps backend by platform without
-touching any caller (native Windows / Linux keychain backends deferred).
+Storage: on macOS (the *standard of care*) secrets are encrypted at rest. A
+single random master key lives in the OS login Keychain
+(:class:`KeychainMasterKey`) - one item, created once, read non-interactively -
+and each project's secret map is stored as authenticated ciphertext in a
+``0600`` file at ``$HERMES_HOME/projects/<project_id>/secrets.enc``
+(:class:`EncryptedFileProjectSecretStore`), decrypted only in memory. This gives
+encryption at rest (the file is useless in a Time Machine snapshot or backup
+without the Keychain-held key) with **zero per-secret Keychain prompts** - the
+naive "one Keychain item per secret/project" backend prompted on first access to
+each item and was rejected. Other platforms fall back to the plaintext
+:class:`FileProjectSecretStore` until a native secret backend lands for them
+(Windows Credential Manager / Linux Secret Service, and product backends such as
+1Password Service Accounts / Vault, are deferred behind this same
+:class:`ProjectSecretStore` interface). :func:`get_default_store` swaps backend
+by platform without touching any caller.
 
 The resolution contract is **env-inject at spawn**: the kanban dispatcher's
 ``_default_spawn`` layers a task's project secrets over the child's inherited
@@ -50,6 +57,8 @@ import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from agent.secret_scope import _is_global_env
 from agent.secret_sources.base import is_valid_env_name
@@ -250,16 +259,16 @@ class FileProjectSecretStore(ProjectSecretStore):
         except OSError:
             pass
         payload = json.dumps(cleaned, ensure_ascii=False, indent=2, sort_keys=True)
-        _atomic_write_private(path, payload)
+        _atomic_write_private(path, payload.encode("utf-8"))
 
 
-def _atomic_write_private(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` atomically with ``0600`` permissions."""
+def _atomic_write_private(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically with ``0600`` permissions."""
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".secrets_", suffix=".tmp")
     try:
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         atomic_replace(tmp, path)
@@ -276,49 +285,50 @@ def _atomic_write_private(path: Path, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# macOS Keychain backend
+# macOS master key (Keychain) + encrypted-file backend
 # ---------------------------------------------------------------------------
 
-# One login-Keychain generic-password item per project; its password field
-# holds that project's ``{NAME: value}`` map as a JSON string. This mirrors how
-# Claude Code stores its OAuth payload (see
-# :func:`agent.claude_subscriptions._read_credentials_keychain`).
-_KEYCHAIN_SERVICE = "hermes-project-secrets"
+# ONE login-Keychain generic-password item holds a single random data-encryption
+# key for all project secrets. Per-project secret maps are AEAD-encrypted with
+# it and stored on disk (see :class:`EncryptedFileProjectSecretStore`); the
+# Keychain never holds a per-project or per-secret item, so there is no
+# per-secret access prompt. Mirrors how Claude Code parks material in the
+# Keychain (see :func:`agent.claude_subscriptions._read_credentials_keychain`).
+_MASTER_KEY_SERVICE = "hermes-project-secrets-master"
+_MASTER_KEY_ACCOUNT = "master"
 _SECURITY_TIMEOUT = 5
 
 
-class KeychainProjectSecretStore(ProjectSecretStore):
-    """macOS Keychain backend - the *standard of care* for project secrets.
+class MasterKeyUnavailable(ProjectSecretError):
+    """The at-rest master key could not be read or created (no secure backend)."""
 
-    Secret material is stored encrypted in the OS login Keychain instead of a
-    plaintext file, so it is never exposed to Time Machine snapshots, cloud or
-    local backups, or a stray ``cat`` of the profile directory - the concrete
-    at-rest risk the file backend carries. The store keeps one generic-password
-    item per ``project_id`` (service ``hermes-project-secrets``) whose password
-    field is the project's validated ``{NAME: value}`` map as JSON, so
-    :meth:`get_all` / :meth:`replace_all` stay a single Keychain read / write.
 
-    macOS only; :meth:`is_available` gates selection so non-Darwin hosts keep
-    the :class:`FileProjectSecretStore` fallback (a real OS-keychain backend for
-    Windows / Linux is deferred behind this same interface).
+class KeychainMasterKey:
+    """A single Fernet master key parked in the macOS login Keychain.
 
-    Known limitation: writes shell out to ``security add-generic-password -w``,
-    which places the value on the process argv (briefly visible to a same-user
-    ``ps``). Items are created ``-A`` (any same-user app may read) so autonomous
-    spawns never block on an interactive Keychain-access prompt. Both are
-    same-user exposures no worse than the ``0600`` file this replaces; the win
-    is encryption at rest and exclusion from backups.
+    :meth:`get_or_create` returns the process-wide data key, creating it on
+    first use. Exactly one Keychain item ever exists (service
+    ``hermes-project-secrets-master``); it is created ``-A`` (readable by any
+    same-user app without a prompt) so an autonomous spawn never blocks on an
+    interactive Keychain-access dialog, and the value is cached in memory so the
+    Keychain is touched at most once per process. The key is **never** deleted
+    or rotated here - doing so would orphan every existing ciphertext.
+
+    Known limitation: creation shells out to ``security add-generic-password
+    -w``, briefly placing the key on the process argv (visible to a same-user
+    ``ps``). This happens once, ever; reads pass no value on argv.
     """
 
     def __init__(self, *, service: Optional[str] = None, keychain: Optional[str] = None):
         # ``keychain`` targets a specific keychain file (tests point at an
         # isolated temp keychain); ``None`` uses the user's default search list.
-        self._service = service or _KEYCHAIN_SERVICE
+        self._service = service or _MASTER_KEY_SERVICE
         self._keychain = keychain
+        self._cached: Optional[bytes] = None
 
     @staticmethod
     def is_available() -> bool:
-        """Whether this host can use the Keychain backend (macOS + ``security``)."""
+        """Whether this host can use the Keychain (macOS + ``security``)."""
         return platform.system() == "Darwin" and shutil.which("security") is not None
 
     def _run(self, args: List[str]) -> Optional[subprocess.CompletedProcess]:
@@ -333,24 +343,107 @@ class KeychainProjectSecretStore(ProjectSecretStore):
         except (OSError, subprocess.TimeoutExpired):
             return None
 
-    def get_all(self, project_id: str) -> Dict[str, str]:
-        account = _safe_project_id(project_id)
+    def _read(self) -> Optional[bytes]:
+        """Return the stored key, or ``None`` if no item exists.
+
+        Raises :class:`MasterKeyUnavailable` when the Keychain is unreachable or
+        the stored value is not a valid key (never silently mints a new key over
+        a corrupt one - that would orphan existing ciphertext).
+        """
         result = self._run([
-            "find-generic-password", "-s", self._service, "-a", account, "-w",
+            "find-generic-password", "-s", self._service,
+            "-a", _MASTER_KEY_ACCOUNT, "-w",
         ])
         if result is None:
-            _log.warning("keychain unavailable reading project secrets for %s "
-                         "(treating as empty)", project_id)
-            return {}
+            raise MasterKeyUnavailable("macOS Keychain (security) is unavailable")
         if result.returncode != 0 or not result.stdout.strip():
+            return None
+        key = result.stdout.strip().encode("ascii")
+        try:
+            Fernet(key)  # validates length + base64 shape
+        except (ValueError, TypeError) as exc:
+            raise MasterKeyUnavailable(
+                "the stored project-secrets master key is corrupt; refusing to "
+                "mint a new one (it would orphan existing secrets)"
+            ) from exc
+        return key
+
+    def get_or_create(self) -> bytes:
+        if self._cached is not None:
+            return self._cached
+        key = self._read()
+        if key is None:
+            key = Fernet.generate_key()
+            added = self._run([
+                "add-generic-password", "-s", self._service,
+                "-a", _MASTER_KEY_ACCOUNT, "-w", key.decode("ascii"),
+                "-A", "-D", "hermes project secrets master key",
+            ])
+            if added is None:
+                raise MasterKeyUnavailable(
+                    "macOS Keychain (security) is unavailable or timed out"
+                )
+            if added.returncode != 0:
+                # A concurrent process may have won the create race; re-read and
+                # adopt the winner rather than failing.
+                key = self._read()
+                if key is None:
+                    raise MasterKeyUnavailable(
+                        f"could not persist the master key (security exited "
+                        f"{added.returncode})"
+                    )
+        self._cached = key
+        return key
+
+
+class EncryptedFileProjectSecretStore(ProjectSecretStore):
+    """Encrypted-at-rest backend - the *standard of care* for project secrets.
+
+    Each project's validated ``{NAME: value}`` map is serialised to JSON and
+    stored as authenticated (Fernet / AES-CBC + HMAC) ciphertext in a ``0600``
+    file at ``$HERMES_HOME/projects/<project_id>/secrets.enc``. The data key
+    comes from a :class:`KeychainMasterKey`, so the on-disk file is useless in a
+    Time Machine snapshot or backup without the Keychain-held key, and plaintext
+    exists only in process memory - the concrete at-rest risk the plaintext file
+    backend carries, closed without any per-secret Keychain prompt.
+
+    ``home`` pins the profile root (tests pass an explicit path); when ``None``
+    it resolves lazily via :func:`get_hermes_home` on every access.
+    """
+
+    def __init__(self, *, home: Optional[Path] = None, master: KeychainMasterKey):
+        self._home = Path(home) if home is not None else None
+        self._master = master
+
+    def _home_dir(self) -> Path:
+        return self._home if self._home is not None else get_hermes_home()
+
+    def path_for(self, project_id: str) -> Path:
+        pid = _safe_project_id(project_id)
+        return self._home_dir() / "projects" / pid / "secrets.enc"
+
+    def get_all(self, project_id: str) -> Dict[str, str]:
+        path = self.path_for(project_id)
+        try:
+            token = path.read_bytes()
+        except (FileNotFoundError, NotADirectoryError, OSError):
+            return {}
+        if not token.strip():
             return {}
         try:
-            data = json.loads(result.stdout.strip())
-        except (ValueError, TypeError):
-            # Corrupt item -> fail closed (no secrets), never crash the spawn
-            # path. Log the project only, never any parsed content.
-            _log.warning("project secrets keychain item for %s is unreadable; "
-                         "treating as empty", project_id)
+            key = self._master.get_or_create()
+        except MasterKeyUnavailable:
+            _log.warning("master key unavailable reading project secrets for %s "
+                         "(treating as empty)", project_id)
+            return {}
+        try:
+            raw = Fernet(key).decrypt(token)
+            data = json.loads(raw)
+        except (InvalidToken, ValueError, TypeError):
+            # Corrupt / undecryptable store -> fail closed (no secrets), never
+            # crash the spawn path. Log the project only, never any content.
+            _log.warning("project secrets file for %s is unreadable; "
+                         "treating as empty (%s)", project_id, path)
             return {}
         if not isinstance(data, dict):
             return {}
@@ -362,31 +455,24 @@ class KeychainProjectSecretStore(ProjectSecretStore):
         return out
 
     def replace_all(self, project_id: str, secrets: Dict[str, str]) -> None:
-        account = _safe_project_id(project_id)
         cleaned = validate_secrets(secrets)
-        # Always delete-then-add. ``add -U`` (update-in-place) of an existing
-        # item blocks on an interactive Keychain-authorization prompt, which
-        # would hang an autonomous spawn; deleting first (ignore "not found")
-        # then adding fresh never prompts. Also leaves no empty husk when the
-        # set becomes empty.
-        self._run(["delete-generic-password", "-s", self._service, "-a", account])
+        path = self.path_for(project_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
         if not cleaned:
+            # Empty set -> remove the file rather than leave an empty husk.
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
             return
+        key = self._master.get_or_create()  # raises MasterKeyUnavailable on failure
         payload = json.dumps(cleaned, ensure_ascii=False, sort_keys=True)
-        result = self._run([
-            "add-generic-password", "-s", self._service, "-a", account,
-            "-w", payload, "-A", "-D", "hermes project secrets",
-        ])
-        if result is None:
-            raise ProjectSecretError(
-                f"could not write project secrets for {project_id}: the macOS "
-                "Keychain (security) is unavailable or timed out"
-            )
-        if result.returncode != 0:
-            raise ProjectSecretError(
-                f"could not write project secrets for {project_id} to the macOS "
-                f"Keychain (security exited {result.returncode})"
-            )
+        token = Fernet(key).encrypt(payload.encode("utf-8"))
+        _atomic_write_private(path, token)
 
 
 # ---------------------------------------------------------------------------
@@ -397,17 +483,18 @@ _default_store: Optional[ProjectSecretStore] = None
 
 
 def _build_default_store() -> ProjectSecretStore:
-    """Keychain on macOS (standard of care); file backend elsewhere."""
-    if KeychainProjectSecretStore.is_available():
-        return KeychainProjectSecretStore()
+    """Encrypted store keyed off the Keychain on macOS; file backend elsewhere."""
+    if KeychainMasterKey.is_available():
+        return EncryptedFileProjectSecretStore(master=KeychainMasterKey())
     return FileProjectSecretStore()
 
 
 def get_default_store() -> ProjectSecretStore:
     """Return the process default store.
 
-    macOS resolves to :class:`KeychainProjectSecretStore`; other platforms keep
-    the :class:`FileProjectSecretStore` until a native backend lands for them.
+    macOS resolves to :class:`EncryptedFileProjectSecretStore` (a Keychain-held
+    master key encrypting per-project files); other platforms keep the plaintext
+    :class:`FileProjectSecretStore` until a native backend lands for them.
     """
     global _default_store
     if _default_store is None:
