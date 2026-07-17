@@ -176,3 +176,36 @@ class _connection_context:
 
     def __exit__(self, *exc):
         return False
+
+
+def test_acp_worker_passes_requested_model_to_session(monkeypatch, kanban_conn, tmp_path):
+    """HERMES_KANBAN_MODEL from the dispatcher reaches the ACP client."""
+    from agent import acp_task_executor as executor
+
+    task_id = kb.create_task(kanban_conn, title="Modeled task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+    monkeypatch.setenv("HERMES_KANBAN_MODEL", "claude-opus-9")
+
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def _run_prompt(self, prompt, *, timeout_seconds):
+            return "done", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    executor.run_task(executor="claude-code", task_id=task_id,
+                      workspace=str(tmp_path), board="test")
+    assert captured["session_model"] == "claude-opus-9"
+
+    monkeypatch.delenv("HERMES_KANBAN_MODEL")
+    task_id2 = kb.create_task(kanban_conn, title="Default-model task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id2, claimer="test-lock") is not None
+    executor.run_task(executor="claude-code", task_id=task_id2,
+                      workspace=str(tmp_path), board="test")
+    assert captured["session_model"] is None

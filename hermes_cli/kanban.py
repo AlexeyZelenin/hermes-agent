@@ -295,6 +295,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_rename.add_argument("slug")
     b_rename.add_argument("name", help="New display name")
 
+    b_set_model = boards_sub.add_parser(
+        "set-model",
+        help="Configure the board's model map (worker/aux/cheap/strong roles)",
+        description=(
+            "Per-role models for this board. worker = default model for "
+            "task workers; aux = auxiliary planning roles (decomposer, "
+            "batch planner); cheap/strong = the tiers Take v2 assigns to "
+            "mechanical vs. complex chunks. Pass '' to clear a role. "
+            "Omitted roles keep their current value."
+        ),
+    )
+    b_set_model.add_argument("slug")
+    b_set_model.add_argument("--worker", default=None,
+                             help="Default worker model ('' clears)")
+    b_set_model.add_argument("--aux", default=None,
+                             help="Auxiliary-roles model ('' clears)")
+    b_set_model.add_argument("--cheap", default=None,
+                             help="Model for mechanical chunks ('' clears)")
+    b_set_model.add_argument("--strong", default=None,
+                             help="Model for complex chunks ('' clears)")
+
     b_set_wd = boards_sub.add_parser(
         "set-default-workdir",
         help="Set the default workspace path for tasks on a board",
@@ -315,6 +336,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--model", default=None,
+                          help="Per-task model override (wins over the "
+                               "project/board model map)")
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -1031,6 +1055,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "set-model":
+        return _cmd_boards_set_model(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1112,6 +1138,34 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         print(f"  Switched to {meta['slug']!r}.")
     else:
         print(f"  Use `hermes kanban boards switch {meta['slug']}` to make it current.")
+    return 0
+
+
+def _cmd_boards_set_model(args: argparse.Namespace) -> int:
+    updates = {
+        role: value
+        for role, value in (
+            ("worker", args.worker), ("aux", args.aux),
+            ("cheap", args.cheap), ("strong", args.strong),
+        )
+        if value is not None
+    }
+    if not updates:
+        print("kanban boards set-model: pass at least one of "
+              "--worker/--aux/--cheap/--strong", file=sys.stderr)
+        return 2
+    if not kb.board_exists(args.slug):
+        print(f"kanban boards set-model: board {args.slug!r} does not exist",
+              file=sys.stderr)
+        return 1
+    try:
+        meta = kb.write_board_metadata(args.slug, models=updates)
+    except ValueError as exc:
+        print(f"kanban boards set-model: {exc}", file=sys.stderr)
+        return 1
+    models = meta.get("models") or {}
+    print(f"Board {meta['slug']!r} models: "
+          + (json.dumps(models, ensure_ascii=False) if models else "(none)"))
     return 0
 
 
@@ -1347,6 +1401,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            model_override=getattr(args, "model", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1519,6 +1574,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
         print(f"  model:     {task.model_override}")
+    else:
+        try:
+            board_model = kb.resolve_model_map().get("worker")
+        except Exception:
+            board_model = None
+        if board_model:
+            print(f"  model:     {board_model} (board/global default)")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see

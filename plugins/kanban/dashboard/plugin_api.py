@@ -2037,6 +2037,8 @@ class CreateBoardBody(BaseModel):
     color: Optional[str] = None
     default_workdir: Optional[str] = None
     agent_limit: Optional[int] = None
+    executor: Optional[str] = None
+    models: Optional[dict] = None
     switch: bool = False
 
 
@@ -2046,6 +2048,8 @@ class RenameBoardBody(BaseModel):
     icon: Optional[str] = None
     color: Optional[str] = None
     agent_limit: Optional[int] = None
+    executor: Optional[str] = None
+    models: Optional[dict] = None
 
 
 def _board_counts(slug: str) -> dict[str, int]:
@@ -2116,6 +2120,8 @@ def create_board_endpoint(payload: CreateBoardBody):
             color=payload.color,
             default_workdir=default_workdir,
             agent_limit=payload.agent_limit,
+            executor=payload.executor,
+            models=payload.models,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2137,14 +2143,19 @@ def rename_board(slug: str, payload: RenameBoardBody):
         raise HTTPException(status_code=400, detail=str(exc))
     if not normed or not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
-    meta = kanban_db.write_board_metadata(
-        normed,
-        name=payload.name,
-        description=payload.description,
-        icon=payload.icon,
-        color=payload.color,
-        agent_limit=payload.agent_limit,
-    )
+    try:
+        meta = kanban_db.write_board_metadata(
+            normed,
+            name=payload.name,
+            description=payload.description,
+            icon=payload.icon,
+            color=payload.color,
+            agent_limit=payload.agent_limit,
+            executor=payload.executor,
+            models=payload.models,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"board": meta}
 
 
@@ -2346,6 +2357,9 @@ class OrchestrationSettingsBody(BaseModel):
     default_assignee: Optional[str] = None
     auto_decompose: Optional[bool] = None
     auto_promote_children: Optional[bool] = None
+    # Global dispatcher cap (kanban.max_in_progress). 0 clears the cap;
+    # None leaves it untouched. The dispatcher re-reads it every tick.
+    max_in_progress: Optional[int] = None
 
 
 @router.get("/orchestration")
@@ -2362,6 +2376,10 @@ def get_orchestration_settings():
     explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
     auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
+    try:
+        max_in_progress = int(kanban_cfg.get("max_in_progress") or 0) or None
+    except (TypeError, ValueError):
+        max_in_progress = None
 
     # Resolve fallbacks the same way the decomposer does.
     resolved_orch = explicit_orch
@@ -2385,6 +2403,7 @@ def get_orchestration_settings():
         "default_assignee": explicit_default,
         "auto_decompose": auto_decompose,
         "auto_promote_children": auto_promote_children,
+        "max_in_progress": max_in_progress,
         "resolved_orchestrator_profile": resolved_orch,
         "resolved_default_assignee": resolved_default,
         "active_profile": active_default,
@@ -2452,6 +2471,18 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
 
     if payload.auto_promote_children is not None:
         kanban_section["auto_promote_children"] = bool(payload.auto_promote_children)
+
+    if payload.max_in_progress is not None:
+        limit = int(payload.max_in_progress)
+        if limit < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="max_in_progress must be >= 0 (0 clears the cap)",
+            )
+        if limit == 0:
+            kanban_section.pop("max_in_progress", None)
+        else:
+            kanban_section["max_in_progress"] = limit
 
     try:
         save_config(cfg)

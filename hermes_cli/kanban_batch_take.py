@@ -133,6 +133,9 @@ def plan_and_take(task_ids: list[str], *, timeout: int = 90) -> BatchTakeOutcome
             from agent.auxiliary_client import call_llm
             response = call_llm(
                 task="kanban_batch_planner",
+                # Board-level "aux" model (if configured) overrides the
+                # auxiliary.kanban_batch_planner.* model from config.yaml.
+                model=kb.resolve_model_map().get("aux"),
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": _prompt(tasks)},

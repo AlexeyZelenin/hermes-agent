@@ -593,6 +593,14 @@
   align-items: center;
 }
 
+/* Per-task model chip — long model ids ellipsize instead of widening cards. */
+.hermes-kanban-model {
+  max-width: 11rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- Selection chrome ----------------------------------------------- */
 
 .hermes-kanban-card--selected :where(.hermes-kanban-card-content) {

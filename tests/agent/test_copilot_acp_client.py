@@ -370,3 +370,18 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+
+
+def test_match_session_model_id_prefers_exact_then_fuzzy():
+    from agent.copilot_acp_client import _match_session_model_id
+
+    available = [
+        {"modelId": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5"},
+        {"modelId": "claude-opus-4-1", "name": "Claude Opus 4.1"},
+    ]
+    assert _match_session_model_id("claude-opus-4-1", available) == "claude-opus-4-1"
+    assert _match_session_model_id("CLAUDE-OPUS-4-1", available) == "claude-opus-4-1"
+    assert _match_session_model_id("opus", available) == "claude-opus-4-1"
+    assert _match_session_model_id("sonnet 4.5", available) == "claude-sonnet-4-5"
+    assert _match_session_model_id("gpt-5", available) is None
+    assert _match_session_model_id("opus", "not-a-list") is None

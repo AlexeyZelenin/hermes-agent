@@ -9,6 +9,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -29,6 +30,8 @@ from openai.types.chat.chat_completion_message_tool_call import (
 from agent.file_safety import get_read_block_error, get_write_denied_error
 from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
+
+logger = logging.getLogger(__name__)
 
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -441,6 +444,29 @@ def _model_from_session(session: dict[str, Any]) -> str:
     return ""
 
 
+def _match_session_model_id(wanted: str, available: Any) -> str | None:
+    """Pick the advertised modelId matching ``wanted``.
+
+    Exact id match first, then case-insensitive id match, then substring
+    match on id or display name. Returns None when nothing matches.
+    """
+    if not isinstance(available, list):
+        return None
+    entries = [m for m in available if isinstance(m, dict)]
+    ids = [str(m.get("modelId") or "").strip() for m in entries]
+    if wanted in ids:
+        return wanted
+    lowered = wanted.lower()
+    for mid in ids:
+        if mid.lower() == lowered:
+            return mid
+    for m, mid in zip(entries, ids):
+        name = str(m.get("name") or "").lower()
+        if mid and (lowered in mid.lower() or (name and lowered in name)):
+            return mid
+    return None
+
+
 def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
     candidate = Path(path_text)
     if not candidate.is_absolute():
@@ -482,6 +508,7 @@ class CopilotACPClient:
         command: str | None = None,
         args: list[str] | None = None,
         allow_permissions: bool = False,
+        session_model: str | None = None,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
@@ -493,6 +520,9 @@ class CopilotACPClient:
         # Headless task-executor sessions have no human to answer
         # session/request_permission; interactive chat keeps the deny default.
         self._allow_permissions = bool(allow_permissions)
+        # Requested session model (ACP session/set_model). Best-effort: an
+        # agent that doesn't support it keeps its own default.
+        self._session_model = (session_model or "").strip()
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -728,6 +758,29 @@ class CopilotACPClient:
                 raise RuntimeError("Copilot ACP did not return a sessionId.")
             self.last_session_id = session_id
             self.last_model = _model_from_session(session)
+
+            if self._session_model:
+                # Best-effort model pin. When the agent advertises models we
+                # match against them; otherwise we try the id verbatim. A
+                # refusal only logs — the session runs on the agent default.
+                models_state = session.get("models") if isinstance(session, dict) else None
+                advertised = (models_state or {}).get("availableModels")
+                model_id = (
+                    _match_session_model_id(self._session_model, advertised)
+                    or self._session_model
+                )
+                try:
+                    _request(
+                        "session/set_model",
+                        {"sessionId": session_id, "modelId": model_id},
+                    )
+                    self.last_model = model_id
+                except Exception as exc:
+                    logger.warning(
+                        "ACP session/set_model(%s) failed; continuing on the "
+                        "agent's default model (%s): %s",
+                        model_id, self.last_model or "unknown", exc,
+                    )
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []

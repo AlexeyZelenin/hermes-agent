@@ -57,6 +57,40 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _positive_int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def _resolve_dispatch_limits(
+    load_config: Callable[[], Any],
+) -> "tuple[Optional[int], Optional[int], Optional[int]]":
+    """Resolve live (max_spawn, max_in_progress, max_in_progress_per_profile).
+
+    Re-read from config on every dispatcher tick — like board agent_limit
+    (board.json is re-read per tick) and the auto-decompose toggle (#49638) —
+    so the dashboard/CLI can retune global concurrency without a gateway
+    restart. Invalid or missing values resolve to None (no cap); a transient
+    config read error resolves to no global cap for one tick rather than
+    blocking dispatch (board agent_limit still applies).
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return None, None, None
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    return (
+        _positive_int_or_none(kcfg.get("max_spawn")),
+        _positive_int_or_none(kcfg.get("max_in_progress")),
+        _positive_int_or_none(kcfg.get("max_in_progress_per_profile")),
+    )
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -826,35 +860,18 @@ class GatewayKanbanWatchersMixin:
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
-        if max_spawn is not None:
-            logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
-
-        # Cap the number of simultaneously running tasks so slow workers
-        # (local LLMs, resource-constrained hosts) don't pile up and time
-        # out. When set, the dispatcher skips spawning when the board
-        # already has this many tasks in 'running' status.
-        raw_max_in_progress = kanban_cfg.get("max_in_progress", None)
-        max_in_progress = None
-        if raw_max_in_progress is not None:
-            try:
-                max_in_progress = int(raw_max_in_progress)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress=%r; ignoring",
-                    raw_max_in_progress,
-                )
-                max_in_progress = None
-            else:
-                if max_in_progress < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress=%r is below 1; ignoring",
-                        raw_max_in_progress,
-                    )
-                    max_in_progress = None
-                else:
-                    logger.info(f"kanban dispatcher: max_in_progress={max_in_progress}")
+        # Global concurrency limits (max_spawn / max_in_progress /
+        # max_in_progress_per_profile) are resolved LIVE on every tick via
+        # _resolve_dispatch_limits — mirroring board agent_limit — so the
+        # dashboard/CLI can retune them without a gateway restart.
+        max_spawn, max_in_progress, max_in_progress_per_profile = (
+            _resolve_dispatch_limits(_load_config)
+        )
+        logger.info(
+            "kanban dispatcher: max_spawn=%s max_in_progress=%s "
+            "max_in_progress_per_profile=%s (re-read every tick)",
+            max_spawn, max_in_progress, max_in_progress_per_profile,
+        )
 
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
@@ -899,35 +916,6 @@ class GatewayKanbanWatchersMixin:
                 "will route to this profile)",
                 default_assignee,
             )
-
-        # Read kanban.max_in_progress_per_profile — per-profile concurrency
-        # cap (#21582). When set, no single profile gets more than N
-        # workers running at once, even if the global max_in_progress
-        # would allow it. Prevents one profile's local model / API quota
-        # / browser pool from being overwhelmed by a fan-out.
-        raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
-        max_in_progress_per_profile = None
-        if raw_per_profile is not None:
-            try:
-                max_in_progress_per_profile = int(raw_per_profile)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
-                    raw_per_profile,
-                )
-                max_in_progress_per_profile = None
-            else:
-                if max_in_progress_per_profile < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress_per_profile=%r is below 1; ignoring",
-                        raw_per_profile,
-                    )
-                    max_in_progress_per_profile = None
-                else:
-                    logger.info(
-                        "kanban dispatcher: max_in_progress_per_profile=%d",
-                        max_in_progress_per_profile,
-                    )
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
@@ -1232,6 +1220,16 @@ class GatewayKanbanWatchersMixin:
                 _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                # Live-re-read global limits so UI/CLI edits apply this tick.
+                _new_limits = _resolve_dispatch_limits(_load_config)
+                if _new_limits != (max_spawn, max_in_progress,
+                                   max_in_progress_per_profile):
+                    logger.info(
+                        "kanban dispatcher: limits changed: max_spawn=%s "
+                        "max_in_progress=%s max_in_progress_per_profile=%s",
+                        *_new_limits,
+                    )
+                    max_spawn, max_in_progress, max_in_progress_per_profile = _new_limits
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):

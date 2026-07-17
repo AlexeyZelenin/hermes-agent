@@ -24,6 +24,7 @@ The schema is intentionally small and additive: column additions go through
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import secrets
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS projects (
     board_slug    TEXT,
     primary_path  TEXT,
     executor      TEXT NOT NULL DEFAULT 'hermes-worker',
+    models        TEXT,
     created_at    INTEGER NOT NULL,
     archived      INTEGER NOT NULL DEFAULT 0
 );
@@ -201,7 +203,9 @@ def connect_closing(db_path: Optional[Path] = None):
 
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
-_OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color", "executor")
+_OPTIONAL_PROJECT_COLUMNS = (
+    "board_slug", "primary_path", "icon", "color", "executor", "models"
+)
 
 VALID_EXECUTORS = frozenset({"hermes-worker", "claude-code", "codex"})
 
@@ -212,6 +216,36 @@ def normalize_executor(executor: object | None) -> str:
     if value not in VALID_EXECUTORS:
         raise ValueError("executor must be hermes-worker, claude-code, or codex")
     return value
+
+
+VALID_MODEL_ROLES = ("worker", "aux", "cheap", "strong")
+
+
+def normalize_models(models: object | None) -> dict:
+    """Validate a project model map ({role: model-id}) and drop empties."""
+    if models is None:
+        return {}
+    if not isinstance(models, dict):
+        raise ValueError("models must be a dict of {role: model}")
+    unknown = set(models) - set(VALID_MODEL_ROLES)
+    if unknown:
+        raise ValueError(
+            f"unknown model roles {sorted(unknown)}; valid roles: {list(VALID_MODEL_ROLES)}"
+        )
+    return {
+        role: str(value).strip()
+        for role, value in models.items()
+        if str(value or "").strip()
+    }
+
+
+def _models_from_column(raw: object | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        return normalize_models(json.loads(raw))
+    except (ValueError, TypeError):
+        return {}
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -260,6 +294,7 @@ class Project:
     board_slug: Optional[str] = None
     primary_path: Optional[str] = None
     executor: str = "hermes-worker"
+    models: dict = field(default_factory=dict)
     archived: bool = False
     folders: List[ProjectFolder] = field(default_factory=list)
 
@@ -274,6 +309,7 @@ class Project:
             "board_slug": self.board_slug,
             "primary_path": self.primary_path,
             "executor": self.executor,
+            "models": dict(self.models),
             "archived": bool(self.archived),
             "created_at": self.created_at,
             "folders": [f.to_dict() for f in self.folders],
@@ -293,6 +329,7 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         board_slug=row["board_slug"] if "board_slug" in keys else None,
         primary_path=row["primary_path"] if "primary_path" in keys else None,
         executor=normalize_executor(row["executor"] if "executor" in keys else None),
+        models=_models_from_column(row["models"] if "models" in keys else None),
         archived=bool(row["archived"]) if "archived" in keys else False,
     )
 
@@ -350,6 +387,7 @@ def create_project(
     color: Optional[str] = None,
     board_slug: Optional[str] = None,
     executor: Optional[str] = None,
+    models: Optional[dict] = None,
 ) -> str:
     """Create a project and return its id.
 
@@ -382,8 +420,8 @@ def create_project(
         conn.execute(
             "INSERT INTO projects "
             "(id, slug, name, description, icon, color, board_slug, "
-            " primary_path, executor, created_at, archived) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            " primary_path, executor, models, created_at, archived) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
             (
                 pid,
                 unique,
@@ -394,6 +432,7 @@ def create_project(
                 normalize_slug(board_slug) if board_slug else None,
                 primary,
                 normalize_executor(executor),
+                json.dumps(normalize_models(models)) if models else None,
                 now,
             ),
         )
@@ -444,6 +483,7 @@ def update_project(
     color: Optional[str] = None,
     board_slug: Optional[str] = None,
     executor: Optional[str] = None,
+    models: Optional[dict] = None,
 ) -> bool:
     """Patch top-level project fields. Only provided fields change.
 
@@ -474,6 +514,10 @@ def update_project(
     if executor is not None:
         sets.append("executor = ?")
         params.append(normalize_executor(executor))
+    if models is not None:
+        cleaned = normalize_models(models)
+        sets.append("models = ?")
+        params.append(json.dumps(cleaned) if cleaned else None)
     if not sets:
         return False
     params.append(project_id)

@@ -95,6 +95,20 @@ def build_parser(
     p_restore = sub.add_parser("restore", help="Restore an archived project")
     p_restore.add_argument("project", help="Project id or slug")
 
+    p_model = sub.add_parser(
+        "set-model",
+        help="Configure the project's model map (worker/aux/cheap/strong roles)",
+    )
+    p_model.add_argument("project", help="Project id or slug")
+    p_model.add_argument("--worker", default=None,
+                         help="Default worker model ('' clears)")
+    p_model.add_argument("--aux", default=None,
+                         help="Auxiliary-roles model ('' clears)")
+    p_model.add_argument("--cheap", default=None,
+                         help="Model for mechanical chunks ('' clears)")
+    p_model.add_argument("--strong", default=None,
+                         help="Model for complex chunks ('' clears)")
+
     p_bind = sub.add_parser("bind-board", help="Bind a kanban board to a project")
     p_bind.add_argument("project", help="Project id or slug")
     p_bind.add_argument(
@@ -133,6 +147,7 @@ def projects_command(args: argparse.Namespace) -> int:
         "archive": _cmd_archive,
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
+        "set-model": _cmd_set_model,
     }
     handler = handlers.get(action)
     if handler is None:
@@ -178,6 +193,11 @@ def _print_project(proj) -> None:
         print(f"  about:   {proj.description}")
     if proj.board_slug:
         print(f"  board:   {proj.board_slug}")
+    if proj.executor and proj.executor != "hermes-worker":
+        print(f"  executor: {proj.executor}")
+    if proj.models:
+        roles = ", ".join(f"{k}={v}" for k, v in sorted(proj.models.items()))
+        print(f"  models:  {roles}")
     if proj.primary_path:
         print(f"  primary: {proj.primary_path}")
     if proj.folders:
@@ -311,6 +331,33 @@ def _cmd_bind_board(args, conn, proj) -> int:
         _sync_board_default_workdir(proj, args.board)
     else:
         print(f"Unbound board from {proj.slug}")
+    return 0
+
+
+@_with_project
+def _cmd_set_model(args, conn, proj) -> int:
+    updates = {
+        role: value
+        for role, value in (
+            ("worker", args.worker), ("aux", args.aux),
+            ("cheap", args.cheap), ("strong", args.strong),
+        )
+        if value is not None
+    }
+    if not updates:
+        print("project set-model: pass at least one of "
+              "--worker/--aux/--cheap/--strong", file=sys.stderr)
+        return 2
+    merged = dict(proj.models)
+    for role, value in updates.items():
+        value = value.strip()
+        if value:
+            merged[role] = value
+        else:
+            merged.pop(role, None)
+    pdb.update_project(conn, proj.id, models=merged)
+    refreshed = pdb.get_project(conn, proj.id)
+    _print_project(refreshed)
     return 0
 
 
