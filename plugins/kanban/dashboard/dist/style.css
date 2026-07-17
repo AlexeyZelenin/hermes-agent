@@ -336,7 +336,23 @@
   font-weight: 500;
   line-height: 1.3;
   color: var(--color-foreground);
-  word-break: break-word;
+  /* Titles are always one line. Fallback for browsers without mask support:
+     hard-clip with an ellipsis. Mask-capable browsers override below. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Preferred: overflow text fades smoothly into transparent on the right edge
+   via a gradient mask, instead of a hard ellipsis. Short titles that end
+   before the fade band stay fully opaque. */
+@supports (mask-image: linear-gradient(#000, #000)) or
+          (-webkit-mask-image: linear-gradient(#000, #000)) {
+  .hermes-kanban-card-title {
+    text-overflow: clip;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+  }
 }
 
 .hermes-kanban-card-meta {
