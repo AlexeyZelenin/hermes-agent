@@ -3392,11 +3392,24 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
+    *, board: Optional[str] = None, promote_todo: Optional[bool] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
+
+    ``promote_todo`` gates the plain ``todo``->``ready`` blanket promotion.
+    When ``None`` (the default) it resolves from the board's ``auto_replenish``
+    opt-in flag: on boards that opted in, the unbounded blanket promotion is
+    suppressed here and the bounded, rank-ordered
+    :func:`replenish_ready_slots` owns the ``todo``->``ready`` path instead,
+    so the ready queue stays capped to the pacing ``agent_limit``. The
+    ``blocked``->``ready`` dependency-recovery path below is NEVER gated by
+    this flag. Default-off means unchanged behaviour on every board that has
+    not opted in. ``board=None`` resolves the env-pinned / current board so a
+    worker calling this (e.g. via ``complete_task``) sees the same decision
+    the dispatcher does.
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
@@ -3423,6 +3436,8 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    if promote_todo is None:
+        promote_todo = not _auto_replenish_enabled(board)
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -3468,12 +3483,149 @@ def recompute_ready(
                         (task_id,),
                     )
                 else:
+                    if not promote_todo:
+                        # Auto-replenish board: the bounded replenisher owns
+                        # todo->ready. Leave this task in 'todo' for it.
+                        continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
+    return promoted
+
+
+def _auto_replenish_enabled(board: Optional[str] = None) -> bool:
+    """Return True when ``board`` opts into autonomous queue replenishment.
+
+    Reads the per-board ``auto_replenish`` flag from ``board.json`` (via
+    :func:`read_board_metadata`). Opt-in / deny-by-default: a missing key, a
+    falsey / unrecognised value, or any read error resolves to ``False`` so
+    no board starts auto-promoting without explicit configuration.
+    ``board=None`` resolves the env-pinned / current board
+    (:func:`get_current_board`) so non-dispatch callers (a worker calling
+    ``complete_task`` -> ``recompute_ready``) see the same decision the
+    dispatcher does.
+
+    This is the single integration point for the flag. When the board-policy
+    layer (``check_autonomy`` / ``auto_replenish`` verb, see
+    design-cross-cutting-secrets-autonomy) lands, swap the metadata read here
+    for the policy lookup and every caller inherits it.
+    """
+    try:
+        slug = board or get_current_board()
+        val = read_board_metadata(slug).get("auto_replenish", False)
+    except Exception:
+        return False
+    if val is True:
+        return True
+    return str(val).strip().lower() in ("1", "true", "on", "yes")
+
+
+def replenish_ready_slots(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """Promote assigned ``todo`` tasks to ``ready`` to keep execution slots full.
+
+    Autonomy-ratchet (decisions.md 2026-07-17): fills the queue UP TO the
+    board's ``agent_limit`` in backlog-rank order so the overseer no longer
+    hand-promotes todo->ready at oversight ticks. Deliberately narrow — it
+    *fills to* the limit and never fights the pacing controller that owns it:
+
+      * Gated by the per-board ``auto_replenish`` opt-in flag (default off).
+        Returns ``[]`` when the board has not opted in.
+      * Only promotes ``todo`` tasks that (a) have an assignee, (b) have all
+        parents ``done``/``archived`` (dependency gate), and (c) are below the
+        circuit-breaker failure limit.
+      * Promotes at most ``agent_limit - (running + ready)`` tasks — never
+        past the limit; returns ``[]`` the moment the limit is already met.
+      * Backlog rank order = ``priority DESC, created_at ASC`` (the same
+        order the dispatcher spawns in). The card names a ``task_flags.rank``
+        column as the intended primary key, but no ``task_flags`` table exists
+        yet, so this uses the documented ``priority``/``created_at`` fallback.
+      * Emits a ``promoted_auto`` ``task_event`` per promotion for the audit
+        trail — distinct from ``promoted`` / ``promoted_manual`` so the source
+        is legible, and recognised by the respawn guard the same way (F9).
+
+    Returns the list of promoted task ids (what *would* be promoted, under
+    ``dry_run``). Safe to call every dispatch tick.
+    """
+    if not _auto_replenish_enabled(board):
+        return []
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
+    # Resolve the effective concurrency limit exactly as the dispatcher does
+    # (board agent_limit, further clamped by any global max_in_progress) so we
+    # never promote past what the pacing controller allows.
+    try:
+        limit = int(read_board_metadata(board).get("agent_limit", 10))
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, limit)
+    if isinstance(max_in_progress, int) and max_in_progress > 0:
+        limit = min(limit, max_in_progress)
+
+    occupancy = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status IN ('running', 'ready')"
+        ).fetchone()[0]
+    )
+    slots = limit - occupancy
+    if slots <= 0:
+        return []
+
+    candidates = conn.execute(
+        "SELECT id, consecutive_failures, max_retries FROM tasks "
+        "WHERE status = 'todo' "
+        "  AND assignee IS NOT NULL AND TRIM(assignee) != '' "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+
+    promoted: list[str] = []
+    with write_txn(conn):
+        for row in candidates:
+            if len(promoted) >= slots:
+                break
+            task_id = row["id"]
+            # Dependency gate: every parent must be in a terminal state.
+            undone = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') "
+                "LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if undone:
+                continue
+            # Circuit breaker: don't resurrect a task that has exhausted its
+            # retry budget (mirrors recompute_ready / _record_task_failure).
+            failures = int(row["consecutive_failures"] or 0)
+            task_limit = row["max_retries"]
+            effective_limit = (
+                int(task_limit) if task_limit is not None else int(failure_limit)
+            )
+            if failures >= effective_limit:
+                continue
+            if dry_run:
+                promoted.append(task_id)
+                continue
+            upd = conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                (task_id,),
+            )
+            if upd.rowcount != 1:
+                continue
+            _append_event(
+                conn, task_id, "promoted_auto",
+                {"reason": "auto_replenish", "rank_source": "priority,created_at"},
+            )
+            promoted.append(task_id)
     return promoted
 
 
@@ -6063,6 +6215,11 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    promoted_auto: list[str] = field(default_factory=list)
+    """Task ids auto-promoted todo->ready this tick by the autonomous queue
+    replenisher (:func:`replenish_ready_slots`) to keep execution slots full
+    up to the board ``agent_limit``. Empty unless the board opted into
+    ``auto_replenish``. Each id also has a ``promoted_auto`` task_event."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -7399,7 +7556,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'promoted_manual', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', "
+            "'promoted_auto', 'unblocked', 'reclaimed') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -7613,7 +7771,23 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    # Dependency-gate promotion. On auto_replenish boards the unbounded blanket
+    # todo->ready step is suppressed here (promote_todo=False) and handled by
+    # replenish_ready_slots below, which caps promotion to the pacing limit in
+    # backlog-rank order. blocked->ready recovery inside recompute_ready still
+    # runs regardless. Non-opt-in boards keep the legacy blanket behaviour.
+    auto_replenish = _auto_replenish_enabled(board)
+    result.promoted = recompute_ready(
+        conn, failure_limit=failure_limit, promote_todo=not auto_replenish,
+    )
+    if auto_replenish:
+        # Runs BEFORE the ready_rows query below so freshly-promoted tasks are
+        # eligible to spawn this same tick — that is what "keep slots full"
+        # means. Never promotes past agent_limit, so it never fights pacing.
+        result.promoted_auto = replenish_ready_slots(
+            conn, board=board, max_in_progress=max_in_progress,
+            failure_limit=failure_limit, dry_run=dry_run,
+        )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
