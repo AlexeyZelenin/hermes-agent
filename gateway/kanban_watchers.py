@@ -928,6 +928,73 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+
+        # --- session supervisor (task t_cbf67d89): detect worker/dispatcher
+        # anomalies and escalate to a triage card + operator push. Gated by
+        # kanban.supervisor.enabled (re-read live each tick like auto-decompose).
+        _supervisor_services: dict[str, object] = {}
+
+        def _supervisor_cfg() -> dict:
+            try:
+                cfg = _load_config()
+            except Exception:
+                return {}
+            kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+            return kcfg.get("supervisor", {}) or {}
+
+        def _supervisor_for(slug: str):
+            svc = _supervisor_services.get(slug)
+            if svc is None:
+                from hermes_supervisor import SupervisorService
+                scfg = _supervisor_cfg()
+                state_dir = str(
+                    _kb.kanban_home() / "kanban" / "boards" / slug / ".supervisor"
+                )
+                svc = SupervisorService(
+                    slug,
+                    state_dir=state_dir,
+                    board_meta=_kb.read_board_metadata(slug) or {},
+                    send_argv=tuple(scfg.get("send_argv", ["hermes", "send"])),
+                    logger=logger,
+                )
+                _supervisor_services[slug] = svc
+            return svc
+
+        def _run_supervisors(results) -> None:
+            if not _supervisor_cfg().get("enabled", False):
+                return
+            now = time.time()
+            spawned_by = {
+                slug: bool(getattr(res, "spawned", None))
+                for slug, res in (results or [])
+            }
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            for b in boards:
+                slug = b.get("slug") or _kb.DEFAULT_BOARD
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    ready = _kb.has_spawnable_ready(conn) or _kb.has_spawnable_review(conn)
+                except Exception:
+                    ready = False
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                try:
+                    _supervisor_for(slug).run_tick(
+                        now, ready_nonempty=ready, spawned=spawned_by.get(slug, False)
+                    )
+                except Exception:
+                    logger.exception(
+                        "kanban supervisor: tick failed for board %s", slug
+                    )
+
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1265,6 +1332,10 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+                # Session supervisor: one supervision pass per tick, off the
+                # event loop (DB IO + a blocking psutil CPU sample per suspected
+                # run). Never raises into the caller (see hermes_supervisor).
+                await asyncio.to_thread(_run_supervisors, results)
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 _release_singleton_lock(self._kanban_dispatcher_lock_handle)
