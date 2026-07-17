@@ -119,6 +119,54 @@ def test_acp_worker_completes_claimed_task_with_single_session(monkeypatch, kanb
     assert "# Kanban task" in calls[1][0]
 
 
+def test_acp_worker_reports_turn_usage_via_post_api_request_hook(monkeypatch, kanban_conn, tmp_path):
+    """External-session token usage must reach zeus.db accounting via the plugin hook."""
+    from agent import acp_task_executor as executor
+    import hermes_cli.plugins as plugins
+
+    task_id = kb.create_task(kanban_conn, title="External task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    class FakeClient:
+        last_session_id = "acp-session-1"
+        last_model = "claude-opus-4-8"
+        last_turn_usage = {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_tokens": 2,
+            "cache_write_tokens": 1,
+            "total_tokens": 18,
+        }
+
+        def __init__(self, **kwargs):
+            pass
+
+        def _run_prompt(self, prompt, *, timeout_seconds):
+            return "Implemented and tested.", ""
+
+    recorded = {}
+    monkeypatch.setattr(plugins, "discover_plugins", lambda force=False: None)
+
+    def capture_hook(name, **kw):
+        if name == "post_api_request":
+            recorded.update({"hook": name, **kw})
+        return []
+
+    monkeypatch.setattr(plugins, "invoke_hook", capture_hook)
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    executor.run_task(executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test")
+
+    assert recorded["hook"] == "post_api_request"
+    assert recorded["task_id"] == task_id
+    assert recorded["session_id"] == "acp-session-1"
+    assert recorded["model"] == "claude-opus-4-8"
+    assert recorded["provider"] == "acp-claude-code"
+    assert recorded["usage"]["total_tokens"] == 18
+
+
 class _connection_context:
     def __init__(self, conn):
         self.conn = conn

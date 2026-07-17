@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import CopilotACPClient, _canonical_turn_usage
 
 
 class _FakeProcess:
@@ -140,6 +140,59 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         payload = process.stdin.getvalue().strip()
         self.assertTrue(payload)
         return json.loads(payload)
+
+    def test_usage_update_notification_is_captured(self) -> None:
+        handled = self.client._handle_server_message(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": 1234,
+                        "size": 200000,
+                    }
+                },
+            },
+            process=_FakeProcess(),
+            cwd="/tmp",
+            text_parts=[],
+            reasoning_parts=[],
+        )
+        self.assertTrue(handled)
+        self.assertEqual(self.client._last_usage_update["used"], 1234)
+
+    def test_canonical_turn_usage_prefers_prompt_result_usage(self) -> None:
+        usage = _canonical_turn_usage(
+            {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "cachedReadTokens": 2,
+                "cachedWriteTokens": 1,
+                "totalTokens": 18,
+            },
+            {"used": 999},
+        )
+        self.assertEqual(
+            usage,
+            {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_tokens": 2,
+                "cache_write_tokens": 1,
+                "total_tokens": 18,
+            },
+        )
+
+    def test_canonical_turn_usage_falls_back_to_usage_update(self) -> None:
+        usage = _canonical_turn_usage(None, {"used": 4321, "size": 200000})
+        self.assertEqual(usage["total_tokens"], 4321)
+        self.assertEqual(usage["input_tokens"], 0)
+        self.assertEqual(usage["output_tokens"], 0)
+
+    def test_canonical_turn_usage_returns_none_without_signal(self) -> None:
+        self.assertIsNone(_canonical_turn_usage(None, None))
+        self.assertIsNone(_canonical_turn_usage({"inputTokens": 0}, {"used": 0}))
 
     def test_request_permission_is_not_auto_allowed(self) -> None:
         response = self._dispatch(

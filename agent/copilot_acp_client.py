@@ -387,6 +387,60 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
 
 
 
+def _usage_int(value: Any) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _canonical_turn_usage(turn_usage: Any, last_update: Any) -> dict[str, int] | None:
+    """Map ACP session-usage payloads onto Hermes canonical token buckets.
+
+    ``session/prompt`` results carry per-turn totals (ACP RFD "Session Usage",
+    experimental: inputTokens/outputTokens/cachedReadTokens/cachedWriteTokens).
+    Agents that omit them may still stream ``usage_update`` notifications,
+    which only expose context occupancy (``used``) — recorded as
+    ``total_tokens`` with no prompt/completion split.
+    """
+    if isinstance(turn_usage, dict):
+        usage = {
+            "input_tokens": _usage_int(turn_usage.get("inputTokens")),
+            "output_tokens": _usage_int(turn_usage.get("outputTokens")),
+            "cache_read_tokens": _usage_int(turn_usage.get("cachedReadTokens")),
+            "cache_write_tokens": _usage_int(turn_usage.get("cachedWriteTokens")),
+        }
+        total = _usage_int(turn_usage.get("totalTokens")) or sum(usage.values())
+        if total:
+            usage["total_tokens"] = total
+            return usage
+    if isinstance(last_update, dict):
+        used = _usage_int(last_update.get("used"))
+        if used:
+            return {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": used,
+            }
+    return None
+
+
+def _model_from_session(session: dict[str, Any]) -> str:
+    models = session.get("models")
+    if isinstance(models, dict):
+        current = str(models.get("currentModelId") or "").strip()
+        if current:
+            return current
+    options = session.get("configOptions")
+    if isinstance(options, list):
+        for option in options:
+            if isinstance(option, dict) and option.get("id") == "model":
+                return str(option.get("currentValue") or "").strip()
+    return ""
+
+
 def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
     candidate = Path(path_text)
     if not candidate.is_absolute():
@@ -443,6 +497,10 @@ class CopilotACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self.last_session_id = ""
+        self.last_model = ""
+        self.last_turn_usage: dict[str, int] | None = None
+        self._last_usage_update: dict[str, Any] | None = None
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -548,6 +606,10 @@ class CopilotACPClient:
             raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
 
         self.is_closed = False
+        self.last_session_id = ""
+        self.last_model = ""
+        self.last_turn_usage = None
+        self._last_usage_update = None
         with self._active_process_lock:
             self._active_process = proc
 
@@ -664,10 +726,12 @@ class CopilotACPClient:
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
                 raise RuntimeError("Copilot ACP did not return a sessionId.")
+            self.last_session_id = session_id
+            self.last_model = _model_from_session(session)
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
-            _request(
+            result = _request(
                 "session/prompt",
                 {
                     "sessionId": session_id,
@@ -680,6 +744,10 @@ class CopilotACPClient:
                 },
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
+            )
+            self.last_turn_usage = _canonical_turn_usage(
+                result.get("usage") if isinstance(result, dict) else None,
+                self._last_usage_update,
             )
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
@@ -702,6 +770,9 @@ class CopilotACPClient:
             params = msg.get("params") or {}
             update = params.get("update") or {}
             kind = str(update.get("sessionUpdate") or "").strip()
+            if kind == "usage_update":
+                self._last_usage_update = dict(update)
+                return True
             content = update.get("content") or {}
             chunk_text = ""
             if isinstance(content, dict):
