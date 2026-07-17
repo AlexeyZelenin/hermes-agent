@@ -74,7 +74,8 @@ Output a single JSON object with this exact shape:
         "body":  "<detailed spec for the worker on this child task>",
         "parents": [<int>, ...],
         "estimated_context_tokens": <rough integer estimate>,
-        "model_tier": "cheap" | "standard" | "strong"
+        "model_tier": "cheap" | "mid" | "standard" | "strong",
+        "model_rationale": "<one short clause on why this tier>"
       },
       ...
     ]
@@ -108,17 +109,32 @@ Rules:
     clearly over-budget work into 1 task.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
-  - "model_tier" picks how capable (and expensive) a model the chunk needs:
-      * "cheap"    — mechanical, low-ambiguity work with a clear recipe:
-        translations, templated/repetitive edits, renames, status checks,
-        formatting, config value changes, boilerplate from an exact spec.
-      * "strong"   — high-ambiguity or high-blast-radius work: architecture
-        and API design, debugging of unknown depth, cross-cutting refactors,
-        security-sensitive changes, work whose spec must be interpreted.
-      * "standard" — everything else; use it when unsure.
-    Judge by the nature of the work, not its size: a long translation is
-    still "cheap"; a one-line fix in an unfamiliar concurrency path is
-    "strong".
+  - "model_tier" assigns each chunk a capability tier from the operator's
+    four-tier model grid (ordered cheapest → most capable). Model choice is
+    planner intelligence, not a per-task human setting: judge each chunk on its
+    own merits.
+      * "cheap"    — Tier 4 (quick): mechanical, low-ambiguity work with a clear
+        recipe — translations, templated/repetitive edits, renames, status
+        checks, formatting, config value changes, boilerplate from an exact
+        spec.
+      * "mid"      — Tier 3 (balanced): well-defined implementation, routine
+        refactors, test writing, documentation, moderate bug fixes — scoped
+        work that does not need the default's headroom.
+      * "standard" — Tier 2 (workhorse, the DEFAULT): complex but bounded coding
+        whose shape is clear and needs no long planning horizon. Use it when
+        unsure.
+      * "strong"   — Tier 1 (frontier): high-ambiguity or high-blast-radius work
+        — architecture and API design, cross-cutting refactors, long-horizon
+        autonomous work, security-sensitive changes, debugging of unknown depth,
+        work whose spec must be interpreted.
+    Judge by the NATURE of the work, not its size: a long translation is still
+    "cheap"; a one-line fix in an unfamiliar concurrency path is "strong".
+    Prefer "standard"/"mid" for ordinary work and reserve "strong" for chunks
+    that genuinely need the frontier tier — it is the most expensive.
+  - "model_rationale" is a single short clause (<= 120 chars) justifying the
+    tier for THIS chunk (e.g. "cross-cutting refactor, spec must be
+    interpreted"). It is recorded on the child task so the assignment is
+    auditable.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -207,6 +223,9 @@ class DecomposeOutcome:
     fanout: bool = False
     child_ids: list[str] | None = None
     new_title: Optional[str] = None
+    # One entry per child on a fanout: {"child_id", "title", "tier", "model",
+    # "rationale"}. "model" is None when the tier inherits the board default.
+    model_assignments: list[dict] | None = None
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -268,6 +287,47 @@ def _resolve_context_budget_tokens(cfg: dict) -> int:
         return _DEFAULT_CONTEXT_BUDGET_TOKENS
     return max(_MIN_CONTEXT_BUDGET_TOKENS, budget)
 
+
+
+def _format_assignment_comment(tier: str, model: Optional[str],
+                               rationale: str) -> str:
+    """One-line, human-readable model-assignment note for a child task."""
+    target = model or "board default (standard tier)"
+    line = f"Model tier: {tier} → {target}"
+    if rationale:
+        line += f" — {rationale}"
+    return line
+
+
+def _record_model_assignments(child_ids: list[str], tier_meta: list[dict],
+                              author: str) -> list[dict]:
+    """Comment the tier assignment on each child; return the assignment list.
+
+    Best-effort and fail-open: a per-child comment failure is logged and
+    skipped so a successful decomposition is never rolled back by an audit
+    write.  ``tier_meta`` is parallel to ``child_ids`` (same input order).
+    """
+    assignments: list[dict] = []
+    for child_id, meta in zip(child_ids, tier_meta):
+        assignments.append({
+            "child_id": child_id,
+            "title": meta["title"],
+            "tier": meta["tier"],
+            "model": meta["model"],
+            "rationale": meta["rationale"],
+        })
+        comment = _format_assignment_comment(
+            meta["tier"], meta["model"], meta["rationale"],
+        )
+        try:
+            with kb.connect_closing() as conn:
+                kb.add_comment(conn, child_id, author, comment)
+        except Exception as exc:  # noqa: BLE001 — audit write must never break decompose
+            logger.debug(
+                "decompose: model-assignment comment failed for %s: %s",
+                child_id, exc,
+            )
+    return assignments
 
 
 def decompose_task(
@@ -390,6 +450,9 @@ def decompose_task(
     # Assignment is deliberately outside decomposition. The later explicit
     # take / batch-take action selects assignees for the whole graph.
     children: list[dict] = []
+    # Parallel to ``children`` (same index order): per-child tier metadata used
+    # to record an auditable model-assignment comment after the children exist.
+    tier_meta: list[dict] = []
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
             return DecomposeOutcome(
@@ -410,15 +473,26 @@ def decompose_task(
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
         # Tier → model via the board/project map. "standard" (or an
-        # unmapped tier) leaves the child on the default model chain.
+        # unmapped tier) leaves the child on the default model chain — the
+        # Tier-2 workhorse. cheap/mid/strong resolve to their mapped models.
         tier = str(entry.get("model_tier") or "").strip().lower()
-        tier_model = model_map.get(tier) if tier in ("cheap", "strong") else None
+        if tier not in ("cheap", "mid", "standard", "strong"):
+            tier = "standard"
+        tier_model = model_map.get(tier) if tier in ("cheap", "mid", "strong") else None
+        rationale = entry.get("model_rationale")
+        rationale = rationale.strip()[:200] if isinstance(rationale, str) else ""
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": None,
             "parents": clean_parents,
             "model_override": tier_model,
+        })
+        tier_meta.append({
+            "title": title.strip()[:200],
+            "tier": tier,
+            "model": tier_model,
+            "rationale": rationale,
         })
 
     try:
@@ -442,9 +516,15 @@ def decompose_task(
             task_id, False, "task moved out of triage before decomposition",
         )
 
+    # Record the model-tier assignment (with the planner's one-line rationale)
+    # as a comment on each child, so a taken batch shows tier-differentiated
+    # assignments that are auditable in the task timeline. Best-effort: a
+    # comment failure must never undo a successful decomposition.
+    assignments = _record_model_assignments(child_ids, tier_meta, audit_author)
+
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
-        fanout=True, child_ids=child_ids,
+        fanout=True, child_ids=child_ids, model_assignments=assignments,
     )
 
 

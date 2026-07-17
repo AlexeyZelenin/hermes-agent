@@ -632,7 +632,7 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
-MODEL_MAP_ROLES = ("worker", "aux", "cheap", "strong")
+MODEL_MAP_ROLES = ("worker", "aux", "cheap", "mid", "strong")
 
 
 def _clean_model_map(raw: Any) -> dict[str, str]:
@@ -709,8 +709,9 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "agent_limit": 10,
         "executor": "hermes-worker",
         # Model map: worker = default model for task workers, aux = auxiliary
-        # roles (decomposer / batch planner), cheap / strong = the tiers Take
-        # v2 assigns to mechanical vs. complex chunks. Empty = executor default.
+        # roles (decomposer / batch planner), cheap / mid / strong = the tiers
+        # the decomposer assigns to mechanical / balanced / frontier chunks
+        # (worker is the implicit "standard" default). Empty = executor default.
         "models": {},
         "created_at": None,
         "archived": False,

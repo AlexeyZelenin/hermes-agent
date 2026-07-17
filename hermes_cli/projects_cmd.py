@@ -97,7 +97,7 @@ def build_parser(
 
     p_model = sub.add_parser(
         "set-model",
-        help="Configure the project's model map (worker/aux/cheap/strong roles)",
+        help="Configure the project's model map (worker/aux/cheap/mid/strong roles)",
     )
     p_model.add_argument("project", help="Project id or slug")
     p_model.add_argument("--worker", default=None,
@@ -106,8 +106,10 @@ def build_parser(
                          help="Auxiliary-roles model ('' clears)")
     p_model.add_argument("--cheap", default=None,
                          help="Model for mechanical chunks ('' clears)")
+    p_model.add_argument("--mid", default=None,
+                         help="Model for balanced chunks ('' clears)")
     p_model.add_argument("--strong", default=None,
-                         help="Model for complex chunks ('' clears)")
+                         help="Model for frontier chunks ('' clears)")
 
     p_bind = sub.add_parser("bind-board", help="Bind a kanban board to a project")
     p_bind.add_argument("project", help="Project id or slug")
@@ -340,13 +342,13 @@ def _cmd_set_model(args, conn, proj) -> int:
         role: value
         for role, value in (
             ("worker", args.worker), ("aux", args.aux),
-            ("cheap", args.cheap), ("strong", args.strong),
+            ("cheap", args.cheap), ("mid", args.mid), ("strong", args.strong),
         )
         if value is not None
     }
     if not updates:
         print("project set-model: pass at least one of "
-              "--worker/--aux/--cheap/--strong", file=sys.stderr)
+              "--worker/--aux/--cheap/--mid/--strong", file=sys.stderr)
         return 2
     merged = dict(proj.models)
     for role, value in updates.items():

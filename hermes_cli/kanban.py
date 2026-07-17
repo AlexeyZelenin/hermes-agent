@@ -297,13 +297,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     b_set_model = boards_sub.add_parser(
         "set-model",
-        help="Configure the board's model map (worker/aux/cheap/strong roles)",
+        help="Configure the board's model map (worker/aux/cheap/mid/strong roles)",
         description=(
             "Per-role models for this board. worker = default model for "
-            "task workers; aux = auxiliary planning roles (decomposer, "
-            "batch planner); cheap/strong = the tiers Take v2 assigns to "
-            "mechanical vs. complex chunks. Pass '' to clear a role. "
-            "Omitted roles keep their current value."
+            "task workers (the 'standard' tier); aux = auxiliary planning "
+            "roles (decomposer, batch planner); cheap/mid/strong = the tiers "
+            "the decomposer assigns to mechanical/balanced/frontier chunks. "
+            "Pass '' to clear a role. Omitted roles keep their current value."
         ),
     )
     b_set_model.add_argument("slug")
@@ -313,8 +313,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              help="Auxiliary-roles model ('' clears)")
     b_set_model.add_argument("--cheap", default=None,
                              help="Model for mechanical chunks ('' clears)")
+    b_set_model.add_argument("--mid", default=None,
+                             help="Model for balanced chunks ('' clears)")
     b_set_model.add_argument("--strong", default=None,
-                             help="Model for complex chunks ('' clears)")
+                             help="Model for frontier chunks ('' clears)")
 
     b_set_wd = boards_sub.add_parser(
         "set-default-workdir",
@@ -1146,13 +1148,13 @@ def _cmd_boards_set_model(args: argparse.Namespace) -> int:
         role: value
         for role, value in (
             ("worker", args.worker), ("aux", args.aux),
-            ("cheap", args.cheap), ("strong", args.strong),
+            ("cheap", args.cheap), ("mid", args.mid), ("strong", args.strong),
         )
         if value is not None
     }
     if not updates:
         print("kanban boards set-model: pass at least one of "
-              "--worker/--aux/--cheap/--strong", file=sys.stderr)
+              "--worker/--aux/--cheap/--mid/--strong", file=sys.stderr)
         return 2
     if not kb.board_exists(args.slug):
         print(f"kanban boards set-model: board {args.slug!r} does not exist",
@@ -2734,6 +2736,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                 "fanout": outcome.fanout,
                 "child_ids": outcome.child_ids,
                 "new_title": outcome.new_title,
+                "model_assignments": outcome.model_assignments,
             }))
         elif outcome.ok:
             if outcome.fanout and outcome.child_ids:
@@ -2742,6 +2745,12 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                     f"Decomposed {outcome.task_id} → {len(outcome.child_ids)} "
                     f"children ({child_summary}); root promoted to todo"
                 )
+                for a in outcome.model_assignments or []:
+                    target = a["model"] or "board default (standard)"
+                    line = f"  {a['child_id']} [{a['tier']}→{target}] {a['title']}"
+                    if a["rationale"]:
+                        line += f" — {a['rationale']}"
+                    print(line)
             else:
                 title_suffix = (
                     f" — retitled: {outcome.new_title!r}"

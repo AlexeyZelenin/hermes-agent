@@ -218,7 +218,7 @@ def normalize_executor(executor: object | None) -> str:
     return value
 
 
-VALID_MODEL_ROLES = ("worker", "aux", "cheap", "strong")
+VALID_MODEL_ROLES = ("worker", "aux", "cheap", "mid", "strong")
 
 
 def normalize_models(models: object | None) -> dict:

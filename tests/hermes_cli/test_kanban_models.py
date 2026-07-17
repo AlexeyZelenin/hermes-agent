@@ -104,16 +104,19 @@ def test_decomposer_maps_tiers_to_board_models(kanban_home):
     from hermes_cli import kanban_decompose
 
     kb.write_board_metadata(
-        "default", models={"cheap": "m-cheap", "strong": "m-strong"})
+        "default",
+        models={"cheap": "m-cheap", "mid": "m-mid", "strong": "m-strong"})
     with kb.connect() as conn:
         root = kb.create_task(conn, title="big", body="do it", triage=True)
 
     llm_json = (
         '{"fanout": true, "rationale": "r", "tasks": ['
         '{"title": "translate strings", "body": "b", "parents": [],'
-        ' "model_tier": "cheap"},'
+        ' "model_tier": "cheap", "model_rationale": "mechanical"},'
         '{"title": "redesign core", "body": "b", "parents": [0],'
-        ' "model_tier": "strong"},'
+        ' "model_tier": "strong", "model_rationale": "architecture"},'
+        '{"title": "write tests", "body": "b", "parents": [0],'
+        ' "model_tier": "mid"},'
         '{"title": "normal piece", "body": "b", "parents": [0],'
         ' "model_tier": "standard"}]}'
     )
@@ -130,8 +133,22 @@ def test_decomposer_maps_tiers_to_board_models(kanban_home):
     assert models == {
         "translate strings": "m-cheap",
         "redesign core": "m-strong",
+        "write tests": "m-mid",
         "normal piece": None,
     }
+
+    # Each assignment is recorded with the planner's rationale, and surfaces as
+    # an auditable comment on the child task.
+    by_title = {a["title"]: a for a in outcome.model_assignments}
+    assert by_title["redesign core"]["tier"] == "strong"
+    assert by_title["redesign core"]["model"] == "m-strong"
+    assert by_title["redesign core"]["rationale"] == "architecture"
+    assert by_title["normal piece"]["model"] is None  # inherits board default
+
+    strong_id = by_title["redesign core"]["child_id"]
+    with kb.connect() as conn:
+        bodies = [c.body for c in kb.list_comments(conn, strong_id)]
+    assert any("Model tier: strong → m-strong — architecture" in b for b in bodies)
 
 
 def test_decomposer_uses_board_aux_model(kanban_home):
