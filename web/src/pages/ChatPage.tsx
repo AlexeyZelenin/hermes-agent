@@ -152,7 +152,19 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
   return layoutWidthPx < 1024 ? 1.02 : 1.15;
 }
 
-export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+export default function ChatPage({
+  isActive = true,
+  docked = false,
+}: {
+  isActive?: boolean;
+  // Rendered inside the right chat dock (a narrow fixed column flush to the
+  // screen edge) rather than full-page on `/chat`. The dock is only ~400px
+  // wide, so the viewport-based `narrow` check is wrong there: the desktop
+  // model-picker rail and the terminal card's padding would eat the right
+  // side as an empty strip. Docked mode drops both so the terminal fills the
+  // dock edge-to-edge.
+  docked?: boolean;
+}) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -1415,12 +1427,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       <div className="flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
         <div
           className={cn(
-            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg",
-            "p-2 sm:p-3",
+            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden",
+            // Docked: flush to the dock edges (which sit against the screen
+            // edge) — no card chrome, only vertical breathing room. Full page:
+            // a rounded, shadowed terminal card.
+            docked ? "py-2" : "rounded-lg p-2 sm:p-3",
           )}
           style={{
             backgroundColor: terminalBg,
-            boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
+            ...(docked
+              ? {}
+              : { boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)" }),
           }}
         >
           <div
@@ -1493,7 +1510,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           </Button>
         </div>
 
-        {!narrow && !zellijSession && (
+        {!narrow && !zellijSession && !docked && (
           <div
             id="chat-side-panel"
             role="complementary"
