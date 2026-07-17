@@ -72,7 +72,7 @@ def _prompt(tasks: list[Any]) -> str:
 def _incomplete_parents(conn: Any, task_id: str) -> bool:
     row = conn.execute(
         """SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id
-           WHERE l.child_id=? AND p.status != 'done' LIMIT 1""",
+           WHERE l.child_id=? AND p.status NOT IN ('done', 'archived') LIMIT 1""",
         (task_id,),
     ).fetchone()
     return row is not None

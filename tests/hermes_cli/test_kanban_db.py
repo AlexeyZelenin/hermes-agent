@@ -3563,6 +3563,48 @@ def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
             "parent is archived"
         )
 
+
+def test_create_child_with_historical_archived_parent_is_ready(kanban_home):
+    """An archived parent link is historical and must not gate new children."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="trashed parent")
+        assert kb.archive_task(conn, parent) is True
+
+        child = kb.create_task(conn, title="child", parents=[parent])
+
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_unblock_ignores_archived_parent_but_not_active_parent(kanban_home):
+    """Unblocking uses the same parent gate as creation and dispatch."""
+    with kb.connect() as conn:
+        archived = kb.create_task(conn, title="trashed parent")
+        active = kb.create_task(conn, title="active parent")
+        assert kb.archive_task(conn, archived) is True
+
+        blocked_child = kb.create_task(conn, title="blocked child", parents=[archived])
+        assert kb.get_task(conn, blocked_child).status == "ready"
+        assert kb.claim_task(conn, blocked_child) is not None
+        assert kb.block_task(conn, blocked_child, reason="needs input") is True
+        assert kb.unblock_task(conn, blocked_child) is True
+        assert kb.get_task(conn, blocked_child).status == "ready"
+
+        active_child = kb.create_task(conn, title="active child", parents=[archived, active])
+        assert kb.get_task(conn, active_child).status == "todo"
+
+
+def test_linking_historical_archived_parent_preserves_ready_child(kanban_home):
+    """Adding an archived historical link must not demote an eligible child."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="trashed parent")
+        child = kb.create_task(conn, title="ready child")
+        assert kb.archive_task(conn, parent) is True
+        assert kb.get_task(conn, child).status == "ready"
+
+        kb.link_tasks(conn, parent, child)
+
+        assert kb.get_task(conn, child).status == "ready"
+
 # ---------------------------------------------------------------------------
 # _add_column_if_missing / _migrate_add_optional_columns idempotency (#21708)
 # ---------------------------------------------------------------------------
