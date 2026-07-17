@@ -3260,6 +3260,24 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    # Merge into any metadata already on the run rather than replacing it.
+    # ``_stamp_run_start`` writes {executor, provider, model, workspace} at
+    # spawn so the "who / where / on what" survives even when the worker dies
+    # before reporting; a close-path ``metadata`` (crash payload, handoff
+    # facts) layers on top with its keys winning. ``metadata=None`` preserves
+    # whatever was stamped at start (a fresh, never-stamped run has NULL, so
+    # this stays a no-op for direct complete/block callers in the tests).
+    existing = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    merged: dict = {}
+    if existing and existing["metadata"]:
+        try:
+            merged = json.loads(existing["metadata"]) or {}
+        except (ValueError, TypeError):
+            merged = {}
+    if metadata:
+        merged.update(metadata)
     conn.execute(
         """
         UPDATE task_runs
@@ -3280,7 +3298,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(merged, ensure_ascii=False) if merged else None,
             now,
             run_id,
         ),
@@ -6793,7 +6811,50 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def _post_gave_up_diagnostics(
+    conn: sqlite3.Connection, task_id: str, *,
+    board: Optional[str], reason: str, log_tail: Optional[str],
+) -> None:
+    """Post a ``gave_up`` diagnostics comment: who / where / on what the dead
+    worker ran, why it died, and the tail of its log — so the incident is
+    diagnosable from the card without opening the board's file log. Best-effort:
+    a failure here never blocks the dispatch tick."""
+    try:
+        row = conn.execute(
+            "SELECT executor, workspace_path, model_override "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        executor = (row["executor"] if row else None) or "hermes-worker"
+        workspace = (row["workspace_path"] if row else None) or "?"
+        model = (
+            (row["model_override"] if row else None)
+            or (resolve_model_map(board).get("worker") if board else None)
+            or "?"
+        )
+        provider = (
+            f"acp-{executor}" if executor in ("claude-code", "codex")
+            else executor
+        )
+        lines = [
+            "🩺 Диагностика последнего рана (gave_up)",
+            f"кто: {executor} · провайдер: {provider} · модель: {model}",
+            f"где: {workspace}",
+            f"от чего умер: {reason}",
+        ]
+        if log_tail:
+            lines += [
+                "",
+                "Хвост лога воркера (последние ~15 строк):",
+                log_tail,
+            ]
+        add_comment(conn, task_id, "dispatcher", "\n".join(lines))
+    except Exception:
+        pass
+
+
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -6829,8 +6890,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, Optional[str]]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, log_tail)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -6856,6 +6917,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            # Read the worker log tail once so an abnormal death can (a) carry a
+            # human-readable reason instead of a bare exit code and (b) attach
+            # the tail to the ``gave_up`` comment. Best-effort file I/O.
+            _log_tail = None
+            try:
+                _log_tail = worker_log_tail(row["id"], board=board)
+            except Exception:
+                _log_tail = None
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -6911,6 +6980,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
                     error_text = f"pid {pid} not alive"
+                # Upgrade the bare exit text with a reason parsed from the log
+                # tail when we recognize one (e.g. a provider quota wall). This
+                # is what the circuit breaker later stamps as the park reason,
+                # so a parked card reads "Codex quota exhausted (429), retry in
+                # 6d" instead of "exited with code 1".
+                _reason = classify_fatal_log(_log_tail)
+                if _reason:
+                    error_text = _reason
                 event_kind = "crashed"
                 event_payload = {"pid": pid, "claimer": row["claim_lock"]}
                 if code is not None and kind != "unknown":
@@ -6967,7 +7044,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, _log_tail)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -6989,10 +7066,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, error_text, log_tail in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -7038,6 +7115,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 )
                 if tripped:
                     auto_blocked.append(tid)
+                    _post_gave_up_diagnostics(
+                        conn, tid, board=board, reason=error_text,
+                        log_tail=log_tail,
+                    )
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
@@ -7052,6 +7133,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             )
             if tripped:
                 auto_blocked.append(tid)
+                _post_gave_up_diagnostics(
+                    conn, tid, board=board, reason=error_text,
+                    log_tail=log_tail,
+                )
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this
@@ -7264,6 +7349,56 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+
+
+def _run_start_diagnostics(task: "Task", workspace: str, board: Optional[str]) -> dict:
+    """The 'who / where / on what' facts known at spawn, stamped onto the run
+    so a worker that dies before reporting still shows them on the card.
+
+    ``model`` mirrors ``_default_spawn``'s live resolution (frozen override →
+    board worker role); ``provider`` is the ACP harness id for external
+    executors (native workers resolve their provider inside the session, where
+    the token-usage ledger captures it)."""
+    executor = (task.executor or "hermes-worker")
+    meta: dict = {"executor": executor, "workspace": workspace}
+    model = task.model_override or resolve_model_map(board).get("worker")
+    if model:
+        meta["model"] = model
+    if executor in ("claude-code", "codex"):
+        meta["provider"] = f"acp-{executor}"
+    return meta
+
+
+def _stamp_run_start(
+    conn: sqlite3.Connection, task: "Task", workspace: str,
+    board: Optional[str] = None,
+) -> None:
+    """Merge :func:`_run_start_diagnostics` into the current run's metadata.
+
+    Best-effort: a missing run (task already terminal) is a silent no-op so a
+    diagnostics stamp never breaks a dispatch tick."""
+    try:
+        meta = _run_start_diagnostics(task, workspace, board)
+        with write_txn(conn):
+            run_id = _current_run_id(conn, task.id)
+            if run_id is None:
+                return
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            base: dict = {}
+            if row and row["metadata"]:
+                try:
+                    base = json.loads(row["metadata"]) or {}
+                except (ValueError, TypeError):
+                    base = {}
+            base.update(meta)
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(base, ensure_ascii=False), run_id),
+            )
+    except Exception:
+        pass
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7651,7 +7786,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -7906,6 +8041,7 @@ def _dispatch_once_locked(
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
+                _stamp_run_start(conn, claimed, str(workspace), board)
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -8001,6 +8137,7 @@ def _dispatch_once_locked(
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
+                _stamp_run_start(conn, claimed, str(workspace), board)
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -9178,6 +9315,62 @@ def read_worker_log(
         return data.decode("utf-8", errors="replace")
     except OSError:
         return None
+
+
+def worker_log_tail(
+    task_id: str, *, board: Optional[str] = None,
+    lines: int = 15, max_bytes: int = 8192,
+) -> Optional[str]:
+    """Last ``lines`` lines of a worker log (for the ``gave_up`` diagnostics
+    comment). Returns None when no log exists."""
+    raw = read_worker_log(task_id, tail_bytes=max_bytes, board=board)
+    if not raw:
+        return None
+    rows = raw.strip().splitlines()
+    if not rows:
+        return None
+    return "\n".join(rows[-lines:])
+
+
+def _human_duration(seconds: int) -> str:
+    """Coarse human duration for a retry-after ('505779s' -> '6d')."""
+    if seconds >= 86400:
+        return f"{round(seconds / 86400)}d"
+    if seconds >= 3600:
+        return f"{round(seconds / 3600)}h"
+    if seconds >= 60:
+        return f"{round(seconds / 60)}m"
+    return f"{seconds}s"
+
+
+_RETRY_AFTER_RE = re.compile(r"retry after\s+(\d+)\s*s", re.IGNORECASE)
+
+
+def classify_fatal_log(text: Optional[str]) -> Optional[str]:
+    """Turn a worker-log tail into a human-readable death reason, or None when
+    nothing recognizable is found (callers fall back to the raw exit text).
+
+    Recognizes the silent-killer case from the 2026-07-17 incident: a provider
+    quota wall ('Codex provider quota exhausted (429); retry after 505779s')
+    that otherwise reaches the card as a bare 'exited with code 1'."""
+    if not text:
+        return None
+    low = text.lower()
+    m = _RETRY_AFTER_RE.search(text)
+    retry = f", retry in {_human_duration(int(m.group(1)))}" if m else ""
+    quota = "quota exhausted" in low or (
+        "429" in low and ("quota" in low or "rate" in low)
+    )
+    if quota:
+        provider = (
+            "Codex" if "codex" in low
+            else "Claude" if "claude" in low
+            else "Provider"
+        )
+        return f"{provider} quota exhausted (429){retry}"
+    if "rate limit" in low or "rate-limit" in low or "too many requests" in low:
+        return f"Rate limited{retry}"
+    return None
 
 
 # ---------------------------------------------------------------------------

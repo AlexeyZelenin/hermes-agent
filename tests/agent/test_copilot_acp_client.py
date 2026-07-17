@@ -385,3 +385,97 @@ def test_match_session_model_id_prefers_exact_then_fuzzy():
     assert _match_session_model_id("sonnet 4.5", available) == "claude-sonnet-4-5"
     assert _match_session_model_id("gpt-5", available) is None
     assert _match_session_model_id("opus", "not-a-list") is None
+
+
+# ── Session metadata capture + interactive steering (t_81c4183c) ──────
+# End-to-end against a scripted fake ACP server: exercises the real
+# _run_prompt transport, so it validates modes/configOptions/usage_update
+# parsing and the multi-turn steer loop together.
+
+import sys as _sys
+
+_FAKE_ACP_SERVER = r'''
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": "sess-1",
+            "modes": {"currentModeId": "default",
+                      "availableModes": [{"id": "default", "name": "Default"}]},
+            "configOptions": [
+                {"id": "model", "name": "Model", "type": "select",
+                 "currentValue": "claude-opus-4-8", "options": []},
+                {"id": "effort", "name": "Effort", "type": "select",
+                 "currentValue": "high", "options": []},
+                {"id": "mode", "name": "Mode", "type": "select",
+                 "currentValue": "default", "options": []},
+            ]}})
+    elif method == "session/prompt":
+        text = msg["params"]["prompt"][0]["text"]
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess-1", "update": {
+                "sessionUpdate": "usage_update", "used": 1500, "size": 200000,
+                "cost": {"amount": 0.25, "currency": "USD"}}}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess-1", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "echo:" + text}}}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "stopReason": "end_turn",
+            "usage": {"totalTokens": 42, "inputTokens": 30, "outputTokens": 12}}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+'''
+
+
+def _fake_acp_client(tmp_path):
+    server = tmp_path / "fake_acp.py"
+    server.write_text(_FAKE_ACP_SERVER)
+    return CopilotACPClient(
+        acp_command=_sys.executable,
+        acp_args=[str(server)],
+        acp_cwd=str(tmp_path),
+    )
+
+
+def test_run_prompt_captures_mode_effort_and_context_window(tmp_path):
+    client = _fake_acp_client(tmp_path)
+    text, _ = client._run_prompt("do the task", timeout_seconds=15)
+
+    assert "echo:do the task" in text
+    assert client.last_model == "claude-opus-4-8"
+    assert client.last_mode == "default"
+    assert client.last_effort == "high"
+    assert client.last_context["context_used"] == 1500
+    assert client.last_context["context_size"] == 200000
+    assert client.last_context["context_remaining"] == 198500
+    assert client.last_context["cost_usd"] == 0.25
+    assert client.last_context["cost_currency"] == "USD"
+    assert client.last_turn_usage["total_tokens"] == 42
+
+
+def test_run_prompt_replays_operator_steer_on_same_session(tmp_path):
+    client = _fake_acp_client(tmp_path)
+    queued = iter(["please also add tests"])
+
+    def follow_up():
+        return next(queued, None)
+
+    text, _ = client._run_prompt(
+        "do the task", timeout_seconds=15, follow_up=follow_up,
+    )
+
+    # Both the primary turn and the injected steer turn ran on one session.
+    assert "echo:do the task" in text
+    assert "echo:please also add tests" in text
+    assert "[operator steer]" in text

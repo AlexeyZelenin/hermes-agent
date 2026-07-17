@@ -1,6 +1,6 @@
 """One-session external ACP executor for Kanban tasks; separate from providers."""
 from __future__ import annotations
-import os, shlex
+import json, os, shlex
 from agent.copilot_acp_client import CopilotACPClient
 
 _DEFAULT = {"claude-code": ("npx", ["--yes", "@agentclientprotocol/claude-agent-acp"]), "codex": ("codex-acp", ["--stdio"])}
@@ -10,10 +10,65 @@ def command_for(executor):
     command = os.getenv(prefix + "_COMMAND", "").strip() or _DEFAULT[executor][0]
     raw = os.getenv(prefix + "_ARGS", "").strip()
     return command, shlex.split(raw) if raw else list(_DEFAULT[executor][1])
+def steer_inbox_path(task_id, board=None):
+    """Per-task interactive-steering control channel: a JSONL inbox under the
+    board dir that the Zeus dashboard appends operator messages to and the live
+    ACP session drains between turns. One file per task keeps boards isolated."""
+    from hermes_cli import kanban_db as kb
+    return kb.board_dir(board) / "steer" / f"{task_id}.jsonl"
+def enqueue_steer(task_id, text, board=None):
+    """Append one operator steering message to the task's control channel."""
+    path = steer_inbox_path(task_id, board)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"text": str(text)}, ensure_ascii=False) + "\n")
+def _drain_steer(task_id, board=None):
+    """Return all queued steer messages joined into one turn (or None when the
+    inbox is empty), moving consumed lines to a ``.done`` sibling so a message
+    is never silently lost if the turn then fails. Best-effort file I/O."""
+    path = steer_inbox_path(task_id, board)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    texts = []
+    for ln in lines:
+        try:
+            texts.append(str(json.loads(ln).get("text") or ""))
+        except (ValueError, TypeError):
+            continue
+    try:
+        with open(path.with_suffix(".done.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(raw if raw.endswith("\n") else raw + "\n")
+        path.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+    joined = "\n\n".join(t for t in texts if t.strip())
+    return joined or None
+def _steering_enabled():
+    """Interactive steering is on unless explicitly disabled. An empty inbox is
+    a no-op (one file stat per task), so the default is safe."""
+    return os.getenv("HERMES_ACP_STEERING", "1").strip().lower() not in ("0", "false", "no", "off")
+def _stamp_session_metadata(metadata, client):
+    """Layer the adapter's per-session facts (permission mode, reasoning effort,
+    context-window occupancy, cumulative cost) onto the run metadata so the
+    card's 'last run' block can show them. Only keys the adapter provided."""
+    mode = getattr(client, "last_mode", "") or ""
+    if mode: metadata["mode"] = mode
+    effort = getattr(client, "last_effort", "") or ""
+    if effort: metadata["effort"] = effort
+    context = getattr(client, "last_context", None) or {}
+    for key in ("context_used", "context_size", "context_remaining", "cost_usd", "cost_currency"):
+        if context.get(key) is not None:
+            metadata[key] = context[key]
 def _report_usage(client, executor, task_id, subscription=None):
     """Best-effort turn accounting: the post_api_request hook lands usage in zeus.db token_usage."""
     usage = getattr(client, "last_turn_usage", None)
     if not usage: return
+    context = getattr(client, "last_context", None) or {}
     try:
         from hermes_cli.plugins import discover_plugins, invoke_hook
         discover_plugins()
@@ -21,14 +76,18 @@ def _report_usage(client, executor, task_id, subscription=None):
                     session_id=getattr(client, "last_session_id", "") or "",
                     provider=f"acp-{executor}", api_mode="acp",
                     model=getattr(client, "last_model", "") or executor, usage=usage,
-                    subscription=subscription or "")
+                    subscription=subscription or "",
+                    effort=getattr(client, "last_effort", "") or "",
+                    context_used=context.get("context_used"),
+                    context_size=context.get("context_size"),
+                    cost_usd=context.get("cost_usd"))
     except Exception:
         pass
 def _new_client(command, args, workspace, model, extra_env=None):
     return CopilotACPClient(acp_command=command, acp_args=args, acp_cwd=workspace,
                             allow_permissions=True, session_model=model,
                             extra_env=extra_env)
-def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id):
+def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None):
     """Run the prompt on the Claude subscription pool, rotating on usage limits.
 
     Each session gets CLAUDE_CONFIG_DIR pinned to a leased subscription dir
@@ -41,7 +100,7 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
     from agent import claude_subscriptions as subs
     if subs.pool_size() == 0:
         client = _new_client(command, args, workspace, model)
-        text, _ = client._run_prompt(prompt, timeout_seconds=timeout)
+        text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
         return text, client, None
     while True:
         lease = subs.acquire(task_id=task_id)
@@ -49,7 +108,7 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
         try:
             client = _new_client(command, args, workspace, model,
                                  extra_env={"CLAUDE_CONFIG_DIR": lease.config_dir})
-            text, _ = client._run_prompt(prompt, timeout_seconds=timeout)
+            text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
             if not subs.is_usage_limit_error(text) and not subs.is_auth_error(text):
                 return text, client, lease.name
             limited = text
@@ -71,17 +130,21 @@ def run_task(*, executor, task_id, workspace, board=None):
         timeout=float(os.getenv("HERMES_ACP_TIMEOUT_SECONDS", "3600"))
         model=os.getenv("HERMES_KANBAN_MODEL","").strip() or None
         subscription=None
+        follow_up=(lambda: _drain_steer(task_id, board)) if _steering_enabled() else None
         if executor == "claude-code":
-            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id)
+            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up)
         else:
             client=_new_client(command,args,workspace,model)
-            text,_=client._run_prompt(prompt,timeout_seconds=timeout)
+            text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
         _report_usage(client,executor,task_id,subscription)
     except Exception as exc:
         with kb.connect_closing(board=board) as conn: kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)
         raise
-    metadata={"executor":executor,"acp_command":command}
+    metadata={"executor":executor,"acp_command":command,"provider":f"acp-{executor}","workspace":workspace}
+    run_model=getattr(client,"last_model","") or model
+    if run_model: metadata["model"]=run_model
     if subscription: metadata["subscription"]=subscription
+    _stamp_session_metadata(metadata, client)
     with kb.connect_closing(board=board) as conn:
         if not kb.complete_task(conn,task_id,summary=text.strip() or f"External {executor} ACP session completed.",metadata=metadata,expected_run_id=run_id): raise RuntimeError("task was reclaimed or terminal")
     return text

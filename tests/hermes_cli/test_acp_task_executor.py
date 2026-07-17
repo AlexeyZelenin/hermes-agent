@@ -102,7 +102,7 @@ def test_acp_worker_completes_claimed_task_with_single_session(monkeypatch, kanb
         def __init__(self, **kwargs):
             calls.append(kwargs)
 
-        def _run_prompt(self, prompt, *, timeout_seconds):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
             calls.append((prompt, timeout_seconds))
             return "Implemented and tested.", ""
 
@@ -142,7 +142,7 @@ def test_acp_worker_reports_turn_usage_via_post_api_request_hook(monkeypatch, ka
         def __init__(self, **kwargs):
             pass
 
-        def _run_prompt(self, prompt, *, timeout_seconds):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
             return "Implemented and tested.", ""
 
     recorded = {}
@@ -193,7 +193,7 @@ def test_acp_worker_passes_requested_model_to_session(monkeypatch, kanban_conn, 
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-        def _run_prompt(self, prompt, *, timeout_seconds):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
             return "done", ""
 
     monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
@@ -209,3 +209,36 @@ def test_acp_worker_passes_requested_model_to_session(monkeypatch, kanban_conn, 
     executor.run_task(executor="claude-code", task_id=task_id2,
                       workspace=str(tmp_path), board="test")
     assert captured["session_model"] is None
+
+
+def test_steer_inbox_enqueue_drain_roundtrip(monkeypatch, tmp_path):
+    """Operator steer messages queue to a per-task inbox under the board dir and
+    drain (once) into a single combined turn; consumed lines are archived."""
+    from agent import acp_task_executor as executor
+
+    monkeypatch.setattr(kb, "board_dir", lambda board=None: tmp_path)
+
+    # Empty inbox → nothing to steer.
+    assert executor._drain_steer("t_steer", board="b") is None
+
+    executor.enqueue_steer("t_steer", "focus on the failing test", board="b")
+    executor.enqueue_steer("t_steer", "then commit", board="b")
+
+    drained = executor._drain_steer("t_steer", board="b")
+    assert "focus on the failing test" in drained
+    assert "then commit" in drained
+
+    # Inbox emptied after drain; consumed lines archived to a .done sibling.
+    assert executor._drain_steer("t_steer", board="b") is None
+    assert (tmp_path / "steer" / "t_steer.done.jsonl").exists()
+
+
+def test_steering_toggle_env(monkeypatch):
+    from agent import acp_task_executor as executor
+
+    monkeypatch.delenv("HERMES_ACP_STEERING", raising=False)
+    assert executor._steering_enabled() is True
+    monkeypatch.setenv("HERMES_ACP_STEERING", "0")
+    assert executor._steering_enabled() is False
+    monkeypatch.setenv("HERMES_ACP_STEERING", "off")
+    assert executor._steering_enabled() is False

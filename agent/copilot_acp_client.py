@@ -20,7 +20,7 @@ import time
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable, Optional
 
 from openai.types.chat.chat_completion_message_tool_call import (
     ChatCompletionMessageToolCall,
@@ -444,6 +444,56 @@ def _model_from_session(session: dict[str, Any]) -> str:
     return ""
 
 
+def _config_option_value(session: dict[str, Any], option_id: str) -> str:
+    """Return the ``currentValue`` of a ``session/new`` configOption by id.
+
+    The Claude Code ACP adapter (@agentclientprotocol/claude-agent-acp) exposes
+    per-session selectors as ``configOptions`` — ``id`` ∈ {"mode","model",
+    "effort","fast","agent"}. ``effort`` is only present when the model supports
+    reasoning levels; absent → "" (evidence: adapter buildConfigOptions())."""
+    options = session.get("configOptions")
+    if isinstance(options, list):
+        for option in options:
+            if isinstance(option, dict) and option.get("id") == option_id:
+                return str(option.get("currentValue") or "").strip()
+    return ""
+
+
+def _mode_from_session(session: dict[str, Any]) -> str:
+    """Current permission mode: prefer the ``modes.currentModeId`` block, fall
+    back to the mirrored ``mode`` configOption."""
+    modes = session.get("modes")
+    if isinstance(modes, dict):
+        current = str(modes.get("currentModeId") or "").strip()
+        if current:
+            return current
+    return _config_option_value(session, "mode")
+
+
+def _context_state(last_update: Any) -> dict[str, Any] | None:
+    """Project an ACP ``usage_update`` notification onto context-window state.
+
+    ``used``/``size`` are required by the ACP schema; ``cost`` (amount+currency)
+    is optional and populated by claude-agent-acp (``total_cost_usd``).
+    ``remaining`` is client-derived (size - used) per the Session-Usage RFD."""
+    if not isinstance(last_update, dict):
+        return None
+    used = _usage_int(last_update.get("used"))
+    size = _usage_int(last_update.get("size"))
+    if not used and not size:
+        return None
+    state: dict[str, Any] = {"context_used": used, "context_size": size}
+    if size:
+        state["context_remaining"] = max(size - used, 0)
+    cost = last_update.get("cost")
+    if isinstance(cost, dict):
+        amount = cost.get("amount")
+        if isinstance(amount, (int, float)):
+            state["cost_usd"] = float(amount)
+            state["cost_currency"] = str(cost.get("currency") or "USD")
+    return state
+
+
 def _match_session_model_id(wanted: str, available: Any) -> str | None:
     """Pick the advertised modelId matching ``wanted``.
 
@@ -533,7 +583,12 @@ class CopilotACPClient:
         self._active_process_lock = threading.Lock()
         self.last_session_id = ""
         self.last_model = ""
+        # Extra per-session facts the ACP adapter advertises at session/new and
+        # streams via usage_update. Captured for run diagnostics + zeus.db.
+        self.last_mode = ""
+        self.last_effort = ""
         self.last_turn_usage: dict[str, int] | None = None
+        self.last_context: dict[str, Any] | None = None
         self._last_usage_update: dict[str, Any] | None = None
 
     def close(self) -> None:
@@ -617,7 +672,21 @@ class CopilotACPClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        follow_up: Optional[Callable[[], Optional[str]]] = None,
+    ) -> tuple[str, str]:
+        """Run one prompt turn on a fresh ACP session, then close.
+
+        When ``follow_up`` is provided the session is kept open after the
+        primary turn: the callback is polled for operator steering messages and
+        each non-empty return is sent as another ``session/prompt`` turn on the
+        *same* live session (turn-based interactive steering). ``None``/empty
+        ends the loop. Turn outputs are joined so a single response text carries
+        the whole exchange."""
         env = _build_subprocess_env()
         env.update(self._extra_env)
         try:
@@ -644,7 +713,10 @@ class CopilotACPClient:
         self.is_closed = False
         self.last_session_id = ""
         self.last_model = ""
+        self.last_mode = ""
+        self.last_effort = ""
         self.last_turn_usage = None
+        self.last_context = None
         self._last_usage_update = None
         with self._active_process_lock:
             self._active_process = proc
@@ -764,6 +836,8 @@ class CopilotACPClient:
                 raise RuntimeError("Copilot ACP did not return a sessionId.")
             self.last_session_id = session_id
             self.last_model = _model_from_session(session)
+            self.last_mode = _mode_from_session(session)
+            self.last_effort = _config_option_value(session, "effort")
 
             if self._session_model:
                 # Best-effort model pin. When the agent advertises models we
@@ -790,24 +864,38 @@ class CopilotACPClient:
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
-            result = _request(
-                "session/prompt",
-                {
-                    "sessionId": session_id,
-                    "prompt": [
-                        {
-                            "type": "text",
-                            "text": prompt_text,
-                        }
-                    ],
-                },
-                text_parts=text_parts,
-                reasoning_parts=reasoning_parts,
-            )
-            self.last_turn_usage = _canonical_turn_usage(
-                result.get("usage") if isinstance(result, dict) else None,
-                self._last_usage_update,
-            )
+
+            def _prompt_turn(turn_text: str) -> None:
+                result = _request(
+                    "session/prompt",
+                    {
+                        "sessionId": session_id,
+                        "prompt": [{"type": "text", "text": turn_text}],
+                    },
+                    text_parts=text_parts,
+                    reasoning_parts=reasoning_parts,
+                )
+                self.last_turn_usage = _canonical_turn_usage(
+                    result.get("usage") if isinstance(result, dict) else None,
+                    self._last_usage_update,
+                )
+                self.last_context = _context_state(self._last_usage_update)
+
+            _prompt_turn(prompt_text)
+
+            # Interactive steering: keep the session alive and replay each queued
+            # operator message as another turn. The default (no follow_up) closes
+            # after the primary turn, so the chat-completion path is unchanged.
+            while follow_up is not None:
+                try:
+                    steer = follow_up()
+                except Exception:
+                    steer = None
+                if not steer or not str(steer).strip():
+                    break
+                text_parts.append("\n\n[operator steer]\n")
+                _prompt_turn(str(steer))
+
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
             self.close()
