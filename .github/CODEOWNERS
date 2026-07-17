@@ -1,0 +1,27 @@
+# CODEOWNERS - required reviewers for protected paths (t_537e2195)
+#
+# Syntax: <path-pattern> <owner...>  (gitignore-style globs, owners are
+# @user or @org/team handles that MUST have write access to this repo).
+# The LAST matching pattern for a file wins.
+#
+# Owner note: @AlexeyZelenin is currently the only GitHub account with
+# write access to this repo (the fork these zeus/* PRs target). No team
+# exists yet; when one is added, replace the individual with @org/team so
+# the review gate can be satisfied by someone other than the PR author.
+#
+# The file alone does not block merges - a branch-protection rule / ruleset
+# on `main` with "Require review from Code Owners" enabled must be turned on
+# for these owners to be requested and required on PRs.
+
+# --- Database migrations -----------------------------------------------------
+# Any change under a top-level migrations/ tree (schema history is high-risk).
+migrations/**            @AlexeyZelenin
+
+# --- OpenAPI specs -----------------------------------------------------------
+# Unanchored pattern: matches openapi.json / openapi.yaml / an openapi/ dir
+# in ANY directory of the repo (API contract changes need owner sign-off).
+openapi*                 @AlexeyZelenin
+
+# --- Protect this policy itself ---------------------------------------------
+# So the protection cannot be weakened without owner review.
+/.github/CODEOWNERS      @AlexeyZelenin
