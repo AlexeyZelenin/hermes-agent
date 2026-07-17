@@ -591,6 +591,18 @@ export const api = {
   deleteCronJob: (id: string, profile = "default") =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
 
+  // "Регулярные" registry — crons classified by cadence/purpose with token spend
+  getCronRegistry: (profile = "all", periodDays = 30) =>
+    fetchJSON<CronRegistry>(
+      `/api/cron/registry?profile=${encodeURIComponent(profile)}&period_days=${periodDays}`,
+    ),
+  scanCronRegistry: (profile = "all", periodDays = 30, board = "") =>
+    fetchJSON<{ emitted: CronRegistryFinding[]; count: number }>(
+      `/api/cron/registry/scan?profile=${encodeURIComponent(profile)}` +
+        `&period_days=${periodDays}&board=${encodeURIComponent(board)}`,
+      { method: "POST" },
+    ),
+
   // Automation Blueprints — parameterized automation blueprints
   getAutomationBlueprints: () =>
     fetchJSON<{ blueprints: AutomationBlueprint[] }>("/api/cron/blueprints"),
@@ -2209,6 +2221,65 @@ export interface CronDeliveryTarget {
   name: string;
   home_target_set: boolean;
   home_env_var: string | null;
+}
+
+export interface CronRegistryTokens {
+  total_tokens: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cost_usd: number | null;
+  run_count: number;
+  last_ts: number | null;
+  period_days: number | null;
+  display: string;
+}
+
+export interface CronRegistryAnomaly {
+  kind: "consecutive_failures" | "token_spike";
+  streak?: number;
+  latest?: number;
+  baseline?: number;
+  factor?: number;
+}
+
+export interface CronRegistryRow {
+  id: string;
+  name: string;
+  profile?: string | null;
+  purpose: string;
+  purpose_label: string;
+  cadence: string;
+  cadence_label: string;
+  cadence_badge: string;
+  enabled: boolean;
+  state?: string | null;
+  no_agent: boolean;
+  last_run_at?: string | null;
+  last_status?: string | null;
+  last_error?: string | null;
+  last_delivery_error?: string | null;
+  next_run_at?: string | null;
+  tokens: CronRegistryTokens | null;
+  anomalies: CronRegistryAnomaly[];
+}
+
+export interface CronRegistryTicker {
+  heartbeat_age: number | null;
+  success_age: number | null;
+  interval_seconds: number;
+}
+
+export interface CronRegistry {
+  crons: CronRegistryRow[];
+  ticker: CronRegistryTicker;
+  period_days: number;
+}
+
+export interface CronRegistryFinding {
+  id: string;
+  kind: string;
+  title: string;
+  severity: string;
 }
 
 export interface AutomationBlueprintField {
