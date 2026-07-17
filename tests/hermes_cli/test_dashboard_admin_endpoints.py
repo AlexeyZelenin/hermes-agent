@@ -1270,3 +1270,81 @@ class TestToolsConfigEndpoints:
                 kwargs["json"] = payload
             r = fn(path, **kwargs)
             assert r.status_code == 401, f"{method} {path} not gated"
+
+
+class TestSubscriptionPoolEndpoints:
+    """Claude Code subscription pool: pool view + live 5h/weekly windows.
+
+    Distinct from the API-key credential pool — these are CLAUDE_CONFIG_DIR
+    logins the executor spreads sessions across. The isolated HERMES_HOME gives
+    each test its own zeus.db. The test env deliberately does NOT isolate HOME,
+    so config-dir discovery and login checks are pinned via monkeypatch to keep
+    these tests independent of the host's real ~/.claude* logins.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, _isolate_hermes_home, monkeypatch):
+        self.client, self.header = _client()
+        from agent import claude_subscriptions as subs
+
+        # Pin discovery + login so the host's real subscriptions never leak in.
+        self._dirs = {}
+        monkeypatch.setattr(subs, "_discover_config_dirs", lambda: dict(self._dirs))
+        monkeypatch.setattr(subs, "is_logged_in", lambda config_dir: False)
+
+    def _register(self, name, config_dir):
+        self._dirs[name] = config_dir
+
+    def test_pool_empty(self):
+        r = self.client.get("/api/subscriptions/pool")
+        assert r.status_code == 200, r.text
+        assert r.json()["subscriptions"] == []
+
+    def test_pool_lists_registered_subscription(self):
+        self._register("personal", "/tmp/does-not-exist-personal")
+        r = self.client.get("/api/subscriptions/pool")
+        assert r.status_code == 200, r.text
+        rows = r.json()["subscriptions"]
+        row = next(s for s in rows if s["name"] == "personal")
+        assert row["logged_in"] is False
+        assert row["max_concurrency"] == 4
+        for k in ("active_sessions", "cooling", "burn_rate_tokens_per_hour"):
+            assert k in row
+
+    def test_usage_reports_windows_via_oauth_api(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        import agent.account_usage as au
+        from agent import claude_subscriptions as subs
+        from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
+
+        self._register("personal", "/tmp/does-not-exist-personal")
+        monkeypatch.setattr(subs, "is_logged_in", lambda config_dir: True)
+        monkeypatch.setattr(
+            subs, "subscription_access_token", lambda config_dir: "oauth-tok"
+        )
+        snap = AccountUsageSnapshot(
+            provider="anthropic",
+            source="oauth_usage_api",
+            fetched_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+            windows=(
+                AccountUsageWindow(label="Current session", used_percent=42.0),
+                AccountUsageWindow(label="Current week", used_percent=10.0),
+            ),
+        )
+        monkeypatch.setattr(au, "fetch_account_usage", lambda *a, **k: snap)
+
+        r = self.client.get("/api/subscriptions/usage")
+        assert r.status_code == 200, r.text
+        acc = next(a for a in r.json()["accounts"] if a["name"] == "personal")
+        assert acc["usage"] is not None
+        labels = [w["label"] for w in acc["usage"]["windows"]]
+        assert labels == ["Current session", "Current week"]
+        assert acc["usage"]["windows"][0]["used_percent"] == 42.0
+
+    def test_usage_null_when_logged_out(self):
+        self._register("personal", "/tmp/does-not-exist-personal")
+        r = self.client.get("/api/subscriptions/usage")
+        assert r.status_code == 200, r.text
+        acc = next(a for a in r.json()["accounts"] if a["name"] == "personal")
+        assert acc["usage"] is None

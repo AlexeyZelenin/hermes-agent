@@ -6111,6 +6111,11 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    auto_unblocked: list[str] = field(default_factory=list)
+    """Capability-blocked task ids auto-unblocked this tick because the
+    Claude subscription pool recovered (a cooling window elapsed or a
+    lease slot freed). Closes the manual-unblock gap for external
+    claude-code tasks that blocked on "all subscriptions cooling"."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -7478,6 +7483,56 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _auto_unblock_subscription_blocked(conn: sqlite3.Connection) -> list[str]:
+    """Unblock tasks that blocked on "all Claude subscriptions cooling".
+
+    The external claude-code executor blocks a task with a marker-tagged
+    capability reason when every subscription in the pool is in a usage-limit
+    cooldown. Once any subscription recovers (cooldown elapsed, lease freed,
+    or a new login appears) the block cause is gone — release those tasks
+    back to the work pool instead of waiting for a manual unblock.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked' AND block_kind = 'capability'"
+    ).fetchall()
+    if not rows:
+        return []
+    try:
+        from agent.claude_subscriptions import (
+            SUBSCRIPTIONS_EXHAUSTED_MARKER as marker,
+            pool_has_capacity,
+        )
+    except Exception:
+        return []
+    candidates = []
+    for row in rows:
+        event = conn.execute(
+            "SELECT payload FROM task_events"
+            " WHERE task_id = ? AND kind = 'blocked'"
+            " ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        payload = event["payload"] if event else None
+        if payload and marker in payload:
+            candidates.append(row["id"])
+    if not candidates:
+        return []
+    try:
+        if not pool_has_capacity():
+            return []
+    except Exception:
+        _log.debug("subscription pool capacity check failed", exc_info=True)
+        return []
+    unblocked = []
+    for task_id in candidates:
+        try:
+            if unblock_task(conn, task_id):
+                unblocked.append(task_id)
+        except Exception:
+            _log.exception("auto-unblock of %s failed", task_id)
+    return unblocked
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -7613,6 +7668,7 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    result.auto_unblocked = _auto_unblock_subscription_blocked(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather

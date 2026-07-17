@@ -13,6 +13,7 @@ import {
   Globe,
   HardDrive,
   KeyRound,
+  Layers,
   Link2,
   Play,
   Plus,
@@ -52,6 +53,8 @@ import type {
   MemoryProviderInfo,
   CredentialPoolProvider,
   CredentialUsageAccount,
+  SubscriptionPoolEntry,
+  SubscriptionUsageAccount,
   CheckpointsResponse,
   HooksResponse,
   HookEntry,
@@ -230,6 +233,14 @@ export default function SystemPage() {
   >({});
   const [checkingLimits, setCheckingLimits] = useState(false);
 
+  // Claude Code subscription pool (named CLAUDE_CONFIG_DIR logins).
+  const [subs, setSubs] = useState<SubscriptionPoolEntry[]>([]);
+  // Per-subscription 5h/weekly windows, keyed by subscription name.
+  const [subUsage, setSubUsage] = useState<
+    Record<string, SubscriptionUsageAccount>
+  >({});
+  const [checkingSubLimits, setCheckingSubLimits] = useState(false);
+
   const [pendingBackupArchive, setPendingBackupArchive] = useState<string | null>(
     null,
   );
@@ -282,8 +293,9 @@ export default function SystemPage() {
       // Cached (non-forced) check so the version row shows update status on
       // load without a separate effect / a forced network round-trip.
       api.checkHermesUpdate(false),
+      api.getSubscriptionPool(),
     ])
-      .then(([s, st, m, p, c, h, cur, prt, upd]) => {
+      .then(([s, st, m, p, c, h, cur, prt, upd, sub]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
@@ -293,6 +305,7 @@ export default function SystemPage() {
         if (cur.status === "fulfilled") setCurator(cur.value);
         if (prt.status === "fulfilled") setPortal(prt.value);
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
+        if (sub.status === "fulfilled") setSubs(sub.value.subscriptions);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -390,6 +403,20 @@ export default function SystemPage() {
       showToast(`Failed to check limits: ${e}`, "error");
     } finally {
       setCheckingLimits(false);
+    }
+  };
+
+  const checkSubLimits = async () => {
+    setCheckingSubLimits(true);
+    try {
+      const res = await api.getSubscriptionUsage();
+      const map: Record<string, SubscriptionUsageAccount> = {};
+      for (const acc of res.accounts) map[acc.name] = acc;
+      setSubUsage(map);
+    } catch (e) {
+      showToast(`Failed to check subscription limits: ${e}`, "error");
+    } finally {
+      setCheckingSubLimits(false);
     }
   };
 
@@ -1274,6 +1301,90 @@ export default function SystemPage() {
                 })}
               </div>
             ))}
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* ── Claude subscriptions ──────────────────────────────────── */}
+      <section className="flex flex-col gap-3">
+        <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+          <Layers className="h-4 w-4" /> Claude subscriptions
+        </H2>
+        <Card>
+          <CardContent className="flex flex-col gap-4 py-4">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm text-muted-foreground">
+                Claude Code logins the executor spreads sessions across, cooling
+                one on a usage limit and rotating to the next.
+              </p>
+              {subs.length > 0 && (
+                <Button size="sm" ghost onClick={checkSubLimits} disabled={checkingSubLimits} prefix={checkingSubLimits ? <Spinner /> : <Gauge className="h-3.5 w-3.5" />}>
+                  Check limits
+                </Button>
+              )}
+            </div>
+            {subs.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                No subscription logins found. Run <span className="font-mono">claude</span> once
+                per config dir (<span className="font-mono">~/.claude</span>,{" "}
+                <span className="font-mono">~/.claude-sub-&lt;name&gt;</span>) to add them.
+              </p>
+            )}
+            {subs.map((sub) => {
+              const coolingSeconds = sub.cooling_until
+                ? Math.floor(sub.cooling_until - Date.now() / 1000)
+                : 0;
+              const usage = subUsage[sub.name]?.usage;
+              const burn = sub.burn_rate_tokens_per_hour;
+              return (
+                <div key={sub.name} className="flex flex-col gap-2 border border-border bg-background/40 px-3 py-2">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span className="text-sm font-medium">{sub.display_name || sub.name}</span>
+                    <span className="font-mono text-xs text-muted-foreground">{sub.config_dir}</span>
+                    {!sub.enabled && <Badge tone="outline">disabled</Badge>}
+                    {sub.logged_in ? (
+                      <Badge tone="secondary">logged in</Badge>
+                    ) : (
+                      <Badge tone="destructive">logged out</Badge>
+                    )}
+                    {coolingSeconds > 0 && (
+                      <Badge tone="destructive">cooling · {formatDuration(coolingSeconds)}</Badge>
+                    )}
+                    <Badge tone="outline">{sub.active_sessions}/{sub.max_concurrency} active</Badge>
+                    {burn != null && burn > 0 && (
+                      <Badge tone="outline">{(burn / 1000).toFixed(1)}k tok/h</Badge>
+                    )}
+                  </div>
+                  {usage && (
+                    <div className="flex flex-col gap-1 border-l border-border pl-3">
+                      {usage.unavailable_reason && (
+                        <span className="text-xs text-muted-foreground">{usage.unavailable_reason}</span>
+                      )}
+                      {usage.windows.map((w) => {
+                        const pct = Math.max(0, Math.min(100, w.used_percent ?? 0));
+                        const reset = resetsIn(w.reset_at);
+                        return (
+                          <div key={w.label} className="flex items-center gap-2 text-xs">
+                            <span className="w-28 shrink-0 text-muted-foreground">{w.label}</span>
+                            <div className="h-1.5 w-32 shrink-0 overflow-hidden bg-border/60">
+                              <div
+                                className={cn("h-full", pct >= 90 ? "bg-destructive" : "bg-primary")}
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                            <span>{(100 - pct).toFixed(0)}% left · {pct.toFixed(0)}% used{reset ? ` · resets ${reset}` : ""}</span>
+                            {w.detail && <span className="text-muted-foreground">{w.detail}</span>}
+                          </div>
+                        );
+                      })}
+                      {usage.details.map((d) => (
+                        <span key={d} className="text-xs text-muted-foreground">{d}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </CardContent>
         </Card>
       </section>

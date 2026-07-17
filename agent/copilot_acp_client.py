@@ -509,6 +509,7 @@ class CopilotACPClient:
         args: list[str] | None = None,
         allow_permissions: bool = False,
         session_model: str | None = None,
+        extra_env: dict[str, str] | None = None,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
@@ -523,6 +524,9 @@ class CopilotACPClient:
         # Requested session model (ACP session/set_model). Best-effort: an
         # agent that doesn't support it keeps its own default.
         self._session_model = (session_model or "").strip()
+        # Per-session env overrides for the ACP subprocess — e.g. the Kanban
+        # executor pins CLAUDE_CONFIG_DIR to the leased subscription's dir.
+        self._extra_env = dict(extra_env or {})
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -614,6 +618,8 @@ class CopilotACPClient:
         return completion
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+        env = _build_subprocess_env()
+        env.update(self._extra_env)
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -623,7 +629,7 @@ class CopilotACPClient:
                 text=True,
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=env,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(

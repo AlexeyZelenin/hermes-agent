@@ -1098,6 +1098,16 @@ export const api = {
   getCredentialUsage: () =>
     fetchJSON<{ accounts: CredentialUsageAccount[] }>("/api/credentials/usage"),
 
+  // ── Admin: Claude subscription pool ─────────────────────────────────
+  getSubscriptionPool: () =>
+    fetchJSON<{ subscriptions: SubscriptionPoolEntry[] }>(
+      "/api/subscriptions/pool",
+    ),
+  getSubscriptionUsage: () =>
+    fetchJSON<{ accounts: SubscriptionUsageAccount[] }>(
+      "/api/subscriptions/usage",
+    ),
+
   // ── Admin: Memory provider ──────────────────────────────────────────
   getMemory: () => fetchJSON<MemoryStatus>("/api/memory"),
   getMemoryProviderConfig: (provider: string) =>
@@ -1611,6 +1621,29 @@ export interface CredentialUsageAccount {
   index: number;
   id: string | null;
   label: string | null;
+  usage: CredentialAccountUsage | null;
+}
+
+export interface SubscriptionPoolEntry {
+  name: string;
+  config_dir: string;
+  display_name: string;
+  notes: string;
+  enabled: boolean;
+  dir_exists: boolean;
+  logged_in: boolean;
+  active_sessions: number;
+  max_concurrency: number;
+  cooling: boolean;
+  /** Epoch seconds until a cooling subscription re-enters rotation; null when not cooling. */
+  cooling_until: number | null;
+  last_limited_at: number | null;
+  burn_rate_tokens_per_hour: number | null;
+}
+
+export interface SubscriptionUsageAccount {
+  name: string;
+  display_name: string;
   usage: CredentialAccountUsage | null;
 }
 

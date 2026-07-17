@@ -165,10 +165,45 @@ def read_subscription_credentials(config_dir: str) -> Optional[Dict[str, Any]]:
     return _read_credentials_keychain(config_dir) or _read_credentials_file(config_dir)
 
 
+def subscription_access_token(config_dir: str) -> Optional[str]:
+    """The pocket's stored OAuth access token, for querying its usage API.
+
+    Best-effort: an idle pocket's token may be expired (Claude Code refreshes
+    lazily on session start), in which case the usage API returns 401 and the
+    dashboard shows the window as unavailable rather than a stale number.
+    """
+    oauth = read_subscription_credentials(config_dir)
+    token = (oauth or {}).get("accessToken")
+    return token or None
+
+
 # Keychain lookups shell out to `security`; cache login state briefly so the
 # capacity-wait poll loop and the dashboard don't hammer the OS.
 _LOGIN_CACHE_TTL_SECONDS = 30.0
 _login_cache: Dict[str, tuple] = {}
+
+
+def _credentials_live(oauth: Optional[Dict[str, Any]]) -> bool:
+    """Whether a stored OAuth payload still counts as a usable login.
+
+    Mere presence of a ``.credentials.json`` (or Keychain entry) is not proof
+    of a live login: a logged-out pocket can leave a *stale* payload behind
+    whose access token has expired. If the pool leases such a pocket the
+    session dies with 'Authentication required' — the exact failure that
+    blocked prior task attempts. So a pocket is logged in only when its access
+    token is unexpired, OR it carries a refresh token Claude Code can use to
+    renew it on session start (the executor's ``is_auth_error`` rotation is the
+    backstop for a refresh token that itself has been revoked).
+    """
+    if not oauth or not oauth.get("accessToken"):
+        return False
+    try:
+        from agent.anthropic_adapter import is_claude_code_token_valid
+    except Exception:  # pragma: no cover - adapter import should not fail
+        return True  # fail-open: we already know an access token is present
+    if is_claude_code_token_valid(oauth):
+        return True
+    return bool(oauth.get("refreshToken"))
 
 
 def is_logged_in(config_dir: str) -> bool:
@@ -176,7 +211,7 @@ def is_logged_in(config_dir: str) -> bool:
     now = time.monotonic()
     if cached and now - cached[0] < _LOGIN_CACHE_TTL_SECONDS:
         return cached[1]
-    result = read_subscription_credentials(config_dir) is not None
+    result = _credentials_live(read_subscription_credentials(config_dir))
     _login_cache[config_dir] = (now, result)
     return result
 

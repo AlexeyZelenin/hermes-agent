@@ -11897,6 +11897,51 @@ async def remove_credential_pool_entry(provider: str, index: int):
 
 
 # ---------------------------------------------------------------------------
+# Claude Code subscription pool — named CLAUDE_CONFIG_DIR logins with rotation.
+# Distinct from the API-key credential pool above: these are Claude Code
+# subscription logins (~/.claude, ~/.claude-sub-<name>) the executor spreads
+# sessions across, cooling one on a usage limit and rotating to the next.
+
+@app.get("/api/subscriptions/pool")
+def list_subscription_pool():
+    """Per-subscription pool view: login/enabled/cooling/leases/burn rate."""
+    from agent.claude_subscriptions import pool_status
+
+    try:
+        return {"subscriptions": pool_status()}
+    except Exception as exc:
+        _log.exception("GET /api/subscriptions/pool failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/subscriptions/usage")
+def subscription_pool_usage():
+    """Live 5h/weekly window remainder per Claude Code subscription.
+
+    Queries each pocket's own Anthropic OAuth usage API with that pocket's
+    stored access token, so every subscription reports its exact remaining
+    quota for both the session (5h) and weekly windows. Network-bound — the
+    dashboard calls it on demand, not with every pool refresh. Sync ``def`` so
+    FastAPI runs the blocking HTTP fetches in its threadpool.
+    """
+    from agent.account_usage import fetch_account_usage
+    from agent.claude_subscriptions import pool_status, subscription_access_token
+
+    accounts = []
+    for sub in pool_status():
+        token = subscription_access_token(sub["config_dir"]) if sub["logged_in"] else None
+        snapshot = (
+            fetch_account_usage("anthropic", api_key=token) if token else None
+        )
+        accounts.append({
+            "name": sub["name"],
+            "display_name": sub["display_name"],
+            "usage": _usage_snapshot_dict(snapshot),
+        })
+    return {"accounts": accounts}
+
+
+# ---------------------------------------------------------------------------
 # Memory provider endpoints — status / list providers / select / disable / reset.
 #
 # Provider setup is dashboard-native when a provider exposes get_config_schema().
