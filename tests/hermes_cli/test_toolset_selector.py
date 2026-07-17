@@ -149,6 +149,22 @@ def test_selection_is_deterministic():
     assert a.toolsets == b.toolsets
 
 
+def test_unknown_ceiling_names_are_dropped_not_crash():
+    # a garbage/typo toolset name in the ceiling must be silently discarded,
+    # never selected, and never crash the selector (fail-safe dedup).
+    sel = _sel(title="Search docs",
+               ceiling=["file", "terminal", "todo", "web", "not_a_real_toolset", "WEB"])
+    assert "not_a_real_toolset" not in sel.toolsets
+    assert "WEB" not in sel.toolsets          # validate_toolset is case-sensitive
+    assert "web" in sel.toolsets              # the valid signal still lands
+    assert set(sel.toolsets) <= {"file", "terminal", "todo", "web"}
+
+
+def test_all_unknown_ceiling_yields_empty_but_no_crash():
+    sel = _sel(title="Search docs", ceiling=["garbage", "", "  ", "Nope"])
+    assert sel.toolsets == []
+
+
 # --- thresholds -------------------------------------------------------------
 
 def test_single_keyword_hit_clears_tau_select():
