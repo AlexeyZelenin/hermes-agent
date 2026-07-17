@@ -8514,7 +8514,22 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+def _board_selector_overrides(board: Optional[str]) -> Optional[dict]:
+    """Per-board ``toolset_selection`` overrides from board metadata, if any."""
+    if not board:
+        return None
+    try:
+        raw = read_board_metadata(board).get("toolset_selection")
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
+
+
+def _resolve_worker_cli_toolsets(
+    hermes_home: Optional[str],
+    task: "Optional[Task]" = None,
+    board: Optional[str] = None,
+) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
     Dispatcher-spawned workers are launched from a long-lived gateway process,
@@ -8524,6 +8539,15 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     root/active-profile config or a profile whose top-level ``toolsets`` entry
     is only the kanban orchestrator surface. ``model_tools`` still appends the
     task-scoped kanban lifecycle tools when ``HERMES_KANBAN_TASK`` is set.
+
+    When ``task`` is supplied and the ``kanban.toolset_selection`` mechanism is
+    enabled (``mode: narrow``), the full profile allowlist (the *ceiling*) is
+    narrowed to a base set plus only the toolsets relevant to the task's
+    title/body (see ``hermes_cli/toolset_selector``). This runs only for the
+    native ``hermes-worker`` executor — ``claude-code``/``codex`` swap to the
+    ACP executor and never consume ``--toolsets``, so they get the ceiling
+    unchanged. Any error or ``mode: off`` returns the full ceiling, i.e. the
+    historical behaviour.
     """
     if not hermes_home:
         return None
@@ -8535,10 +8559,9 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            ceiling = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
     except Exception as exc:
         _log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
@@ -8546,6 +8569,36 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             exc,
         )
         return None
+
+    # ACP harnesses (claude-code/codex) don't consume --toolsets; only the
+    # native worker path narrows. A missing task means an older/legacy caller
+    # — keep today's full-ceiling behaviour.
+    if task is None or (task.executor not in ("hermes-worker", None)):
+        return ceiling or None
+
+    try:
+        from hermes_cli.toolset_selector import (
+            emit_selection_log,
+            load_selector_config,
+            select_toolsets,
+        )
+
+        selector_cfg = load_selector_config(cfg, _board_selector_overrides(board))
+        selection = select_toolsets(
+            title=task.title,
+            body=task.body,
+            ceiling=ceiling,
+            config=selector_cfg,
+        )
+        emit_selection_log(task, board, selection)
+        return selection.toolsets or ceiling or None
+    except Exception as exc:
+        _log.warning(
+            "kanban worker: toolset selector failed for task %s (%s); using full ceiling",
+            getattr(task, "id", "?"),
+            exc,
+        )
+        return ceiling or None
 
 
 def _default_spawn(
@@ -8695,7 +8748,7 @@ def _default_spawn(
     # live). Exported for the ACP executor below; the hermes-worker path keeps
     # its own effort resolution.
     effective_effort = task.effort_override or resolve_effort_map(board).get("worker")
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"), task, board)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

@@ -2830,6 +2830,30 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Task-aware toolset selection for native hermes-workers. A worker
+        # otherwise receives its profile's ENTIRE enabled CLI tool surface;
+        # when enabled, the surface narrows to ``base`` plus only the toolsets
+        # whose relevance is signalled by the task's title/body (see
+        # hermes_cli/toolset_selector.py and docs/design/toolset-selection.md).
+        # Ships dark: ``mode: off`` is behaviourally identical to today.
+        # claude-code/codex executors are unaffected (they don't use
+        # --toolsets). Any selector error fails open to the full surface.
+        "toolset_selection": {
+            "mode": "off",              # off | narrow. Enable per board.
+            "base": ["file", "terminal", "todo"],  # always included (⊆ profile allowlist)
+            # Never auto-selected even on a keyword match (must not overlap base).
+            "denylist": ["computer_use", "image_gen", "spotify", "homeassistant", "tts"],
+            "pin": [],                  # optional force-include (⊆ profile allowlist)
+            "tau_select": 0.5,          # >= this confidence → include
+            "tau_low": 0.3,             # [tau_low, tau_select) → borderline (aux may promote)
+            "aux": {
+                # Optional aux-model re-rank of borderline cases (narrow-only).
+                # Off by default — the aux/OpenRouter chain is currently dead.
+                "enabled": False,
+                "timeout_s": 8,
+                "model": "auto",
+            },
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

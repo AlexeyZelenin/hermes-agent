@@ -3,11 +3,11 @@ from __future__ import annotations
 import subprocess
 
 
-def _make_task(kb, *, assignee: str):
+def _make_task(kb, *, assignee: str, title="spawn tools", body=None, executor="hermes-worker"):
     return kb.Task(
         id="t_spawn_tools",
-        title="spawn tools",
-        body=None,
+        title=title,
+        body=body,
         assignee=assignee,
         status="running",
         priority=0,
@@ -21,7 +21,34 @@ def _make_task(kb, *, assignee: str):
         claim_expires=None,
         tenant=None,
         current_run_id=7,
+        executor=executor,
     )
+
+
+def _narrow_profile(tmp_path):
+    """Isolated HERMES_HOME whose profile enables narrow toolset selection."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - file
+    - terminal
+    - web
+    - memory
+    - delegation
+toolsets:
+  - hermes-cli
+kanban:
+  toolset_selection:
+    mode: narrow
+    base: [file, terminal]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return root, profile
 
 
 def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path):
@@ -197,3 +224,70 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_resolve_narrow_mode_narrows_by_task_content(monkeypatch, tmp_path):
+    """With ``mode: narrow``, the worker gets base + only task-relevant toolsets.
+
+    A task about searching online docs earns ``web`` (keyword rule); the
+    unrelated ``memory``/``delegation`` toolsets in the profile ceiling are
+    withheld. Base (file/terminal) is always kept.
+    """
+    _root, profile = _narrow_profile(tmp_path)
+
+    from hermes_cli import kanban_db as kb
+
+    task = _make_task(kb, assignee="elias", title="Search the online documentation")
+    resolved = kb._resolve_worker_cli_toolsets(str(profile), task, "ra")
+
+    assert resolved is not None
+    assert set(resolved) >= {"file", "terminal"}     # base always present
+    assert "web" in resolved                          # earned by content
+    assert "memory" not in resolved                   # no signal → withheld
+    assert "delegation" not in resolved
+
+
+def test_resolve_narrow_mode_minimal_task_is_base_only(monkeypatch, tmp_path):
+    _root, profile = _narrow_profile(tmp_path)
+
+    from hermes_cli import kanban_db as kb
+
+    task = _make_task(kb, assignee="elias", title="do the thing", body="just do it")
+    resolved = kb._resolve_worker_cli_toolsets(str(profile), task, "ra")
+
+    assert sorted(resolved) == ["file", "terminal"]
+
+
+def test_resolve_narrow_mode_bypasses_acp_executor(monkeypatch, tmp_path):
+    """claude-code/codex don't consume --toolsets → full ceiling, no narrowing."""
+    _root, profile = _narrow_profile(tmp_path)
+
+    from hermes_cli import kanban_db as kb
+
+    task = _make_task(
+        kb, assignee="elias", title="do the thing", executor="claude-code")
+    resolved = kb._resolve_worker_cli_toolsets(str(profile), task, "ra")
+
+    # unchanged full ceiling — memory/delegation survive despite no keyword hit
+    assert {"memory", "delegation", "web"} <= set(resolved)
+
+
+def test_resolve_mode_off_matches_legacy_full_ceiling(monkeypatch, tmp_path):
+    """Default ``mode: off`` returns the full profile ceiling (today's behaviour)."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - file\n    - terminal\n    - web\n    - memory\n"
+        "toolsets:\n  - hermes-cli\n",
+        encoding="utf-8",
+    )
+
+    from hermes_cli import kanban_db as kb
+
+    task = _make_task(kb, assignee="elias", title="do the thing")
+    with_task = kb._resolve_worker_cli_toolsets(str(profile), task, "ra")
+    legacy = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert with_task == legacy
+    assert {"memory", "web"} <= set(with_task)
