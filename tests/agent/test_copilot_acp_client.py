@@ -599,3 +599,184 @@ def test_unsupported_effort_is_not_sent(tmp_path, monkeypatch):
 
     assert not rec.exists() or not rec.read_text().strip()
     assert client.last_effort == "medium"
+
+
+# ── tool_call / tool_call_update capture (t_30173a8b) ─────────────────
+# The ACP client must not drop tool_call/tool_call_update session updates:
+# it aggregates them per run (max ACP fields) and streams each to an optional
+# live sink so subagent/tool spawns show as a live feed on the task card.
+
+def test_normalize_tool_call_maps_wire_fields_and_is_partial():
+    from agent.copilot_acp_client import _normalize_tool_call
+
+    full = _normalize_tool_call({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "tc1",
+        "title": "Task(spawn reviewer)",
+        "kind": "other",
+        "status": "pending",
+        "content": [{"type": "content", "content": {"type": "text", "text": "hi"}}],
+        "locations": [{"path": "/repo/a.py", "line": 3}, {"missing": "path"}],
+        "rawInput": {"description": "review", "prompt": "do it"},
+        "rawOutput": {"ok": True},
+    })
+    assert full["tool_call_id"] == "tc1"
+    assert full["title"] == "Task(spawn reviewer)"
+    assert full["kind"] == "other"
+    assert full["status"] == "pending"
+    assert full["content"] == [{"type": "content", "content": {"type": "text", "text": "hi"}}]
+    # Malformed location (no path) dropped; the valid one keeps its line.
+    assert full["locations"] == [{"path": "/repo/a.py", "line": 3}]
+    assert full["raw_input"]["description"] == "review"
+    assert full["raw_output"] == {"ok": True}
+
+    # A partial tool_call_update returns ONLY the keys it carries, so merging it
+    # onto an existing entry can't clobber earlier title/kind/input with None.
+    partial = _normalize_tool_call({"toolCallId": "tc1", "status": "completed"})
+    assert partial == {"tool_call_id": "tc1", "status": "completed"}
+
+
+def test_tool_call_capture_aggregates_per_run_and_emits_to_sink(tmp_path):
+    events: list[dict] = []
+    client = CopilotACPClient(acp_cwd=str(tmp_path), tool_activity_sink=events.append)
+
+    def _dispatch(update: dict) -> None:
+        handled = client._handle_server_message(
+            {"jsonrpc": "2.0", "method": "session/update", "params": {"update": update}},
+            process=_FakeProcess(), cwd=str(tmp_path),
+            text_parts=[], reasoning_parts=[],
+        )
+        assert handled
+
+    _dispatch({"sessionUpdate": "tool_call", "toolCallId": "tc1",
+               "title": "Task(x)", "kind": "other", "status": "pending",
+               "rawInput": {"description": "spawn reviewer"}})
+    _dispatch({"sessionUpdate": "tool_call_update", "toolCallId": "tc1",
+               "status": "in_progress"})
+    _dispatch({"sessionUpdate": "tool_call_update", "toolCallId": "tc1",
+               "status": "completed", "rawOutput": {"done": True}})
+
+    # Aggregated per run: one entry whose merged view keeps the start's
+    # title/input while adopting the final status/output.
+    assert list(client.last_tool_calls) == ["tc1"]
+    entry = client.last_tool_calls["tc1"]
+    assert entry["title"] == "Task(x)"
+    assert entry["kind"] == "other"
+    assert entry["status"] == "completed"
+    assert entry["raw_input"]["description"] == "spawn reviewer"
+    assert entry["raw_output"] == {"done": True}
+
+    # Sink fired on every capture, flagged first-sighting and status changes.
+    assert [e["is_new"] for e in events] == [True, False, False]
+    assert [e["status_changed"] for e in events] == [True, True, True]
+    assert events[0]["previous_status"] is None
+    assert events[0]["update_kind"] == "tool_call"
+    assert events[-1]["status"] == "completed"
+
+
+def test_tool_call_update_only_status_change_is_flagged(tmp_path):
+    """A content-only update (no status change) must report status_changed False
+    so a live sink can skip it and keep the feed to running->done."""
+    events: list[dict] = []
+    client = CopilotACPClient(acp_cwd=str(tmp_path), tool_activity_sink=events.append)
+
+    def _dispatch(update: dict) -> None:
+        client._handle_server_message(
+            {"jsonrpc": "2.0", "method": "session/update", "params": {"update": update}},
+            process=_FakeProcess(), cwd=str(tmp_path),
+            text_parts=[], reasoning_parts=[],
+        )
+
+    _dispatch({"sessionUpdate": "tool_call", "toolCallId": "tc1", "title": "read",
+               "status": "in_progress"})
+    _dispatch({"sessionUpdate": "tool_call_update", "toolCallId": "tc1",
+               "content": [{"type": "content", "content": {"type": "text", "text": "chunk"}}]})
+
+    assert events[0]["is_new"] is True and events[0]["status_changed"] is True
+    assert events[1]["is_new"] is False and events[1]["status_changed"] is False
+
+
+def test_sink_exception_never_breaks_capture(tmp_path):
+    def _boom(_event):
+        raise RuntimeError("sink down")
+
+    client = CopilotACPClient(acp_cwd=str(tmp_path), tool_activity_sink=_boom)
+    client._handle_server_message(
+        {"jsonrpc": "2.0", "method": "session/update",
+         "params": {"update": {"sessionUpdate": "tool_call", "toolCallId": "tc1",
+                               "title": "t", "status": "pending"}}},
+        process=_FakeProcess(), cwd=str(tmp_path),
+        text_parts=[], reasoning_parts=[],
+    )
+    # Capture still happened despite the sink blowing up.
+    assert client.last_tool_calls["tc1"]["title"] == "t"
+
+
+_FAKE_ACP_SERVER_TOOLS = r'''
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "sess-1"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess-1", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "tc1",
+                "title": "Task(reviewer)", "kind": "other", "status": "pending",
+                "rawInput": {"subagent_type": "reviewer", "prompt": "review it"}}}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess-1", "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "tc1",
+                "status": "completed", "rawOutput": {"summary": "looks good"}}}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess-1", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "ok"}}}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+'''
+
+
+def test_run_prompt_captures_tool_calls_end_to_end(tmp_path):
+    server = tmp_path / "fake_acp_tools.py"
+    server.write_text(_FAKE_ACP_SERVER_TOOLS)
+    sink_events: list[dict] = []
+    client = CopilotACPClient(
+        acp_command=_sys.executable, acp_args=[str(server)],
+        acp_cwd=str(tmp_path), tool_activity_sink=sink_events.append,
+    )
+    text, _ = client._run_prompt("do it", timeout_seconds=15)
+
+    assert "ok" in text
+    assert list(client.last_tool_calls) == ["tc1"]
+    entry = client.last_tool_calls["tc1"]
+    assert entry["title"] == "Task(reviewer)"
+    assert entry["status"] == "completed"
+    assert entry["raw_input"]["subagent_type"] == "reviewer"
+    assert entry["raw_output"]["summary"] == "looks good"
+    # The live sink saw the spawn and the completion.
+    assert sink_events[0]["is_new"] is True
+    assert sink_events[-1]["status"] == "completed"
+
+
+def test_tool_calls_reset_between_runs(tmp_path):
+    server = tmp_path / "fake_acp_tools.py"
+    server.write_text(_FAKE_ACP_SERVER_TOOLS)
+    client = CopilotACPClient(
+        acp_command=_sys.executable, acp_args=[str(server)], acp_cwd=str(tmp_path),
+    )
+    client._run_prompt("first", timeout_seconds=15)
+    assert list(client.last_tool_calls) == ["tc1"]
+    client._run_prompt("second", timeout_seconds=15)
+    # Per-run aggregate, not cumulative across runs.
+    assert list(client.last_tool_calls) == ["tc1"]

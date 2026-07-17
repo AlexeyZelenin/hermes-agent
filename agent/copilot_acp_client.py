@@ -430,6 +430,54 @@ def _canonical_turn_usage(turn_usage: Any, last_update: Any) -> dict[str, int] |
     return None
 
 
+def _tool_call_locations(update: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract the ``locations`` collection of an ACP tool_call update.
+
+    Each entry is ``{path, line?}`` per ``ToolCallLocation``; malformed rows
+    (no ``path``) are dropped. ``line`` is kept only when it is an int."""
+    out: list[dict[str, Any]] = []
+    for loc in update.get("locations") or []:
+        if not isinstance(loc, dict):
+            continue
+        path = loc.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        entry: dict[str, Any] = {"path": path}
+        line = loc.get("line")
+        if isinstance(line, int):
+            entry["line"] = line
+        out.append(entry)
+    return out
+
+
+def _normalize_tool_call(update: dict[str, Any]) -> dict[str, Any]:
+    """Project an ACP ``tool_call``/``tool_call_update`` session update onto the
+    fields Hermes surfaces (ACP RFD "Tool Calls").
+
+    Wire shape (camelCase) → Hermes keys: ``toolCallId``→``tool_call_id``,
+    ``rawInput``→``raw_input``, ``rawOutput``→``raw_output``; ``title``/``kind``/
+    ``status``/``content``/``locations`` pass through. Only keys PRESENT in
+    ``update`` are returned, so a partial ``tool_call_update`` (which per spec
+    replaces only the fields it carries) merges without clobbering earlier
+    values with ``None``."""
+    fields: dict[str, Any] = {}
+    tcid = update.get("toolCallId")
+    if isinstance(tcid, str) and tcid.strip():
+        fields["tool_call_id"] = tcid.strip()
+    for wire_key, out_key in (("title", "title"), ("kind", "kind"), ("status", "status")):
+        if update.get(wire_key) is not None:
+            fields[out_key] = update[wire_key]
+    if "content" in update:
+        fields["content"] = update.get("content")
+    if "locations" in update:
+        fields["locations"] = _tool_call_locations(update)
+    if "rawInput" in update:
+        fields["raw_input"] = update.get("rawInput")
+    if "rawOutput" in update:
+        fields["raw_output"] = update.get("rawOutput")
+    return fields
+
+
 def _model_from_session(session: dict[str, Any]) -> str:
     models = session.get("models")
     if isinstance(models, dict):
@@ -580,6 +628,7 @@ class CopilotACPClient:
         session_model: str | None = None,
         session_effort: str | None = None,
         extra_env: dict[str, str] | None = None,
+        tool_activity_sink: Callable[[dict[str, Any]], None] | None = None,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
@@ -601,6 +650,12 @@ class CopilotACPClient:
         # Per-session env overrides for the ACP subprocess — e.g. the Kanban
         # executor pins CLAUDE_CONFIG_DIR to the leased subscription's dir.
         self._extra_env = dict(extra_env or {})
+        # Optional live sink for tool_call/tool_call_update activity. Invoked
+        # from the stdout-reader loop each time a tool call is first seen or
+        # merged, so a caller can stream subagent/tool spawns to a live UI
+        # mid-run. Best-effort: a sink exception is swallowed (never breaks
+        # the transport). None keeps the pure chat-completion path unchanged.
+        self._tool_activity_sink = tool_activity_sink
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -614,6 +669,11 @@ class CopilotACPClient:
         self.last_turn_usage: dict[str, int] | None = None
         self.last_context: dict[str, Any] | None = None
         self._last_usage_update: dict[str, Any] | None = None
+        # Tool calls aggregated per run, keyed by ACP toolCallId in first-seen
+        # order. Each value is the merged view of the initial ``tool_call`` and
+        # every subsequent ``tool_call_update`` (max ACP fields: title, kind,
+        # status, content, locations, raw_input, raw_output). Reset per run.
+        self.last_tool_calls: dict[str, dict[str, Any]] = {}
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -742,6 +802,7 @@ class CopilotACPClient:
         self.last_turn_usage = None
         self.last_context = None
         self._last_usage_update = None
+        self.last_tool_calls = {}
         # Streamed agent output captured live, so a mid-turn crash (usage
         # limit / auth death) can still salvage the partial work instead of
         # discarding it when the turn raises. See _run_claude_code_session.
@@ -966,6 +1027,46 @@ class CopilotACPClient:
             self.last_partial_text = "".join(self._live_text_parts)
             self.close()
 
+    def _capture_tool_call(self, update_kind: str, update: dict[str, Any]) -> None:
+        """Merge one ACP tool_call/tool_call_update into the per-run aggregate.
+
+        The initial ``tool_call`` creates the entry; each ``tool_call_update``
+        overlays the fields it carries onto it (partial merge, so a status-only
+        update keeps the earlier title/kind/input). When a sink is configured it
+        is notified on every capture with the merged entry plus first-seen /
+        status-transition flags so a live UI can render a clean
+        spawn -> running -> done line per tool. Sink failures are swallowed."""
+        fields = _normalize_tool_call(update)
+        tcid = fields.get("tool_call_id")
+        if not tcid:
+            return
+        existing = self.last_tool_calls.get(tcid)
+        is_new = existing is None
+        prev_status = existing.get("status") if existing else None
+        entry = dict(existing or {})
+        entry.update(fields)
+        entry["tool_call_id"] = tcid
+        self.last_tool_calls[tcid] = entry
+
+        if self._tool_activity_sink is None:
+            return
+        event = {
+            "update_kind": update_kind,
+            "is_new": is_new,
+            "status_changed": entry.get("status") != prev_status,
+            "previous_status": prev_status,
+            "tool_call_id": tcid,
+            "title": entry.get("title"),
+            "kind": entry.get("kind"),
+            "status": entry.get("status"),
+            "locations": entry.get("locations"),
+            "raw_input": entry.get("raw_input"),
+        }
+        try:
+            self._tool_activity_sink(event)
+        except Exception:
+            logger.debug("ACP tool_activity_sink raised; ignoring", exc_info=True)
+
     def _handle_server_message(
         self,
         msg: dict[str, Any],
@@ -985,6 +1086,9 @@ class CopilotACPClient:
             kind = str(update.get("sessionUpdate") or "").strip()
             if kind == "usage_update":
                 self._last_usage_update = dict(update)
+                return True
+            if kind in ("tool_call", "tool_call_update"):
+                self._capture_tool_call(kind, update)
                 return True
             content = update.get("content") or {}
             chunk_text = ""

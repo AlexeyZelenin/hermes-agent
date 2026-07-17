@@ -3344,6 +3344,27 @@ def _append_event(
     )
 
 
+def append_task_event(
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+    board: Optional[str] = None,
+) -> None:
+    """Append one live event row from an out-of-process worker.
+
+    Opens and closes its own connection so callers outside the dashboard/CLI
+    (e.g. the ACP task executor mirroring tool-call activity onto the card's
+    live feed) can push a ``task_events`` row without threading a connection
+    through. The row is tailed by the dashboard ``/events`` WebSocket, so the
+    card updates within the poll interval.
+    """
+    with connect_closing(board=board) as conn:
+        with write_txn(conn):
+            _append_event(conn, task_id, kind, payload, run_id=run_id)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,

@@ -83,10 +83,74 @@ def _report_usage(client, executor, task_id, subscription=None):
                     cost_usd=context.get("cost_usd"))
     except Exception:
         pass
-def _new_client(command, args, workspace, model, extra_env=None, effort=None):
+def _new_client(command, args, workspace, model, extra_env=None, effort=None,
+                tool_activity_sink=None):
     return CopilotACPClient(acp_command=command, acp_args=args, acp_cwd=workspace,
                             allow_permissions=True, session_model=model,
-                            session_effort=effort, extra_env=extra_env)
+                            session_effort=effort, extra_env=extra_env,
+                            tool_activity_sink=tool_activity_sink)
+def _tool_feed_enabled():
+    """Live tool-call feed is on unless explicitly disabled. It only writes on a
+    tool's first sighting and status transitions, so volume is bounded; the flag
+    exists so a noisy board can opt out without a code change."""
+    return os.getenv("HERMES_ACP_TOOL_FEED", "1").strip().lower() not in ("0", "false", "no", "off")
+def _tool_input_preview(raw_input, limit=200):
+    """One-line, length-capped preview of a tool call's raw input for the feed.
+    Prefers the human-meaningful field (a subagent spawn's description/prompt, a
+    command, a path) and falls back to compact JSON."""
+    if raw_input is None:
+        return ""
+    text = ""
+    if isinstance(raw_input, dict):
+        for key in ("description", "prompt", "command", "query", "pattern", "path", "url"):
+            val = raw_input.get(key)
+            if isinstance(val, str) and val.strip():
+                text = val.strip()
+                break
+        else:
+            try:
+                text = json.dumps(raw_input, ensure_ascii=False)
+            except (TypeError, ValueError):
+                text = str(raw_input)
+    else:
+        text = str(raw_input)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[:max(limit - 3, 0)].rstrip() + "..."
+    return text
+def _tool_event_payload(event):
+    """Compact task_events payload for one tool-call transition. Keeps only the
+    live-feed essentials (id, status, title, kind, touched paths, input hint) -
+    full per-tool history stays in OTel, so this stays small on the wire."""
+    payload = {"tool_call_id": event.get("tool_call_id"),
+               "status": event.get("status") or "pending"}
+    for key in ("title", "kind"):
+        if event.get(key):
+            payload[key] = event[key]
+    paths = [l.get("path") for l in (event.get("locations") or [])
+             if isinstance(l, dict) and l.get("path")]
+    if paths:
+        payload["locations"] = paths[:5]
+    preview = _tool_input_preview(event.get("raw_input"))
+    if preview:
+        payload["input"] = preview
+    return payload
+def _make_tool_activity_sink(task_id, board, run_id):
+    """Return a CopilotACPClient tool_activity_sink that mirrors ACP tool calls
+    onto the task's live event feed. Fires only on a tool's first sighting and
+    each status transition (running -> completed/failed), so the card shows a
+    clean 'spawn -> running -> done' line per tool rather than every streamed
+    content chunk. Best-effort: a DB failure never disturbs the ACP session."""
+    from hermes_cli import kanban_db as kb
+    def _sink(event):
+        if not event.get("is_new") and not event.get("status_changed"):
+            return
+        try:
+            kb.append_task_event(task_id, "tool_call", _tool_event_payload(event),
+                                 run_id=run_id, board=board)
+        except Exception:
+            pass
+    return _sink
 def _salvage_partial_output(task_id, board, client):
     """Persist a limit/auth-interrupted session's partial output as a task
     comment so the next attempt resumes with context instead of blind.
@@ -108,7 +172,7 @@ def _salvage_partial_output(task_id, board, client):
                            body="partial handoff (limit-interrupted)\n\n" + partial)
     except Exception:
         pass
-def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None):
+def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None, tool_activity_sink=None):
     """Run the prompt on the Claude subscription pool, rotating on usage limits.
 
     Each session gets CLAUDE_CONFIG_DIR pinned to a leased subscription dir
@@ -120,7 +184,8 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
     """
     from agent import claude_subscriptions as subs
     if subs.pool_size() == 0:
-        client = _new_client(command, args, workspace, model, effort=effort)
+        client = _new_client(command, args, workspace, model, effort=effort,
+                             tool_activity_sink=tool_activity_sink)
         text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
         return text, client, None
     while True:
@@ -130,7 +195,7 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
         try:
             client = _new_client(command, args, workspace, model,
                                  extra_env={"CLAUDE_CONFIG_DIR": lease.config_dir},
-                                 effort=effort)
+                                 effort=effort, tool_activity_sink=tool_activity_sink)
             text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
             if not subs.is_usage_limit_error(text) and not subs.is_auth_error(text):
                 return text, client, lease.name
@@ -156,10 +221,11 @@ def run_task(*, executor, task_id, workspace, board=None):
         effort=os.getenv("HERMES_KANBAN_EFFORT","").strip() or None
         subscription=None
         follow_up=(lambda: _drain_steer(task_id, board)) if _steering_enabled() else None
+        tool_sink=_make_tool_activity_sink(task_id, board, run_id) if _tool_feed_enabled() else None
         if executor == "claude-code":
-            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort)
+            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort,tool_sink)
         else:
-            client=_new_client(command,args,workspace,model,effort=effort)
+            client=_new_client(command,args,workspace,model,effort=effort,tool_activity_sink=tool_sink)
             text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
         _report_usage(client,executor,task_id,subscription)
     except Exception as exc:

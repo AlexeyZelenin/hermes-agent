@@ -430,3 +430,73 @@ def test_steering_toggle_env(monkeypatch):
     assert executor._steering_enabled() is False
     monkeypatch.setenv("HERMES_ACP_STEERING", "off")
     assert executor._steering_enabled() is False
+
+
+# ── live tool-call feed (t_30173a8b) ─────────────────────────────────
+
+def test_tool_input_preview_prefers_meaningful_field_and_caps_length():
+    from agent import acp_task_executor as executor
+
+    assert executor._tool_input_preview({"description": "spawn a reviewer", "prompt": "x"}) == "spawn a reviewer"
+    assert executor._tool_input_preview({"command": "pytest -q"}) == "pytest -q"
+    # No known key -> compact JSON fallback.
+    assert executor._tool_input_preview({"foo": "bar"}) == '{"foo": "bar"}'
+    assert executor._tool_input_preview(None) == ""
+    capped = executor._tool_input_preview({"prompt": "x" * 500}, limit=50)
+    assert len(capped) <= 50 and capped.endswith("...")
+
+
+def test_tool_event_payload_is_compact():
+    from agent import acp_task_executor as executor
+
+    payload = executor._tool_event_payload({
+        "tool_call_id": "tc1", "status": "in_progress",
+        "title": "Task(x)", "kind": "other",
+        "locations": [{"path": "/a"}, {"path": "/b"}, {"nope": 1}],
+        "raw_input": {"description": "spawn reviewer"},
+    })
+    assert payload == {
+        "tool_call_id": "tc1", "status": "in_progress", "title": "Task(x)",
+        "kind": "other", "locations": ["/a", "/b"], "input": "spawn reviewer",
+    }
+
+
+def test_tool_activity_sink_writes_live_events_only_on_transitions(monkeypatch, kanban_conn, tmp_path):
+    """The sink mirrors a tool call onto task_events on first sighting and each
+    status change, skipping content-only churn, so the card feed reads
+    spawn -> running -> done."""
+    from agent import acp_task_executor as executor
+    import json as _json
+
+    task_id = kb.create_task(kanban_conn, title="external", assignee="external")
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    sink = executor._make_tool_activity_sink(task_id, None, run_id=7)
+    sink({"is_new": True, "status_changed": True, "tool_call_id": "tc1",
+          "status": "pending", "title": "Task(x)", "kind": "other",
+          "raw_input": {"description": "spawn reviewer"}})
+    # Content-only update (no status change) is noise -> not written.
+    sink({"is_new": False, "status_changed": False, "tool_call_id": "tc1", "status": "pending"})
+    sink({"is_new": False, "status_changed": True, "tool_call_id": "tc1", "status": "completed"})
+
+    rows = kanban_conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id=? AND kind='tool_call' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    assert len(rows) == 2
+    first = _json.loads(rows[0]["payload"])
+    assert first["status"] == "pending" and first["title"] == "Task(x)"
+    assert first["input"] == "spawn reviewer"
+    assert rows[0]["run_id"] == 7
+    assert _json.loads(rows[1]["payload"])["status"] == "completed"
+
+
+def test_tool_feed_toggle_env(monkeypatch):
+    from agent import acp_task_executor as executor
+
+    monkeypatch.delenv("HERMES_ACP_TOOL_FEED", raising=False)
+    assert executor._tool_feed_enabled() is True
+    monkeypatch.setenv("HERMES_ACP_TOOL_FEED", "0")
+    assert executor._tool_feed_enabled() is False
+    monkeypatch.setenv("HERMES_ACP_TOOL_FEED", "off")
+    assert executor._tool_feed_enabled() is False
