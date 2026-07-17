@@ -20,7 +20,7 @@ def run_task(*, executor, task_id, workspace, board=None):
     prompt=("You are the sole native external coding-harness session for this already-scoped task. Work only in the supplied cwd; do not orchestrate child tasks. Follow project rules and return a concise factual handoff with tests run.\n\n"+context)
     try:
         timeout=float(os.getenv("HERMES_ACP_TIMEOUT_SECONDS", "3600"))
-        text,_=CopilotACPClient(acp_command=command,acp_args=args,acp_cwd=workspace)._run_prompt(prompt,timeout_seconds=timeout)
+        text,_=CopilotACPClient(acp_command=command,acp_args=args,acp_cwd=workspace,allow_permissions=True)._run_prompt(prompt,timeout_seconds=timeout)
     except Exception as exc:
         with kb.connect_closing(board=board) as conn: kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)
         raise

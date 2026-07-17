@@ -134,6 +134,26 @@ def _permission_denied(message_id: Any) -> dict[str, Any]:
     }
 
 
+def _permission_allowed(message_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Pick the most permissive allow option the agent offered."""
+    options = (params or {}).get("options") or []
+    choice = None
+    for kind in ("allow_always", "allow_once"):
+        for option in options:
+            if option.get("kind") == kind:
+                choice = option.get("optionId")
+                break
+        if choice:
+            break
+    if choice is None:
+        return _permission_denied(message_id)
+    return {
+        "jsonrpc": "2.0",
+        "id": message_id,
+        "result": {"outcome": {"outcome": "selected", "optionId": choice}},
+    }
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -407,6 +427,7 @@ class CopilotACPClient:
         acp_cwd: str | None = None,
         command: str | None = None,
         args: list[str] | None = None,
+        allow_permissions: bool = False,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
@@ -415,6 +436,9 @@ class CopilotACPClient:
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        # Headless task-executor sessions have no human to answer
+        # session/request_permission; interactive chat keeps the deny default.
+        self._allow_permissions = bool(allow_permissions)
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -695,7 +719,10 @@ class CopilotACPClient:
         params = msg.get("params") or {}
 
         if method == "session/request_permission":
-            response = _permission_denied(message_id)
+            if self._allow_permissions:
+                response = _permission_allowed(message_id, params)
+            else:
+                response = _permission_denied(message_id)
         elif method == "fs/read_text_file":
             try:
                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
