@@ -278,12 +278,18 @@ class TestIsUsageLimitError:
     def test_negative(self, text):
         assert subs.is_usage_limit_error(text) is False
 
-    def test_long_message_is_not_a_limit_death(self):
-        # A real limit-death payload is short; a long handoff can legitimately
-        # mention limits without being one.
-        text = "hit your usage limit " + "x" * subs._LIMIT_TEXT_MAX_CHARS
-        assert len(text.strip()) > subs._LIMIT_TEXT_MAX_CHARS
-        assert subs.is_usage_limit_error(text) is False
+    def test_verbose_exception_is_still_a_limit_death(self):
+        # These matchers now run only on error text (exception message / adapter
+        # stderr), never a handoff, so there is no length cap: a genuine limit
+        # can arrive as a multi-line exception and must still be detected (the
+        # old 600-char gate parked such tasks as capability failures).
+        text = (
+            "Copilot ACP session/prompt failed: the upstream provider returned "
+            + "an error. " * 80
+            + "You've hit your usage limit; try again later."
+        )
+        assert len(text) > 600
+        assert subs.is_usage_limit_error(text) is True
 
 
 class TestIsAuthError:
@@ -303,9 +309,13 @@ class TestIsAuthError:
     def test_negative(self, text):
         assert subs.is_auth_error(text) is False
 
-    def test_long_message_is_not_an_auth_death(self):
-        text = "authentication required " + "y" * subs._LIMIT_TEXT_MAX_CHARS
-        assert subs.is_auth_error(text) is False
+    def test_verbose_exception_is_still_an_auth_death(self):
+        text = (
+            "Copilot ACP session/prompt failed: " + "diagnostic detail. " * 80
+            + "Authentication required - please run /login."
+        )
+        assert len(text) > 600
+        assert subs.is_auth_error(text) is True
 
 
 def _insert_sub(conn, name, config_dir, *, enabled=1, max_concurrency=4,

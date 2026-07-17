@@ -780,3 +780,43 @@ def test_tool_calls_reset_between_runs(tmp_path):
     client._run_prompt("second", timeout_seconds=15)
     # Per-run aggregate, not cumulative across runs.
     assert list(client.last_tool_calls) == ["tc1"]
+
+
+def test_typed_acp_error_classifies_structured_status_first():
+    """A structured HTTP-ish status is the primary signal - it wins even when
+    the free-text message has no limit/auth phrase at all."""
+    from agent.copilot_acp_client import (
+        ACPAuthError, ACPUsageLimitError, ACPSessionError, _typed_acp_error,
+    )
+
+    assert isinstance(
+        _typed_acp_error("upstream failed", data={"status": 429}),
+        ACPUsageLimitError,
+    )
+    for status in (401, 403):
+        assert isinstance(
+            _typed_acp_error("opaque", data={"statusCode": status}),
+            ACPAuthError,
+        )
+    # No status, no phrase -> generic session error (still a RuntimeError).
+    generic = _typed_acp_error("something unexpected happened")
+    assert isinstance(generic, ACPSessionError)
+    assert not isinstance(generic, (ACPAuthError, ACPUsageLimitError))
+    assert isinstance(generic, RuntimeError)
+
+
+def test_acp_error_from_jsonrpc_falls_back_to_substring_and_folds_data():
+    """With no structured status, the substring fallback still classifies, and
+    the message folds in data/code so nothing structural is lost."""
+    from agent.copilot_acp_client import ACPUsageLimitError, _acp_error_from_jsonrpc
+
+    err = {
+        "code": -32000,
+        "message": "request failed",
+        "data": {"detail": "You've hit your usage limit for now"},
+    }
+    typed = _acp_error_from_jsonrpc("session/prompt", err)
+    assert isinstance(typed, ACPUsageLimitError)
+    assert typed.code == -32000
+    assert "usage limit" in str(typed)
+    assert "code -32000" in str(typed)

@@ -311,18 +311,18 @@ _LIMIT_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Successful handoffs can legitimately mention limits; a real limit-death
-# message is short. Only classify compact payloads as limit errors.
-_LIMIT_TEXT_MAX_CHARS = 600
-
-
+# These matchers are the LAST-RESORT fallback, applied only to error text - an
+# ACP request failure's exception message or the adapter's stderr - after the
+# structural typed-error signal (ACPUsageLimitError / ACPAuthError raised by the
+# ACP client) has already been checked. They are never run against a task's
+# returned handoff, so there is deliberately no length cap: a genuine limit/auth
+# death can surface as a verbose multi-line exception, and the old 600-char gate
+# made those go undetected and parked the task as a capability failure even
+# though the pool had free capacity.
 def is_usage_limit_error(text: Optional[str]) -> bool:
     if not text:
         return False
-    stripped = text.strip()
-    if len(stripped) > _LIMIT_TEXT_MAX_CHARS:
-        return False
-    return bool(_LIMIT_PATTERNS.search(stripped))
+    return bool(_LIMIT_PATTERNS.search(text))
 
 
 _AUTH_PATTERNS = re.compile(
@@ -339,14 +339,12 @@ def is_auth_error(text: Optional[str]) -> bool:
     """A session death caused by a logged-out or revoked subscription pocket.
 
     Treated like a limit event by the executor: the pocket cools down and the
-    task rotates to the next subscription instead of blocking.
+    task rotates to the next subscription instead of blocking. Error text only
+    (see :func:`is_usage_limit_error`); no length cap.
     """
     if not text:
         return False
-    stripped = text.strip()
-    if len(stripped) > _LIMIT_TEXT_MAX_CHARS:
-        return False
-    return bool(_AUTH_PATTERNS.search(stripped))
+    return bool(_AUTH_PATTERNS.search(text))
 
 
 def _parse_clock_reset(message: str, now: float) -> Optional[float]:

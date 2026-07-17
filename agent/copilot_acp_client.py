@@ -114,6 +114,83 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+class ACPSessionError(RuntimeError):
+    """An ACP session request failed. Carries the structured JSON-RPC error
+    fields (code/data) so callers classify the failure by type instead of
+    scraping free text. Subclasses mark the two failures the subscription pool
+    handles by rotating rather than blocking."""
+
+    def __init__(self, message: str, *, code: Any = None, data: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
+
+class ACPUsageLimitError(ACPSessionError):
+    """Session aborted by a provider usage/rate limit - a structural signal the
+    pool treats as 'cool this pocket and rotate', not a task failure."""
+
+
+class ACPAuthError(ACPSessionError):
+    """Session aborted by an auth failure (logged-out or revoked pocket)."""
+
+
+def _acp_error_status(data: Any) -> int | None:
+    """Best-effort HTTP-ish status code from a JSON-RPC error's ``data``.
+
+    The ACP adapter surfaces upstream failures as structured data; a 401/403
+    means auth, a 429 means usage limit. This is the structural signal we trust
+    before falling back to matching the free-text message."""
+    if isinstance(data, dict):
+        for key in ("status", "statusCode", "httpStatus", "code"):
+            val = data.get(key)
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, int):
+                return val
+            if isinstance(val, str) and val.strip().isdigit():
+                return int(val.strip())
+    return None
+
+
+def _typed_acp_error(
+    message: str, *, code: Any = None, data: Any = None
+) -> ACPSessionError:
+    """Classify an ACP failure into a typed error: structured status first,
+    free-text substring only as the last-resort fallback."""
+    status = _acp_error_status(data)
+    if status in (401, 403):
+        return ACPAuthError(message, code=code, data=data)
+    if status == 429:
+        return ACPUsageLimitError(message, code=code, data=data)
+    try:  # pragma: no cover - import guard; module is always importable here
+        from agent import claude_subscriptions as subs
+        if subs.is_auth_error(message):
+            return ACPAuthError(message, code=code, data=data)
+        if subs.is_usage_limit_error(message):
+            return ACPUsageLimitError(message, code=code, data=data)
+    except Exception:
+        pass
+    return ACPSessionError(message, code=code, data=data)
+
+
+def _acp_error_from_jsonrpc(method: str, err: dict[str, Any]) -> ACPSessionError:
+    """Build a typed error from a JSON-RPC error object. The message folds in
+    the structured ``data``/``code`` so the substring fallback (and any surfaced
+    handoff) sees the full failure, not just the top-line ``message``."""
+    parts = [f"Copilot ACP {method} failed: {err.get('message') or err}"]
+    data = err.get("data")
+    if data not in (None, "", {}, []):
+        try:
+            parts.append(json.dumps(data, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            parts.append(str(data))
+    code = err.get("code")
+    if code is not None:
+        parts.append(f"(code {code})")
+    return _typed_acp_error(" ".join(parts), code=code, data=data)
+
+
 def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -871,9 +948,7 @@ class CopilotACPClient:
                     continue
                 if "error" in msg:
                     err = msg.get("error") or {}
-                    raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
-                    )
+                    raise _acp_error_from_jsonrpc(method, err)
                 return msg.get("result")
 
             stderr_text = "\n".join(stderr_tail).strip()
@@ -893,7 +968,9 @@ class CopilotACPClient:
                         "directly with a Copilot subscription token) via `hermes setup`.\n\n"
                         f"Original error:\n{stderr_text}"
                     )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
+                raise _typed_acp_error(
+                    f"Copilot ACP process exited early: {stderr_text}"
+                )
             raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
 
         try:

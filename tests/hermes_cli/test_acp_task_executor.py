@@ -366,6 +366,140 @@ def test_no_salvage_comment_when_no_partial_output(monkeypatch, kanban_conn, tmp
     assert [c for c in comments if "partial handoff" in c.body] == []
 
 
+def test_successful_handoff_mentioning_limits_is_not_a_death(monkeypatch, kanban_conn, tmp_path):
+    """A completed session whose handoff merely *mentions* a usage limit must
+    NOT be misread as a limit-death: no cooldown, no rotation, no restart loop -
+    the committed work is kept and the task finishes with that summary (bug #3)."""
+    from agent import acp_task_executor as executor
+    from agent import claude_subscriptions as subs
+
+    task_id = kb.create_task(kanban_conn, title="Report task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    # A single-pocket pool: a spurious rotation would exhaust the iterator and
+    # raise StopIteration, so "task completes" also proves "did not rotate".
+    monkeypatch.setattr(subs, "pool_size", lambda: 1)
+    leases = iter([_FakeLease("p1")])
+    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "release", lambda lease: None)
+    marked: list = []
+    monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: marked.append(name))
+
+    handoff = ("Added 429 handling; the API returns 'usage limit reached' and "
+               "'limit will reset' banners which are now parsed. Tests pass.")
+
+    class FakeClient:
+        last_model = "claude-opus-4-8"
+        last_turn_usage = None
+
+        def __init__(self, **kwargs):
+            self.last_partial_text = ""
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            return handoff, ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    result = executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+    )
+    assert result == handoff
+    assert marked == [], "a successful handoff mentioning limits must not cool the pocket"
+    assert kb.get_task(kanban_conn, task_id).status == "done"
+
+
+def test_verbose_limit_exception_rotates_not_parks(monkeypatch, kanban_conn, tmp_path):
+    """A limit that arrives as a >600-char exception must still rotate to the
+    next pocket (uncapped substring fallback) instead of parking the task as a
+    capability failure while the pool is free (bug #4)."""
+    from agent import acp_task_executor as executor
+    from agent import claude_subscriptions as subs
+
+    task_id = kb.create_task(kanban_conn, title="Verbose limit", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+    monkeypatch.setattr(subs, "pool_size", lambda: 2)
+    leases = iter([_FakeLease("p1"), _FakeLease("p2")])
+    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "release", lambda lease: None)
+    marked: list = []
+    monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: marked.append(name))
+
+    attempts = {"n": 0}
+
+    class FakeClient:
+        last_model = "claude-opus-4-8"
+        last_turn_usage = None
+
+        def __init__(self, **kwargs):
+            self.last_partial_text = ""
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError(
+                    "Copilot ACP session/prompt failed: " + "context. " * 90
+                    + "You've hit your session limit; resets later."
+                )
+            return "Finished.", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    result = executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+    )
+    assert result == "Finished."
+    assert marked == ["p1"], "the verbose limit exception must cool p1 and rotate"
+    assert kb.get_task(kanban_conn, task_id).status == "done"
+
+
+def test_typed_limit_error_rotates_without_substring(monkeypatch, kanban_conn, tmp_path):
+    """The structural signal: a typed ACPUsageLimitError rotates the pool even
+    when its message carries no recognizable limit phrase at all."""
+    from agent import acp_task_executor as executor
+    from agent import claude_subscriptions as subs
+    from agent.copilot_acp_client import ACPUsageLimitError
+
+    task_id = kb.create_task(kanban_conn, title="Typed limit", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+    monkeypatch.setattr(subs, "pool_size", lambda: 2)
+    leases = iter([_FakeLease("p1"), _FakeLease("p2")])
+    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "release", lambda lease: None)
+    marked: list = []
+    monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: marked.append(name))
+
+    attempts = {"n": 0}
+
+    class FakeClient:
+        last_model = "claude-opus-4-8"
+        last_turn_usage = None
+
+        def __init__(self, **kwargs):
+            self.last_partial_text = ""
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise ACPUsageLimitError("upstream 429", code=-32000,
+                                         data={"status": 429})
+            return "Recovered.", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    result = executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+    )
+    assert result == "Recovered."
+    assert marked == ["p1"], "a typed limit error must cool p1 and rotate"
+    assert kb.get_task(kanban_conn, task_id).status == "done"
+
+
 def test_acp_worker_passes_requested_model_to_session(monkeypatch, kanban_conn, tmp_path):
     """HERMES_KANBAN_MODEL from the dispatcher reaches the ACP client."""
     from agent import acp_task_executor as executor
