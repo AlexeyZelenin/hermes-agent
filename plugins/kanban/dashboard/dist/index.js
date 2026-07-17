@@ -4032,6 +4032,7 @@
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
     const childResults = props.data.child_results || [];
+    const decisions = props.data.decisions || [];
 
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
@@ -4122,6 +4123,15 @@
         homeChannels: props.homeChannels || [],
         homeBusy: props.homeBusy || {},
         onToggle: props.onToggleHomeSub,
+      }),
+      h(ContextEditor, {
+        task: t,
+        renderMarkdown: props.renderMarkdown,
+        onPatch: props.onPatch,
+      }),
+      h(RelatedDecisions, {
+        decisions: decisions,
+        renderMarkdown: props.renderMarkdown,
       }),
       h(BodyEditor, {
         task: t,
@@ -4563,6 +4573,89 @@
           ? h(MarkdownBlock, { source: props.task.body, enabled: props.renderMarkdown })
           : h("div", { className: "text-xs text-muted-foreground italic" },
               tx(t, "noDescription", "— no description —")),
+    );
+  }
+
+  // Background / "why" for the card, separate from the description. Mirrors
+  // BodyEditor but writes the ``context`` field. Shown above the description so
+  // opening a card gives the reader the why without digging.
+  function ContextEditor(props) {
+    const { t } = useI18n();
+    const [editing, setEditing] = useState(false);
+    const [v, setV] = useState(props.task.context || "");
+    useEffect(function () { setV(props.task.context || ""); }, [props.task.context]);
+    const save = function () {
+      props.onPatch({ context: v }).then(function () { setEditing(false); });
+    };
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head-row" },
+        h("span", { className: "hermes-kanban-section-head" }, tx(t, "context", "Context")),
+        editing
+          ? h("div", { className: "flex gap-1" },
+              h(Button, { onClick: save, size: "sm" }, tx(t, "save", "Save")),
+              h(Button, { onClick: function () { setEditing(false); setV(props.task.context || ""); },
+                size: "sm",
+              }, tx(t, "cancel", "Cancel")),
+            )
+          : h("button", {
+              type: "button",
+              onClick: function () { setEditing(true); },
+              className: "hermes-kanban-edit-link",
+              title: "Edit context",
+            }, tx(t, "edit", "edit")),
+      ),
+      editing
+        ? h("textarea", {
+            className: "hermes-kanban-textarea",
+            value: v,
+            rows: 5,
+            placeholder: tx(t, "contextPlaceholder",
+              "Why this task exists — background, the reader needs this to make sense of the card"),
+            onChange: function (e) { setV(e.target.value); },
+          })
+        : props.task.context
+          ? h(MarkdownBlock, { source: props.task.context, enabled: props.renderMarkdown })
+          : h("div", { className: "text-xs text-muted-foreground italic" },
+              tx(t, "noContext", "— no context —")),
+    );
+  }
+
+  // Read-only "Related decisions" section: decisions recorded against this
+  // card (the "что нарешали" the operator wants visible without digging).
+  // The backend read is defensive, so ``decisions`` is simply empty until the
+  // sibling decisions-table feature lands; render nothing in that case rather
+  // than an empty placeholder that would just add noise.
+  function RelatedDecisions(props) {
+    const { t } = useI18n();
+    const decisions = props.decisions || [];
+    if (decisions.length === 0) return null;
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" },
+        `${tx(t, "relatedDecisions", "Related Decisions")} (${decisions.length})`),
+      decisions.map(function (d, i) {
+        // Render defensively — the decisions schema is owned elsewhere, so
+        // pick common fields when present and never assume any single one.
+        const summary = d.summary || d.title || d.decision || null;
+        const rationale = d.rationale || d.reason || d.body || null;
+        const when = d.created_at != null && timeAgo ? timeAgo(d.created_at) : null;
+        const links = Array.isArray(d.links) ? d.links : null;
+        return h("div", { key: d.id != null ? d.id : i, className: "hermes-kanban-comment" },
+          h("div", { className: "hermes-kanban-comment-head" },
+            h("span", { className: "hermes-kanban-comment-author" },
+              summary || tx(t, "decision", "decision")),
+            when ? h("span", { className: "hermes-kanban-comment-ago" }, when) : null,
+          ),
+          rationale
+            ? h(MarkdownBlock, { source: rationale, enabled: props.renderMarkdown })
+            : null,
+          links && links.length
+            ? h("div", { className: "hermes-kanban-deps-chips" },
+                links.map(function (lk, j) {
+                  return h("span", { key: j, className: "hermes-kanban-dep-chip" }, String(lk));
+                }))
+            : null,
+        );
+      }),
     );
   }
 

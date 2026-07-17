@@ -645,6 +645,10 @@ def get_task(
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
             "child_results": child_results,
+            # Related decisions recorded for this card (empty until the sibling
+            # decisions-table feature lands; read is defensive — see
+            # kanban_db.list_task_decisions).
+            "decisions": kanban_db.list_task_decisions(conn, task_id),
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(
@@ -666,6 +670,8 @@ def get_task(
 class CreateTaskBody(BaseModel):
     title: str
     body: Optional[str] = None
+    # Background / "why" for the card, separate from the work description.
+    context: Optional[str] = None
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
@@ -717,6 +723,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
             category=payload.category,
+            context=payload.context,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -910,6 +917,9 @@ class UpdateTaskBody(BaseModel):
     priority: Optional[int] = None
     title: Optional[str] = None
     body: Optional[str] = None
+    # Background / "why" for the card. Empty string clears it; None leaves it
+    # untouched (same convention as ``category``).
+    context: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
     # First-class pause toggle. True pauses (dispatcher skips, status
@@ -1023,6 +1033,16 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             )
             if not ok:
                 raise HTTPException(status_code=400, detail=err or "invalid category")
+
+        # --- context ------------------------------------------------------
+        # Background / "why" field. Empty string clears it (→ NULL); a
+        # non-empty value sets it. None leaves it untouched.
+        if payload.context is not None:
+            ok, err = kanban_db.set_task_context(
+                conn, task_id, payload.context, actor="dashboard",
+            )
+            if not ok:
+                raise HTTPException(status_code=404, detail=err or "task not found")
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:

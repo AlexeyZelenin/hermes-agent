@@ -1133,6 +1133,12 @@ class Task:
     # (the default) means uncategorized — the UI groups those last. Set by the
     # planner at decompose time and editable via ``set_task_category``.
     category: Optional[str] = None
+    # Free-text BACKGROUND / "why" for the task — the context a reader needs to
+    # understand the card (why we're doing this, the backstory), kept SEPARATE
+    # from ``body`` (the work description). NULL = no context recorded. Shown on
+    # the dashboard drawer above the description so opening a card gives the
+    # reader the why without digging.
+    context: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1225,6 +1231,9 @@ class Task:
             ),
             category=(
                 row["category"] if "category" in keys and row["category"] else None
+            ),
+            context=(
+                row["context"] if "context" in keys and row["context"] else None
             ),
         )
 
@@ -1496,7 +1505,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- managed name+icon set, NOT free text). NULL = uncategorized — the
     -- dashboard groups those in a trailing bucket. Set by the planner at
     -- decompose time and editable via ``set_task_category`` / the dashboard.
-    category             TEXT
+    category             TEXT,
+    -- Free-text BACKGROUND / "why" for the task, kept SEPARATE from ``body``
+    -- (the work description). NULL = none. Human-facing context shown on the
+    -- dashboard drawer above the description so a reader gets the why without
+    -- digging. Editable via ``set_task_context`` / the dashboard.
+    context              TEXT
 );
 
 -- Per-board CATALOG of task categories (name + icon). A task's ``category``
@@ -2370,6 +2384,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # rows that predate the column.
         _add_column_if_missing(conn, "tasks", "category", "category TEXT")
 
+    if "context" not in cols:
+        # Free-text background / "why", separate from body. Existing rows get
+        # NULL (no context) — no behaviour change for rows predating the column.
+        _add_column_if_missing(conn, "tasks", "context", "context TEXT")
+
     # Seed the category catalog on first creation only. ``task_categories`` is
     # created by SCHEMA_SQL just above; seed the operator's original icon groups
     # when it is still empty so a fresh board starts curated. A non-empty
@@ -2842,6 +2861,7 @@ def create_task(
     effort_override: Optional[str] = None,
     append_system_prompt: Optional[str] = None,
     category: Optional[str] = None,
+    context: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2964,6 +2984,10 @@ def create_task(
     category = str(category or "").strip().lower() or None
     if category is not None and get_category(conn, category) is None:
         category = None
+
+    # Background / "why" context, separate from the work description (body).
+    # Empty/whitespace collapses to NULL so the drawer can cleanly hide it.
+    context = (str(context).strip() or None) if context is not None else None
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3126,8 +3150,8 @@ def create_task(
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        category
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        category, context
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3155,6 +3179,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         category,
+                        context,
                     ),
                 )
                 for pid in parents:
@@ -5927,6 +5952,76 @@ def set_task_category(
             {"category": slug, "actor": actor},
         )
     return True, None
+
+
+def set_task_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    context: Optional[str],
+    *,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Set (or clear, with an empty/None ``context``) a task's background field.
+
+    ``context`` is the free-text "why" shown on the card, separate from the
+    work description (``body``). Whitespace-only collapses to NULL. Returns
+    ``(True, None)`` on success or ``(False, reason)`` if the task is unknown.
+    Idempotent: setting the same value is a no-op that still returns success.
+    """
+    value = (str(context).strip() or None) if context is not None else None
+    row = conn.execute(
+        "SELECT context FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    if row["context"] == value:
+        return True, None  # idempotent no-op
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET context = ? WHERE id = ?", (value, task_id)
+        )
+        _append_event(
+            conn, task_id, "edited",
+            {"field": "context", "actor": actor},
+        )
+    return True, None
+
+
+def list_task_decisions(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[dict]:
+    """Return the recorded ``decisions`` for a task, newest first.
+
+    The ``decisions`` table is owned by a sibling feature (the decisions
+    table / UI-category work, t_6dc73752). This read is deliberately
+    DEFENSIVE so the card can surface related decisions the moment that
+    table lands without this code being the thing that has to change:
+
+      * table absent            → ``[]``
+      * no ``task_id`` column    → ``[]`` (can't scope to this card)
+      * any query/shape error    → ``[]``
+
+    Each decision is returned as a raw column→value dict so the dashboard can
+    render whatever fields exist (e.g. ``summary``, ``rationale``, ``links``,
+    ``created_at``) without this layer pinning the schema.
+    """
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}
+    except sqlite3.Error:
+        return []
+    if not cols or "task_id" not in cols:
+        return []
+    # Newest-first when the table carries a timestamp; otherwise fall back to
+    # insertion order via the implicit rowid.
+    order = "created_at DESC" if "created_at" in cols else "rowid DESC"
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM decisions WHERE task_id = ? ORDER BY {order}",
+            (task_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(r) for r in rows]
 
 
 # --- Engine-room structured log (engine_log) --------------------------------

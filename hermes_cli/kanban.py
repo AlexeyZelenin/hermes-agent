@@ -333,6 +333,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument("--context", default=None,
+                          help="Optional background / 'why' shown on the card, "
+                               "separate from --body (the work description)")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -1493,6 +1496,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             conn,
             title=args.title,
             body=args.body,
+            context=getattr(args, "context", None),
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
