@@ -551,6 +551,12 @@ export const en: Translations = {
     switchTo: "Switch language",
   },
 
+  autoUpdate: {
+    on: "Auto-update on",
+    off: "Auto-update off",
+    hint: "Toggle live auto-update of lists (chat stays live either way)",
+  },
+
   theme: {
     title: "Theme",
     switchTheme: "Switch theme",

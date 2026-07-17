@@ -101,6 +101,7 @@ import SystemPage from "@/pages/SystemPage";
 import ChatPage from "@/pages/ChatPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
+import { AutoUpdateToggle } from "@/components/AutoUpdateToggle";
 import { useI18n } from "@/i18n";
 import type { Translations } from "@/i18n/types";
 import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
@@ -773,6 +774,14 @@ export default function App() {
                   tooltipWarmRef={tooltipWarmRef}
                 >
                   <LanguageSwitcher collapsed={isDesktopCollapsed} dropUp />
+                </SidebarIconWithTooltip>
+
+                <SidebarIconWithTooltip
+                  collapsed={isDesktopCollapsed}
+                  label={t.autoUpdate?.hint ?? "Auto-update"}
+                  tooltipWarmRef={tooltipWarmRef}
+                >
+                  <AutoUpdateToggle collapsed={isDesktopCollapsed} />
                 </SidebarIconWithTooltip>
               </div>
             </div>

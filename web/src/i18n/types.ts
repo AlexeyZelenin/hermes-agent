@@ -571,6 +571,13 @@ export interface Translations {
     switchTo: string;
   };
 
+  // ── Auto-update toggle (optional — locales fall back to English). ──
+  autoUpdate?: {
+    on: string;
+    off: string;
+    hint: string;
+  };
+
   // ── Theme switcher ──
   theme: {
     title: string;

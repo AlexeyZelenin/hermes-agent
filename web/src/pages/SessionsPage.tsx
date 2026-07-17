@@ -31,7 +31,11 @@ import {
   Archive,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { shouldRefreshSessions } from "@/lib/session-refresh";
+import {
+  shouldRefreshVisible,
+  visibleListSignature,
+} from "@/lib/auto-update";
+import { useAutoUpdate } from "@/hooks/useAutoUpdate";
 import {
   importSummary,
   parseImportSessions,
@@ -674,6 +678,24 @@ type SessionsView = "list" | "overview";
 
 const PAGE_SIZE = 20;
 
+// The session fields the list actually renders (see ``SessionRow``). The
+// overview poll silently re-fetches the paginated list only when one of
+// these changes on a visible row — a churn confined to invisible fields
+// (token counts, timestamps we don't show) must not flicker the list
+// (operator t_f0a1b527, diff-by-visibility). ``id`` is included so a new
+// session, a removal, or a reorder (rows visibly moving) still refreshes.
+const VISIBLE_SESSION_FIELDS = [
+  "id",
+  "title",
+  "source",
+  "model",
+  "is_active",
+  "message_count",
+  "tool_call_count",
+  "last_active",
+  "preview",
+] as const satisfies readonly (keyof SessionInfo)[];
+
 function SessionsPagination({
   className,
   compact = false,
@@ -769,6 +791,7 @@ export default function SessionsPage() {
   const [pruning, setPruning] = useState(false);
   const [importingSessions, setImportingSessions] = useState(false);
   const { toast, showToast } = useToast();
+  const { enabled: autoUpdate } = useAutoUpdate();
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
@@ -877,17 +900,23 @@ export default function SessionsPage() {
     loadStats();
   }, [loadStats]);
 
-  // Refs for the overview poll's new-session detection. The poll effect
-  // below is mounted once with stable deps, so it reads the current page
-  // and the last-seen newest session id through refs instead of capturing
-  // stale values. ``newestSeenRef`` starts null so the first poll sets a
-  // baseline without triggering a redundant reload (mount already loads).
-  const newestSeenRef = useRef<string | null>(null);
+  // Refs for the overview poll's change detection. The poll effect below is
+  // mounted once with stable deps, so it reads the current page, the
+  // last-seen visible signature, and the live auto-update preference through
+  // refs instead of capturing stale values. ``overviewSigRef`` starts null so
+  // the first poll sets a baseline without triggering a redundant reload
+  // (mount already loads).
+  const overviewSigRef = useRef<string | null>(null);
   const pageRef = useRef(page);
+  const autoUpdateRef = useRef(autoUpdate);
 
   useEffect(() => {
     pageRef.current = page;
   }, [page]);
+
+  useEffect(() => {
+    autoUpdateRef.current = autoUpdate;
+  }, [autoUpdate]);
 
   useEffect(() => {
     let cancelled = false;
@@ -913,16 +942,25 @@ export default function SessionsPage() {
           setOverviewSessions(r.sessions);
           // The dashboard server and a terminal CLI are separate
           // processes sharing one session DB — there is no push channel,
-          // so we detect sessions created in another process here. The
-          // overview poll already fetches the 50 newest sessions, so we
-          // reuse its head id as a cheap change signal: when it changes,
-          // silently refresh the paginated list so the new session shows
-          // up in real time without a visible loading flicker.
-          const newest = r.sessions[0]?.id ?? null;
-          if (shouldRefreshSessions(newestSeenRef.current, newest)) {
+          // so we detect changes made in another process here. The overview
+          // poll already fetches the 50 newest sessions, so we project them
+          // down to the fields the list actually renders and use that as a
+          // change signal: when a *visible* field moves (a new/removed/
+          // reordered session, or a title/count/activity change) we silently
+          // refresh the paginated list. A churn confined to invisible fields
+          // is skipped so the list never flickers for data the user can't
+          // see. The whole refresh is gated on the auto-update toggle so the
+          // user can freeze the list while interacting with it (esp. the
+          // standalone app, which has no F5). Chat is unaffected — its own
+          // WebSocket stays live regardless.
+          const sig = visibleListSignature(r.sessions, VISIBLE_SESSION_FIELDS);
+          if (
+            autoUpdateRef.current &&
+            shouldRefreshVisible(overviewSigRef.current, sig)
+          ) {
             loadSessions(pageRef.current, true);
           }
-          newestSeenRef.current = newest;
+          overviewSigRef.current = sig;
         })
         .catch(() => {});
     };
