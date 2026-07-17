@@ -199,6 +199,18 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     )
     if cost_result.amount_usd is not None:
         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
+    # Feed the payment-source-aware spend guard (codex is subscription-billed,
+    # so this is shadow-priced and warn-only).
+    from agent.budget_guard import feed_budget_guard
+    feed_budget_guard(
+        getattr(agent, "_budget_guard", None),
+        model=agent.model,
+        provider=agent.provider,
+        base_url=agent.base_url,
+        api_key=getattr(agent, "api_key", ""),
+        usage=canonical_usage,
+        cost_result=cost_result,
+    )
     agent.session_cost_status = cost_result.status
     agent.session_cost_source = cost_result.source
 

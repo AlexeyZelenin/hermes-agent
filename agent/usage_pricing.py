@@ -807,6 +807,18 @@ def get_pricing_entry(
             source="none",
             pricing_version="included-route",
         )
+    return _metered_pricing_entry(route, api_key)
+
+
+def _metered_pricing_entry(
+    route: BillingRoute, api_key: Optional[str]
+) -> Optional[PricingEntry]:
+    """Resolve per-token pricing for a route, ignoring subscription routing.
+
+    Same lookup order as :func:`get_pricing_entry` minus the
+    ``subscription_included`` short-circuit, so a subscription turn can still be
+    priced at its would-be metered ("shadow") rate.
+    """
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
     if route.base_url:
@@ -929,6 +941,36 @@ def estimate_usage_cost(
     if not entry:
         return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
 
+    return _cost_from_entry(entry, usage, route)
+
+
+def estimate_metered_cost(
+    model_name: str,
+    usage: CanonicalUsage,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> CostResult:
+    """Price usage at its per-token rate, ignoring subscription-included routing.
+
+    This is the "shadow price": the dollar amount a subscription turn WOULD cost
+    on live API-key billing. The budget guard uses it to raise soft warnings on
+    subscription spend without ever blocking (a flat-rate plan's marginal dollar
+    cost is really $0). Returns ``status="unknown"`` when the route has no
+    metered pricing, so callers degrade gracefully instead of counting $0.
+    """
+    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    entry = _metered_pricing_entry(route, api_key or "")
+    if not entry:
+        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
+    return _cost_from_entry(entry, usage, route)
+
+
+def _cost_from_entry(
+    entry: PricingEntry, usage: CanonicalUsage, route: BillingRoute
+) -> CostResult:
+    """Compute a :class:`CostResult` from a resolved pricing entry and usage."""
     notes: list[str] = []
     amount = _ZERO
 

@@ -578,6 +578,7 @@ def init_agent(
     # even when stream consumers are registered (no tokens streaming then)
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
+    agent._budget_guard = None  # set from config below; None disables gating
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
 
     # Interrupt mechanism for breaking out of tool loops
@@ -1362,6 +1363,15 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+    try:
+        from agent.budget_guard import BudgetGuard, BudgetGuardConfig
+
+        agent._budget_guard = BudgetGuard(
+            BudgetGuardConfig.from_mapping(_agent_cfg.get("budget_guard", {}))
+        )
+    except Exception as _bg_err:
+        agent._budget_guard = None
+        _ra().logger.warning("Budget guard config ignored: %s", _bg_err)
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

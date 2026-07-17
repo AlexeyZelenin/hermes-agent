@@ -52,6 +52,26 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _budget_guard_block(agent, tool_name: str, args) -> Optional[ToolGuardrailDecision]:
+    """Return a block decision if the spend guard denies ``tool_name``, else None.
+
+    Soft warnings (subscription spend, or api-key spend nearing the limit) are
+    logged for the operator and allowed through; only a hard stop returns a
+    block. Never raises — spend telemetry must not break tool execution.
+    """
+    guard = getattr(agent, "_budget_guard", None)
+    if guard is None:
+        return None
+    try:
+        decision = guard.before_call(tool_name, args)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    if decision.action == "warn" and decision.message:
+        logger.warning("Budget guard: %s", decision.message)
+        return None
+    return decision if not decision.allows_execution else None
+
+
 def _budget_for_agent(agent) -> BudgetConfig:
     """Resolve a tool-result BudgetConfig scaled to the agent's context window.
 
@@ -480,6 +500,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             else:
                 guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                if guardrail_decision.allows_execution:
+                    guardrail_decision = (
+                        _budget_guard_block(agent, function_name, function_args)
+                        or guardrail_decision
+                    )
                 if not guardrail_decision.allows_execution:
                     block_result = agent._guardrail_block_result(guardrail_decision)
                     blocked_by_guardrail = True
@@ -1132,6 +1157,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
+            else:
+                _guardrail_block_decision = _budget_guard_block(
+                    agent, function_name, function_args
+                )
 
         _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
 

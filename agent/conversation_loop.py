@@ -2226,6 +2226,18 @@ def run_conversation(
                     )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
+                    # Feed the payment-source-aware spend guard: subscription
+                    # turns are shadow-priced (warn-only), api-key turns metered.
+                    from agent.budget_guard import feed_budget_guard
+                    feed_budget_guard(
+                        getattr(agent, "_budget_guard", None),
+                        model=_agg_cost_model,
+                        provider=_agg_cost_provider,
+                        base_url=_agg_cost_base_url,
+                        api_key=getattr(agent, "api_key", ""),
+                        usage=aggregator_usage,
+                        cost_result=cost_result,
+                    )
                     # Add MoA advisor cost (already priced per-advisor at each
                     # advisor's own model rate) on top of the aggregator cost.
                     if _moa_ref_cost is not None:
