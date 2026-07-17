@@ -1095,6 +1095,8 @@ export const api = {
       `/api/credentials/pool/${encodeURIComponent(provider)}/${index}`,
       { method: "DELETE" },
     ),
+  getCredentialUsage: () =>
+    fetchJSON<{ accounts: CredentialUsageAccount[] }>("/api/credentials/usage"),
 
   // ── Admin: Memory provider ──────────────────────────────────────────
   getMemory: () => fetchJSON<MemoryStatus>("/api/memory"),
@@ -1576,6 +1578,9 @@ export interface CredentialPoolEntry {
   source: string | null;
   priority: number;
   last_status: string | null;
+  last_error_code: number | null;
+  /** Epoch seconds until an exhausted entry re-enters rotation; null when not cooling down. */
+  cooldown_until: number | null;
   request_count: number;
   token_preview: string;
   has_refresh: boolean;
@@ -1584,6 +1589,29 @@ export interface CredentialPoolEntry {
 export interface CredentialPoolProvider {
   provider: string;
   entries: CredentialPoolEntry[];
+}
+
+export interface AccountUsageWindow {
+  label: string;
+  used_percent: number | null;
+  reset_at: string | null;
+  detail: string | null;
+}
+
+export interface CredentialAccountUsage {
+  plan: string | null;
+  fetched_at: string;
+  unavailable_reason: string | null;
+  details: string[];
+  windows: AccountUsageWindow[];
+}
+
+export interface CredentialUsageAccount {
+  provider: string;
+  index: number;
+  id: string | null;
+  label: string | null;
+  usage: CredentialAccountUsage | null;
 }
 
 export interface MemoryProviderInfo {

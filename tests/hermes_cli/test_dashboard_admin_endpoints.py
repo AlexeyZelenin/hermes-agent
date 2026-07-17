@@ -161,6 +161,85 @@ class TestCredentialPoolEndpoints:
         )
         assert r.status_code == 400
 
+    def test_pool_entry_exposes_429_cooldown(self):
+        import time
+
+        self.client.post(
+            "/api/credentials/pool",
+            json={"provider": "openrouter", "api_key": "sk-or-cooldown99", "label": "c"},
+        )
+        entry = self.client.get("/api/credentials/pool").json()["providers"][0]["entries"][0]
+        assert entry["last_error_code"] is None
+        assert entry["cooldown_until"] is None
+
+        from agent.credential_pool import load_pool
+
+        load_pool("openrouter").mark_exhausted_and_rotate(status_code=429)
+
+        entry = self.client.get("/api/credentials/pool").json()["providers"][0]["entries"][0]
+        assert entry["last_status"] == "exhausted"
+        assert entry["last_error_code"] == 429
+        # 429 entries cool down for 1 hour before re-entering rotation.
+        assert entry["cooldown_until"] == pytest.approx(time.time() + 3600, abs=60)
+
+    def test_usage_reports_per_account_snapshots(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        import agent.account_usage as account_usage
+
+        # openrouter: unlike anthropic, its pool never auto-seeds entries from
+        # ambient singleton credentials, so the test stays hermetic.
+        self.client.post(
+            "/api/credentials/pool",
+            json={"provider": "openrouter", "api_key": "sk-or-usage-abc12", "label": "acct"},
+        )
+
+        def fake_fetch(provider, *, base_url=None, api_key=None):
+            assert provider == "openrouter"
+            assert api_key == "sk-or-usage-abc12"
+            return account_usage.AccountUsageSnapshot(
+                provider=provider,
+                source="credits_api",
+                fetched_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+                plan="Max",
+                windows=(
+                    account_usage.AccountUsageWindow(
+                        label="Current week",
+                        used_percent=41.5,
+                        reset_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+                    ),
+                ),
+                details=("Extra usage: 1.00 / 5.00 USD",),
+            )
+
+        monkeypatch.setattr(account_usage, "fetch_account_usage", fake_fetch)
+
+        accounts = self.client.get("/api/credentials/usage").json()["accounts"]
+        assert len(accounts) == 1
+        acc = accounts[0]
+        assert acc["provider"] == "openrouter"
+        assert acc["index"] == 1 and acc["label"] == "acct"
+        assert acc["usage"]["plan"] == "Max"
+        assert acc["usage"]["details"] == ["Extra usage: 1.00 / 5.00 USD"]
+        window = acc["usage"]["windows"][0]
+        assert window["label"] == "Current week"
+        assert window["used_percent"] == 41.5
+        assert window["reset_at"].startswith("2026-07-20")
+
+    def test_usage_skips_fetch_for_providers_without_usage_api(self, monkeypatch):
+        import agent.account_usage as account_usage
+
+        self.client.post(
+            "/api/credentials/pool",
+            json={"provider": "openrouter", "api_key": "sk-or-quotaless1", "label": "q"},
+        )
+        monkeypatch.setattr(
+            account_usage, "fetch_account_usage", lambda *a, **k: None
+        )
+        accounts = self.client.get("/api/credentials/usage").json()["accounts"]
+        assert len(accounts) == 1
+        assert accounts[0]["usage"] is None
+
 
 class TestMemoryEndpoints:
     @pytest.fixture(autouse=True)

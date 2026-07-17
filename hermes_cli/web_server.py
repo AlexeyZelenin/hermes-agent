@@ -11731,6 +11731,8 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
 
     ``index`` is 1-based to match CredentialPool.remove_index().
     """
+    from agent.credential_pool import _exhausted_until
+
     token = getattr(entry, "access_token", "") or ""
     return {
         "index": index,
@@ -11740,6 +11742,10 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
         "source": getattr(entry, "source", None),
         "priority": getattr(entry, "priority", 0),
         "last_status": getattr(entry, "last_status", None),
+        "last_error_code": getattr(entry, "last_error_code", None),
+        # Epoch seconds until an exhausted (429/402/401) entry re-enters
+        # rotation; None when the entry is not cooling down.
+        "cooldown_until": _exhausted_until(entry),
         "request_count": getattr(entry, "request_count", 0),
         "token_preview": redact_key(token) if token else "",
         "has_refresh": bool(getattr(entry, "refresh_token", None)),
@@ -11771,6 +11777,72 @@ async def list_credential_pool():
             ],
         })
     return {"providers": providers}
+
+
+def _usage_snapshot_dict(snapshot: Any) -> Optional[Dict[str, Any]]:
+    """JSON view of an AccountUsageSnapshot (None when the provider has no usage API)."""
+    if snapshot is None:
+        return None
+    return {
+        "plan": snapshot.plan,
+        "fetched_at": snapshot.fetched_at.isoformat(),
+        "unavailable_reason": snapshot.unavailable_reason,
+        "details": list(snapshot.details),
+        "windows": [
+            {
+                "label": w.label,
+                "used_percent": w.used_percent,
+                "reset_at": w.reset_at.isoformat() if w.reset_at else None,
+                "detail": w.detail,
+            }
+            for w in snapshot.windows
+        ],
+    }
+
+
+@app.get("/api/credentials/usage")
+def credential_pool_usage(provider: Optional[str] = None):
+    """Subscription-limit remainder per pooled account.
+
+    Queries each provider's own usage API with the pooled credential itself
+    (Anthropic OAuth usage API, Codex, OpenRouter credits), so every account
+    in the pool reports its exact remaining quota.  Network-bound — the
+    dashboard calls it on demand, not with every pool refresh.  Sync ``def``
+    so FastAPI runs the blocking HTTP fetches in its threadpool.
+    """
+    from agent.account_usage import fetch_account_usage
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import read_credential_pool
+
+    wanted = (provider or "").strip().lower()
+    accounts = []
+    for provider_id in sorted(read_credential_pool().keys()):
+        if wanted and provider_id != wanted:
+            continue
+        try:
+            pool = load_pool(provider_id)
+        except Exception:
+            _log.exception("load_pool(%s) failed", provider_id)
+            continue
+        for index, entry in enumerate(pool.entries(), start=1):
+            token = (entry.runtime_api_key or "").strip()
+            snapshot = (
+                fetch_account_usage(
+                    provider_id,
+                    base_url=getattr(entry, "base_url", None),
+                    api_key=token,
+                )
+                if token
+                else None
+            )
+            accounts.append({
+                "provider": provider_id,
+                "index": index,
+                "id": getattr(entry, "id", None),
+                "label": getattr(entry, "label", None),
+                "usage": _usage_snapshot_dict(snapshot),
+            })
+    return {"accounts": accounts}
 
 
 @app.post("/api/credentials/pool")
