@@ -212,6 +212,19 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Pre-spawn worker-env contribution. Fired by agent.acp_task_executor in the
+    # WORKER process, just before an external ACP session (Claude Code / Codex)
+    # is spawned, so a plugin can inject env into the child WITHOUT the core ever
+    # importing it. Each callback returns a ``dict[str, str]`` (or ``None``) that
+    # is merged into the worker's ``extra_env``; later callbacks and core-owned
+    # keys (e.g. CLAUDE_CONFIG_DIR) win on collision. Observer-safe: invoke_hook
+    # isolates every callback, so a raising plugin never blocks task spawn.
+    #
+    # Kwargs: task_id: str, board: str | None, subscription: str | None,
+    #   run_id: int | None.
+    # Used by the Zeus plugin to resolve HERMES_LANGFUSE_* into the OTLP env that
+    # makes Claude Code stream per-request/per-tool spans to Langfuse natively.
+    "contribute_worker_env",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

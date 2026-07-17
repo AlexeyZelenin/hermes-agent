@@ -83,6 +83,28 @@ def _report_usage(client, executor, task_id, subscription=None):
                     cost_usd=context.get("cost_usd"))
     except Exception:
         pass
+def _contributed_worker_env(task_id, board=None, subscription=None, run_id=None):
+    """Plugin-contributed env for a spawning ACP worker, merged before spawn.
+
+    Fires the ``contribute_worker_env`` hook so a plugin can inject env into the
+    worker session WITHOUT the core importing it - e.g. the Zeus plugin resolves
+    ``HERMES_LANGFUSE_*`` into the OTLP env that makes Claude Code stream
+    per-request/per-tool spans to Langfuse natively. Each callback returns a
+    ``dict[str, str]`` (or ``None``); later callbacks win on a key collision.
+    Fail-open: invoke_hook isolates every callback, and any error reaching here
+    yields ``{}`` so an unconfigured or broken plugin never blocks task spawn."""
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+        discover_plugins()
+        results = invoke_hook("contribute_worker_env", task_id=task_id,
+                              board=board, subscription=subscription, run_id=run_id)
+    except Exception:
+        return {}
+    merged = {}
+    for result in results:
+        if isinstance(result, dict):
+            merged.update({str(k): str(v) for k, v in result.items()})
+    return merged
 def _new_client(command, args, workspace, model, extra_env=None, effort=None,
                 tool_activity_sink=None):
     return CopilotACPClient(acp_command=command, acp_args=args, acp_cwd=workspace,
@@ -172,7 +194,7 @@ def _salvage_partial_output(task_id, board, client):
                            body="partial handoff (limit-interrupted)\n\n" + partial)
     except Exception:
         pass
-def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None, tool_activity_sink=None):
+def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None, tool_activity_sink=None, run_id=None):
     """Run the prompt on the Claude subscription pool, rotating on usage limits.
 
     Each session gets CLAUDE_CONFIG_DIR pinned to a leased subscription dir
@@ -184,8 +206,9 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
     """
     from agent import claude_subscriptions as subs
     if subs.pool_size() == 0:
-        client = _new_client(command, args, workspace, model, effort=effort,
-                             tool_activity_sink=tool_activity_sink)
+        extra_env = _contributed_worker_env(task_id, board, None, run_id) or None
+        client = _new_client(command, args, workspace, model, extra_env=extra_env,
+                             effort=effort, tool_activity_sink=tool_activity_sink)
         text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
         return text, client, None
     while True:
@@ -193,8 +216,13 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
         limited = None
         client = None
         try:
+            # Plugin-contributed env (e.g. Zeus Langfuse OTLP) first, then the
+            # core-owned CLAUDE_CONFIG_DIR last so the leased subscription dir
+            # always wins over any contributed key.
+            extra_env = _contributed_worker_env(task_id, board, lease.name, run_id)
+            extra_env["CLAUDE_CONFIG_DIR"] = lease.config_dir
             client = _new_client(command, args, workspace, model,
-                                 extra_env={"CLAUDE_CONFIG_DIR": lease.config_dir},
+                                 extra_env=extra_env,
                                  effort=effort, tool_activity_sink=tool_activity_sink)
             text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
             # A completed session/prompt is structurally NOT a limit/auth death:
@@ -242,7 +270,7 @@ def run_task(*, executor, task_id, workspace, board=None):
         follow_up=(lambda: _drain_steer(task_id, board)) if _steering_enabled() else None
         tool_sink=_make_tool_activity_sink(task_id, board, run_id) if _tool_feed_enabled() else None
         if executor == "claude-code":
-            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort,tool_sink)
+            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort,tool_sink,run_id)
         else:
             client=_new_client(command,args,workspace,model,effort=effort,tool_activity_sink=tool_sink)
             text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
