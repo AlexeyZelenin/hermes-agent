@@ -75,7 +75,8 @@ Output a single JSON object with this exact shape:
         "parents": [<int>, ...],
         "estimated_context_tokens": <rough integer estimate>,
         "model_tier": "cheap" | "mid" | "standard" | "strong",
-        "model_rationale": "<one short clause on why this tier>"
+        "model_rationale": "<one short clause on why this tier>",
+        "category": "<category key from the catalog, or null>"
       },
       ...
     ]
@@ -135,6 +136,13 @@ Rules:
     tier for THIS chunk (e.g. "cross-cutting refactor, spec must be
     interpreted"). It is recorded on the child task so the assignment is
     auditable.
+  - "category" tags each chunk with ONE key from the board's category catalog
+    (supplied below). Categories are a fixed, managed set with a consistent
+    icon per category — the dashboard groups the backlog by them, so pick the
+    best-fitting existing key rather than inventing one. Use the key exactly as
+    listed (lowercase slug). If none fits, or no catalog is supplied, use null.
+    Assign the category by the DOMAIN of the work (what part of the product it
+    touches), not by the model tier.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -160,7 +168,29 @@ Body:
 {body}
 
 Maximum rough context budget per fresh worker: {context_budget_tokens:,} tokens
-{calibration_context}"""
+{category_catalog}{calibration_context}"""
+
+
+def _category_catalog_block() -> str:
+    """Render the board's category catalog for the decomposer prompt.
+
+    Empty string when the catalog is empty (older boards / operator cleared
+    it) so the model is told to use ``category: null``.
+    """
+    try:
+        with kb.connect_closing() as conn:
+            cats = kb.list_categories(conn)
+    except Exception as exc:  # noqa: BLE001 — catalog is advisory, never fatal
+        logger.debug("decompose: category catalog unavailable: %s", exc)
+        return ""
+    if not cats:
+        return ""
+    lines = [f"  - {c.key}: {c.icon} {c.name}" for c in cats]
+    return (
+        "Category catalog (assign each chunk the best-fitting key, or null):\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
 
 
 def _task_model_map(task) -> dict:
@@ -372,6 +402,7 @@ def decompose_task(
         title=title,
         body=body,
         context_budget_tokens=context_budget_tokens,
+        category_catalog=_category_catalog_block(),
         calibration_context=calibration_context,
     )
 
@@ -481,12 +512,17 @@ def decompose_task(
         tier_model = model_map.get(tier) if tier in ("cheap", "mid", "strong") else None
         rationale = entry.get("model_rationale")
         rationale = rationale.strip()[:200] if isinstance(rationale, str) else ""
+        # Planner-assigned category key (managed set). Kept as a lowercase slug;
+        # decompose_triage_task drops it to NULL if it isn't in the catalog.
+        category = entry.get("category")
+        category = category.strip().lower() if isinstance(category, str) and category.strip() else None
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": None,
             "parents": clean_parents,
             "model_override": tier_model,
+            "category": category,
         })
         tier_meta.append({
             "title": title.strip()[:200],

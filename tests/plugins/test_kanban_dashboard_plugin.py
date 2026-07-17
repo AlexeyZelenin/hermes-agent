@@ -2744,3 +2744,59 @@ def test_task_detail_includes_token_cost(client, kanban_home):
     assert tc["rollup"]["total_tokens"] == 400
     # parent cost was unpriced (None); only the child's $0.30 rolls up.
     assert tc["rollup"]["cost_usd"] == pytest.approx(0.30)
+
+
+# ---------------------------------------------------------------------------
+# Category catalog endpoints (managed set + per-task assignment)
+# ---------------------------------------------------------------------------
+
+def test_board_includes_seeded_category_catalog(client):
+    data = client.get("/api/plugins/kanban/board").json()
+    keys = [c["key"] for c in data["categories"]]
+    assert keys == [k for (k, _n, _i) in kb.DEFAULT_CATEGORIES]
+
+
+def test_categories_list_upsert_delete(client):
+    r = client.get("/api/plugins/kanban/categories")
+    assert r.status_code == 200
+    assert "engine-room" in [c["key"] for c in r.json()["categories"]]
+
+    r = client.post(
+        "/api/plugins/kanban/categories",
+        json={"key": "ops", "name": "Ops", "icon": "🛠", "sort": 9},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["category"] == {"key": "ops", "name": "Ops", "icon": "🛠", "sort": 9}
+
+    r = client.delete("/api/plugins/kanban/categories/ops")
+    assert r.status_code == 200
+    assert "ops" not in [c["key"] for c in client.get(
+        "/api/plugins/kanban/categories").json()["categories"]]
+
+    # Deleting an unknown key is a 404.
+    assert client.delete("/api/plugins/kanban/categories/ghost").status_code == 404
+
+
+def test_create_task_with_category(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "ship it", "category": "product"},
+    ).json()["task"]
+    assert task["category"] == "product"
+
+
+def test_patch_task_category_set_and_clear(client):
+    tid = client.post("/api/plugins/kanban/tasks", json={"title": "t"}).json()["task"]["id"]
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"category": "intelligence"})
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["category"] == "intelligence"
+    # Empty string clears.
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"category": ""})
+    assert r.status_code == 200
+    assert r.json()["task"]["category"] is None
+
+
+def test_patch_task_unknown_category_rejected(client):
+    tid = client.post("/api/plugins/kanban/tasks", json={"title": "t"}).json()["task"]["id"]
+    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"category": "ghost"})
+    assert r.status_code == 400

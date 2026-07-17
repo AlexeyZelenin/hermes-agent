@@ -91,6 +91,55 @@
   // Statuses from which a task may be PAUSED — mirrors VALID_PAUSE_STATUSES in
   // kanban_db.py. Pause is a pre-run hold, so only the queued statuses qualify.
   const PAUSEABLE_STATUSES = new Set(["triage", "todo", "ready"]);
+  // Backlog columns whose cards are auto-grouped by category (with icons), the
+  // operator's icon-grouped-backlog request. Run/blocked/done stay flat.
+  const CATEGORY_GROUPED_COLUMNS = new Set(["triage", "todo", "ready"]);
+  // Icon for the trailing Uncategorized bucket — mirrors UNCATEGORIZED_ICON in
+  // kanban_db.py.
+  const UNCATEGORIZED_ICON = "📥";
+
+  // Build a {key: {name, icon}} lookup from the board's category catalog.
+  function categoryMap(categories) {
+    const map = {};
+    for (const c of categories || []) {
+      if (c && c.key) map[c.key] = { name: c.name || c.key, icon: c.icon || "" };
+    }
+    return map;
+  }
+
+  // Split a column's tasks into ordered category groups plus a trailing
+  // Paused group. Active cards are grouped by category (catalog order, then
+  // Uncategorized last); paused cards are pulled out into their own bottom
+  // section regardless of category. Returns [{key, name, icon, paused, tasks}].
+  function groupTasksByCategory(tasks, categories) {
+    const cats = categories || [];
+    const order = cats.map(function (c) { return c.key; });
+    const map = categoryMap(cats);
+    const active = {};
+    const paused = [];
+    for (const tk of tasks) {
+      if (tk.paused) { paused.push(tk); continue; }
+      const key = (tk.category && map[tk.category]) ? tk.category : "__uncat__";
+      (active[key] = active[key] || []).push(tk);
+    }
+    const groups = [];
+    for (const key of order) {
+      if (active[key] && active[key].length) {
+        groups.push({ key: key, name: map[key].name, icon: map[key].icon,
+                      paused: false, tasks: active[key] });
+      }
+    }
+    if (active["__uncat__"] && active["__uncat__"].length) {
+      groups.push({ key: "__uncat__", name: "Uncategorized",
+                    icon: UNCATEGORIZED_ICON, paused: false,
+                    tasks: active["__uncat__"] });
+    }
+    if (paused.length) {
+      groups.push({ key: "__paused__", name: "Paused", icon: "⏸",
+                    paused: true, tasks: paused });
+    }
+    return groups;
+  }
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
@@ -1163,6 +1212,7 @@
           onOpen: setSelectedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
+          categories: (boardData && boardData.categories) || [],
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
@@ -1173,6 +1223,7 @@
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
           assignees: (boardData && boardData.assignees) || [],
+          categories: (boardData && boardData.categories) || [],
           eventTick: taskEventTick[selectedTaskId] || 0,
         }) : null,
       ),
@@ -2658,9 +2709,11 @@
           onMove: props.onMove,
           onMoveSelected: props.onMoveSelected,
           onTogglePause: props.onTogglePause,
+          onDelete: props.onDelete,
           onOpen: props.onOpen,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
+          categories: props.categories,
         });
       }),
       h(TrashDropZone, {
@@ -2725,6 +2778,39 @@
       });
     }, [props.column, props.laneByProfile]);
 
+    // Auto-group backlog columns by category (with icons); paused cards fall
+    // into a trailing section. Skipped for non-backlog columns and when a
+    // column has no category signal at all (no catalog and nothing paused),
+    // so an uncurated board keeps its original flat layout.
+    const catGroups = useMemo(function () {
+      if (!CATEGORY_GROUPED_COLUMNS.has(props.column.name)) return null;
+      const cats = props.categories || [];
+      const anyPaused = props.column.tasks.some(function (tk) { return tk.paused; });
+      const anyCategorized = props.column.tasks.some(function (tk) { return tk.category; });
+      if (!cats.length && !anyPaused && !anyCategorized) return null;
+      const groups = groupTasksByCategory(props.column.tasks, cats);
+      // A single active group with nothing paused is just the flat list —
+      // don't add a header for it.
+      if (groups.length <= 1 && !anyPaused) return null;
+      return groups;
+    }, [props.column, props.categories]);
+
+    const renderCard = function (tk) {
+      return h(TaskCard, {
+        key: tk.id, task: tk,
+        categories: props.categories,
+        selected: props.selectedIds.has(tk.id),
+        failed: props.failedIds && props.failedIds.has(tk.id),
+        draggingTaskId: props.draggingTaskId,
+        draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
+        toggleSelected: props.toggleSelected,
+        toggleRange: props.toggleRange,
+        onOpen: props.onOpen,
+        onTogglePause: props.onTogglePause,
+        onDelete: props.onDelete,
+      });
+    };
+
     const colHelp = getColumnHelp(t, props.column.name);
     const colLabel = getColumnLabel(t, props.column.name);
 
@@ -2786,34 +2872,30 @@
                     h("span", { className: "hermes-kanban-lane-name" }, lane.assignee),
                     h("span", { className: "hermes-kanban-lane-count" }, lane.tasks.length),
                   ),
-                  lane.tasks.map(function (tk) {
-                    return h(TaskCard, {
-                      key: tk.id, task: tk,
-                      selected: props.selectedIds.has(tk.id),
-                      failed: props.failedIds && props.failedIds.has(tk.id),
-                      draggingTaskId: props.draggingTaskId,
-                      draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
-                      toggleSelected: props.toggleSelected,
-                      toggleRange: props.toggleRange,
-                      onOpen: props.onOpen,
-                      onTogglePause: props.onTogglePause,
-                    });
-                  }),
+                  lane.tasks.map(renderCard),
                 );
               })
-            : props.column.tasks.map(function (tk) {
-                return h(TaskCard, {
-                  key: tk.id, task: tk,
-                  selected: props.selectedIds.has(tk.id),
-                  failed: props.failedIds && props.failedIds.has(tk.id),
-                  draggingTaskId: props.draggingTaskId,
-                  draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
-                  toggleSelected: props.toggleSelected,
-                  toggleRange: props.toggleRange,
-                  onOpen: props.onOpen,
-                  onTogglePause: props.onTogglePause,
-                });
-              }),
+            : catGroups
+              ? catGroups.map(function (grp) {
+                  return h("div", {
+                    key: grp.key,
+                    className: cn(
+                      "hermes-kanban-catgroup",
+                      grp.paused ? "hermes-kanban-catgroup--paused" : "",
+                    ),
+                  },
+                    h("div", { className: "hermes-kanban-catgroup-head",
+                               title: grp.paused
+                                 ? "Paused tasks — the dispatcher skips these"
+                                 : ("Category: " + grp.name) },
+                      h("span", { className: "hermes-kanban-catgroup-icon" }, grp.icon),
+                      h("span", { className: "hermes-kanban-catgroup-name" }, grp.name),
+                      h("span", { className: "hermes-kanban-catgroup-count" }, grp.tasks.length),
+                    ),
+                    grp.tasks.map(renderCard),
+                  );
+                })
+              : props.column.tasks.map(renderCard),
       ),
     );
   }
@@ -2929,6 +3011,33 @@
       props.toggleSelected(t.id, true);
     };
 
+    // Right-click context menu. Surfaces the per-card verbs (open, pause/
+    // resume, delete) on a real menu instead of only inline glyphs. Position
+    // is clamped to the viewport so a card near an edge still shows in full.
+    const [menuPos, setMenuPos] = useState(null);
+    const closeMenu = function () { setMenuPos(null); };
+    const handleContextMenu = function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      const MW = 190, MH = 150;
+      const x = Math.min(e.clientX, window.innerWidth - MW);
+      const y = Math.min(e.clientY, window.innerHeight - MH);
+      setMenuPos({ x: Math.max(4, x), y: Math.max(4, y) });
+    };
+    useEffect(function () {
+      if (!menuPos) return undefined;
+      const onKey = function (e) { if (e.key === "Escape") closeMenu(); };
+      window.addEventListener("keydown", onKey);
+      window.addEventListener("resize", closeMenu);
+      window.addEventListener("scroll", closeMenu, true);
+      return function () {
+        window.removeEventListener("keydown", onKey);
+        window.removeEventListener("resize", closeMenu);
+        window.removeEventListener("scroll", closeMenu, true);
+      };
+    }, [menuPos]);
+    const canPause = (t.paused || PAUSEABLE_STATUSES.has(t.status)) && props.onTogglePause;
+
     const progress = t.progress;
     const needsAssignee = t.status === "ready" && !t.assignee;
 
@@ -2950,6 +3059,7 @@
       onDragStart: handleDragStart,
       onClick: handleClick,
       onKeyDown: handleKeyDown,
+      onContextMenu: handleContextMenu,
     },
       h(Card, null,
         h(CardContent, { className: "hermes-kanban-card-content" },
@@ -2992,6 +3102,17 @@
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
                            title: `Tenant: ${t.tenant}. Free-form tag for grouping tasks (customer, project, team).` }, t.tenant)
               : null,
+            (function () {
+              if (!t.category) return null;
+              const cm = categoryMap(props.categories);
+              const meta = cm[t.category];
+              if (!meta) return null;
+              return h(Badge, {
+                variant: "outline",
+                className: "hermes-kanban-category-badge",
+                title: `Category: ${meta.name}`,
+              }, meta.icon, " ", meta.name);
+            })(),
             progress
               ? h("span", {
                   className: cn(
@@ -3083,6 +3204,48 @@
           ),
         ),
       ),
+      menuPos
+        ? h("div", {
+            className: "hermes-kanban-context-menu-backdrop",
+            onClick: function (e) { e.stopPropagation(); closeMenu(); },
+            onContextMenu: function (e) { e.preventDefault(); e.stopPropagation(); closeMenu(); },
+          })
+        : null,
+      menuPos
+        ? h("div", {
+            className: "hermes-kanban-context-menu",
+            style: { left: menuPos.x + "px", top: menuPos.y + "px" },
+            onClick: function (e) { e.stopPropagation(); },
+          },
+            h("button", {
+              type: "button",
+              className: "hermes-kanban-context-menu-item",
+              onClick: function () { closeMenu(); props.onOpen(t.id); },
+            }, "🔍 " + tx(i18n, "openDetails", "Open details")),
+            canPause
+              ? h("button", {
+                  type: "button",
+                  className: "hermes-kanban-context-menu-item",
+                  onClick: function () {
+                    closeMenu();
+                    props.onTogglePause(t.id, !t.paused);
+                  },
+                }, t.paused
+                    ? "▶ " + tx(i18n, "resumeShort", "Resume")
+                    : "‖ " + tx(i18n, "pauseShort", "Pause"))
+              : null,
+            props.onDelete
+              ? h("button", {
+                  type: "button",
+                  className: "hermes-kanban-context-menu-item hermes-kanban-context-menu-item--danger",
+                  onClick: function () {
+                    closeMenu();
+                    props.onDelete(t.id);
+                  },
+                }, "🗑 " + tx(i18n, "delete", "Delete"))
+              : null,
+          )
+        : null,
     );
   }
 
@@ -3531,6 +3694,7 @@
           renderMarkdown: props.renderMarkdown,
           allTasks: props.allTasks,
           assignees: props.assignees || [],
+          categories: props.categories || [],
           boardSlug: boardSlug,
           onPatch: doPatch,
           onSpecify: doSpecify,
@@ -3709,6 +3873,7 @@
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
+        h(CategoryEditor, { task: t, categories: props.categories, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
         h(MetaRow, {
@@ -4146,6 +4311,37 @@
         },
         className: "h-7 text-xs w-20",
       }),
+    );
+  }
+
+  // Manual "change category" control in the drawer. A native <select> over
+  // the board catalog plus an Uncategorized option; the empty value clears
+  // the category (PATCH treats "" as a clear). Hidden when the board has no
+  // catalog at all — nothing to pick from.
+  function CategoryEditor(props) {
+    const { t } = useI18n();
+    const cats = props.categories || [];
+    const current = props.task.category || "";
+    const onChange = function (e) {
+      const val = e.target.value;
+      if (val === current) return;
+      props.onPatch({ category: val });
+    };
+    if (!cats.length && !current) return null;
+    return h("div", { className: "hermes-kanban-meta-row" },
+      h("span", { className: "hermes-kanban-meta-label" }, tx(t, "category", "Category")),
+      h("select", {
+        className: "hermes-kanban-category-select",
+        value: current,
+        onChange: onChange,
+        title: tx(t, "changeCategory", "Change this task's category"),
+      },
+        h("option", { value: "" }, tx(t, "uncategorized", "— Uncategorized —")),
+        cats.map(function (c) {
+          return h("option", { key: c.key, value: c.key },
+            `${c.icon} ${c.name}`);
+        }),
+      ),
     );
   }
 

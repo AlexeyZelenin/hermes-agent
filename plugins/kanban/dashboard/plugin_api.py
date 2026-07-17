@@ -542,12 +542,19 @@ def get_board(
             )
         ]
 
+        # Category catalog for the backlog grouping (name + icon per key).
+        categories = [
+            {"key": c.key, "name": c.name, "icon": c.icon, "sort": c.sort}
+            for c in kanban_db.list_categories(conn)
+        ]
+
         return {
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "categories": categories,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
@@ -674,6 +681,9 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    # Category key from the board catalog (managed set). Unknown keys are
+    # dropped to NULL by create_task rather than rejected.
+    category: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -706,6 +716,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            category=payload.category,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -904,6 +915,9 @@ class UpdateTaskBody(BaseModel):
     # First-class pause toggle. True pauses (dispatcher skips, status
     # preserved), False resumes. None leaves the flag untouched.
     paused: Optional[bool] = None
+    # Category assignment. A key sets it (must exist in the catalog); the
+    # empty string clears it (uncategorized). None leaves it untouched.
+    category: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -998,6 +1012,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 ok, err = kanban_db.resume_task(conn, task_id, actor="dashboard")
             if not ok:
                 raise HTTPException(status_code=409, detail=err or "pause toggle failed")
+
+        # --- category -----------------------------------------------------
+        # Empty string clears (uncategorized); a non-empty key must resolve
+        # against the catalog (managed set).
+        if payload.category is not None:
+            cat = payload.category.strip() or None
+            ok, err = kanban_db.set_task_category(
+                conn, task_id, cat, actor="dashboard",
+            )
+            if not ok:
+                raise HTTPException(status_code=400, detail=err or "invalid category")
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
@@ -2034,6 +2059,65 @@ def get_assignees(board: Optional[str] = Query(None)):
     conn = _conn(board=board)
     try:
         return {"assignees": kanban_db.known_assignees(conn)}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Category catalog — list / upsert / delete (managed set; name + icon)
+# ---------------------------------------------------------------------------
+
+class CategoryBody(BaseModel):
+    key: str
+    name: Optional[str] = None
+    icon: Optional[str] = None
+    sort: Optional[int] = None
+
+
+@router.get("/categories")
+def list_categories(board: Optional[str] = Query(None)):
+    """Return the board's category catalog (ordered by sort, then name)."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {
+            "categories": [
+                {"key": c.key, "name": c.name, "icon": c.icon, "sort": c.sort}
+                for c in kanban_db.list_categories(conn)
+            ]
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/categories")
+def upsert_category(payload: CategoryBody, board: Optional[str] = Query(None)):
+    """Create or update a catalog entry (upsert by key)."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        cat = kanban_db.upsert_category(
+            conn, payload.key,
+            name=payload.name, icon=payload.icon, sort=payload.sort,
+        )
+        return {"category": {"key": cat.key, "name": cat.name,
+                             "icon": cat.icon, "sort": cat.sort}}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+@router.delete("/categories/{key}")
+def delete_category(key: str, board: Optional[str] = Query(None)):
+    """Delete a catalog entry; referring tasks become uncategorized."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ok = kanban_db.remove_category(conn, key)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"unknown category {key!r}")
+        return {"ok": True}
     finally:
         conn.close()
 

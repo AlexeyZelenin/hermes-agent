@@ -230,6 +230,67 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- Category groups (auto-grouped backlog) -------------------------- */
+
+.hermes-kanban-catgroup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.25rem 0 0.35rem;
+  border-top: 1px dashed color-mix(in srgb, var(--color-border) 70%, transparent);
+}
+.hermes-kanban-catgroup:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+/* Paused section sits at the bottom; a slightly heavier rule + dimmed cards
+ * separate "held" work from the live backlog above it. */
+.hermes-kanban-catgroup--paused {
+  border-top: 1px solid color-mix(in srgb, var(--color-border) 90%, transparent);
+  margin-top: 0.25rem;
+}
+.hermes-kanban-catgroup--paused :where(.hermes-kanban-card) {
+  opacity: 0.72;
+}
+.hermes-kanban-catgroup-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.65rem;
+  letter-spacing: 0.02em;
+  color: var(--color-muted-foreground);
+  padding: 0 0.1rem;
+}
+.hermes-kanban-catgroup-icon {
+  font-size: 0.85rem;
+  line-height: 1;
+}
+.hermes-kanban-catgroup-name {
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.hermes-kanban-catgroup-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+/* Per-card category badge (icon + name) on the card meta row. */
+.hermes-kanban-category-badge {
+  font-size: 0.62rem;
+  white-space: nowrap;
+}
+/* Drawer "change category" picker. */
+.hermes-kanban-category-select {
+  flex: 1;
+  min-width: 0;
+  height: 1.75rem;
+  font-size: 0.75rem;
+  padding: 0 0.4rem;
+  border-radius: var(--radius, 0.375rem);
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+  color: var(--color-foreground);
+}
+
 /* ---- Card ------------------------------------------------------------ */
 
 .hermes-kanban-card {
@@ -1644,4 +1705,55 @@
 
 .hermes-kanban-trash-label {
   font-weight: 500;
+}
+
+/* ---- Card right-click context menu ----------------------------------- */
+/* Full-viewport catcher so a click (or another right-click) anywhere off
+   the menu dismisses it. */
+.hermes-kanban-context-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+}
+
+.hermes-kanban-context-menu {
+  position: fixed;
+  z-index: 91;
+  min-width: 9rem;
+  padding: 0.25rem;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 20px color-mix(in srgb, var(--color-foreground) 18%, transparent);
+}
+
+.hermes-kanban-context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+  line-height: 1.2;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 0.25rem;
+  cursor: pointer;
+  /* Ordinary actions read near-black; bright red is reserved for delete. */
+  color: var(--color-foreground);
+}
+
+.hermes-kanban-context-menu-item:hover {
+  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+}
+
+.hermes-kanban-context-menu-item--danger {
+  color: var(--color-destructive, #d14a4a);
+}
+
+.hermes-kanban-context-menu-item--danger:hover {
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 12%, transparent);
 }

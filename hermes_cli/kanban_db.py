@@ -108,6 +108,31 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # (not paused); terminal states ('done'/'archived') have nothing to hold.
 VALID_PAUSE_STATUSES = {"triage", "todo", "ready"}
 
+# ---------------------------------------------------------------------------
+# Task categories — a per-board CATALOG (name + icon) that a task's
+# ``category`` column references. Deliberately a managed set, not free text:
+# the planner auto-assigns from the catalog and the dashboard groups the
+# backlog by it, so an unbounded free-form field would splinter the grouping
+# (same discipline the memory/scope subsystems apply). NULL category = an
+# ``Uncategorized`` bucket the UI renders last.
+#
+# Seeded once (on first creation of an empty ``task_categories`` table) with
+# the operator's original icon groups — 🖥️ engine-room / ⚙️ mechanics /
+# 🚀 product / 🧠 intelligence. Operators curate freely afterwards
+# (``kanban category add/rm``); a non-empty catalog is never re-seeded.
+DEFAULT_CATEGORIES: tuple[tuple[str, str, str], ...] = (
+    # (key, display name, icon)
+    ("engine-room", "Engine room", "🖥️"),
+    ("mechanics", "Mechanics", "⚙️"),
+    ("product", "Product", "🚀"),
+    ("intelligence", "Intelligence", "🧠"),
+)
+
+# Icon shown for tasks whose ``category`` is NULL / unknown.
+UNCATEGORIZED_ICON = "📥"
+
+_CATEGORY_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -1104,6 +1129,10 @@ class Task:
     # promotion and spawn while its ``status`` is preserved unchanged. Resume =
     # set back to False. Orthogonal to status; see the SCHEMA_SQL column note.
     paused: bool = False
+    # Category key referencing the per-board ``task_categories`` catalog. NULL
+    # (the default) means uncategorized — the UI groups those last. Set by the
+    # planner at decompose time and editable via ``set_task_category``.
+    category: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1194,6 +1223,9 @@ class Task:
             paused=(
                 bool(row["paused"]) if "paused" in keys and row["paused"] else False
             ),
+            category=(
+                row["category"] if "category" in keys and row["category"] else None
+            ),
         )
 
 
@@ -1248,6 +1280,32 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+        )
+
+
+@dataclass
+class Category:
+    """In-memory view of a ``task_categories`` row — one catalog entry.
+
+    ``key`` is the stable slug stored on ``tasks.category``; ``name`` and
+    ``icon`` are display-only and freely editable. ``sort`` orders the
+    groups in the dashboard backlog (ascending; ties broken by name).
+    """
+
+    key: str
+    name: str
+    icon: str
+    sort: int
+    created_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Category":
+        return cls(
+            key=row["key"],
+            name=row["name"],
+            icon=row["icon"],
+            sort=int(row["sort"]) if row["sort"] is not None else 0,
+            created_at=int(row["created_at"]) if row["created_at"] is not None else 0,
         )
 
 
@@ -1390,7 +1448,25 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ineligible in both promotion (recompute_ready) and spawn (dispatch tick),
     -- so a paused task is deterministically skipped without losing "what it
     -- was". 0 = active (the default and prior behaviour for every existing row).
-    paused               INTEGER NOT NULL DEFAULT 0
+    paused               INTEGER NOT NULL DEFAULT 0,
+    -- Category key referencing the per-board ``task_categories`` catalog (a
+    -- managed name+icon set, NOT free text). NULL = uncategorized — the
+    -- dashboard groups those in a trailing bucket. Set by the planner at
+    -- decompose time and editable via ``set_task_category`` / the dashboard.
+    category             TEXT
+);
+
+-- Per-board CATALOG of task categories (name + icon). A task's ``category``
+-- column references ``key`` here. Deliberately a managed set, not free text,
+-- so the planner auto-assigns from a bounded vocabulary and the dashboard can
+-- group the backlog by category with a consistent per-category icon. Seeded
+-- once with DEFAULT_CATEGORIES on first creation; operators curate afterwards.
+CREATE TABLE IF NOT EXISTS task_categories (
+    key        TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    icon       TEXT NOT NULL,
+    sort       INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2221,6 +2297,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "paused", "paused INTEGER NOT NULL DEFAULT 0"
         )
 
+    if "category" not in cols:
+        # Category catalog key. Existing rows get NULL (uncategorized), which
+        # the dashboard renders in a trailing bucket — no behaviour change for
+        # rows that predate the column.
+        _add_column_if_missing(conn, "tasks", "category", "category TEXT")
+
+    # Seed the category catalog on first creation only. ``task_categories`` is
+    # created by SCHEMA_SQL just above; seed the operator's original icon groups
+    # when it is still empty so a fresh board starts curated. A non-empty
+    # catalog (operator has curated) is never re-seeded — deleting entries is a
+    # deliberate managed-set action, not something the migration should undo.
+    _seed_default_categories(conn)
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2685,6 +2774,7 @@ def create_task(
     model_override: Optional[str] = None,
     effort_override: Optional[str] = None,
     append_system_prompt: Optional[str] = None,
+    category: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2799,6 +2889,14 @@ def create_task(
         append_system_prompt = (
             getattr(project_obj, "append_system_prompt", None) or None
         )
+
+    # Category must reference an existing catalog entry (managed set). An
+    # unknown key is dropped to NULL rather than raising: the planner may
+    # occasionally emit a stale key and a task should still be created
+    # (uncategorized) instead of failing the whole create.
+    category = str(category or "").strip().lower() or None
+    if category is not None and get_category(conn, category) is None:
+        category = None
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2960,8 +3058,9 @@ def create_task(
                         effort_override, append_system_prompt,
                         tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        category
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2988,6 +3087,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        category,
                     ),
                 )
                 for pid in parents:
@@ -5593,6 +5693,175 @@ def promote_task(
     return True, None
 
 
+# ---------------------------------------------------------------------------
+# Task categories — catalog CRUD + per-task assignment
+# ---------------------------------------------------------------------------
+
+def _normalize_category_key(key: str) -> str:
+    """Validate + canonicalise a category key (a stable slug).
+
+    Keys are lowercase ``[a-z0-9-]`` slugs so they are stable references and
+    URL/CLI-safe. Raises ``ValueError`` on an empty or malformed key.
+    """
+    slug = (key or "").strip().lower()
+    if not slug:
+        raise ValueError("category key is required")
+    if not _CATEGORY_KEY_RE.match(slug):
+        raise ValueError(
+            f"invalid category key {key!r}: use a lowercase slug of letters, "
+            "digits, and hyphens (max 40 chars), e.g. 'engine-room'"
+        )
+    return slug
+
+
+def _seed_default_categories(conn: sqlite3.Connection) -> None:
+    """Insert DEFAULT_CATEGORIES when the catalog is empty (first creation).
+
+    Idempotent and non-destructive: does nothing once the operator has any
+    categories, so curation (add/rm) is never clobbered by a later connect().
+    """
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM task_categories").fetchone()
+    except sqlite3.OperationalError:
+        return  # table not present yet (pre-SCHEMA_SQL call ordering) — skip
+    if row and int(row["n"]) > 0:
+        return
+    now = int(time.time())
+    with write_txn(conn):
+        for idx, (key, name, icon) in enumerate(DEFAULT_CATEGORIES):
+            conn.execute(
+                "INSERT OR IGNORE INTO task_categories "
+                "(key, name, icon, sort, created_at) VALUES (?, ?, ?, ?, ?)",
+                (key, name, icon, idx, now),
+            )
+
+
+def list_categories(conn: sqlite3.Connection) -> list[Category]:
+    """Return the board's category catalog, ordered by ``sort`` then name."""
+    rows = conn.execute(
+        "SELECT key, name, icon, sort, created_at FROM task_categories "
+        "ORDER BY sort ASC, name ASC"
+    ).fetchall()
+    return [Category.from_row(r) for r in rows]
+
+
+def get_category(conn: sqlite3.Connection, key: str) -> Optional[Category]:
+    """Return one catalog entry by key, or ``None`` if absent."""
+    slug = (key or "").strip().lower()
+    if not slug:
+        return None
+    row = conn.execute(
+        "SELECT key, name, icon, sort, created_at FROM task_categories WHERE key = ?",
+        (slug,),
+    ).fetchone()
+    return Category.from_row(row) if row else None
+
+
+def upsert_category(
+    conn: sqlite3.Connection,
+    key: str,
+    *,
+    name: Optional[str] = None,
+    icon: Optional[str] = None,
+    sort: Optional[int] = None,
+) -> Category:
+    """Create or update a catalog entry. Returns the resulting Category.
+
+    On update, only the provided fields change; omitted ones are preserved.
+    A first-time insert requires both ``name`` and ``icon``. ``icon`` is
+    capped at 8 chars (an emoji or short glyph, matching the chat convention).
+    """
+    slug = _normalize_category_key(key)
+    existing = get_category(conn, slug)
+    now = int(time.time())
+    if existing is None:
+        if not (name and name.strip()):
+            raise ValueError("a new category requires a name")
+        if not (icon and icon.strip()):
+            raise ValueError("a new category requires an icon")
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_categories (key, name, icon, sort, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    slug,
+                    name.strip()[:60],
+                    icon.strip()[:8],
+                    int(sort) if sort is not None else 0,
+                    now,
+                ),
+            )
+        return get_category(conn, slug)  # type: ignore[return-value]
+
+    new_name = name.strip()[:60] if (name and name.strip()) else existing.name
+    new_icon = icon.strip()[:8] if (icon and icon.strip()) else existing.icon
+    new_sort = int(sort) if sort is not None else existing.sort
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_categories SET name = ?, icon = ?, sort = ? WHERE key = ?",
+            (new_name, new_icon, new_sort, slug),
+        )
+    return get_category(conn, slug)  # type: ignore[return-value]
+
+
+def remove_category(conn: sqlite3.Connection, key: str) -> bool:
+    """Delete a catalog entry and clear it off any task that referenced it.
+
+    Returns True if a row was deleted, False if the key was unknown. Tasks
+    pointing at the removed key fall back to NULL (uncategorized) in the same
+    transaction so no task keeps a dangling reference.
+    """
+    slug = (key or "").strip().lower()
+    if not slug:
+        return False
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET category = NULL WHERE category = ?", (slug,)
+        )
+        cur = conn.execute("DELETE FROM task_categories WHERE key = ?", (slug,))
+        return cur.rowcount > 0
+
+
+def set_task_category(
+    conn: sqlite3.Connection,
+    task_id: str,
+    category: Optional[str],
+    *,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Set (or clear, with ``category=None``) a task's category.
+
+    Validates that a non-null category exists in the catalog — the managed-set
+    discipline: a task can only reference a real catalog entry. Returns
+    ``(True, None)`` on success or ``(False, reason)`` if the task or category
+    is unknown.
+    """
+    slug: Optional[str] = None
+    if category is not None:
+        slug = (category or "").strip().lower() or None
+    row = conn.execute(
+        "SELECT category FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    if slug is not None and get_category(conn, slug) is None:
+        return False, (
+            f"unknown category {category!r}; add it first with "
+            "`kanban category add` (categories are a managed set)"
+        )
+    if row["category"] == slug:
+        return True, None  # idempotent no-op
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET category = ? WHERE id = ?", (slug, task_id)
+        )
+        _append_event(
+            conn, task_id, "categorized",
+            {"category": slug, "actor": actor},
+        )
+    return True, None
+
+
 def pause_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5910,6 +6179,11 @@ def decompose_triage_task(
     if _seen != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
 
+    # Resolve the valid category vocabulary once (managed set). A child whose
+    # planner-supplied category isn't in the catalog falls back to NULL rather
+    # than aborting the whole fan-out — same lenient policy as create_task.
+    _valid_categories = {c.key for c in list_categories(conn)}
+
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
     # ``todo``, or nothing changes. We deliberately do NOT call any
@@ -5982,12 +6256,16 @@ def decompose_triage_task(
             else:
                 child_ws_path = None
             child_model = str(child.get("model_override") or "").strip() or root_model
+            child_category = str(child.get("category") or "").strip().lower() or None
+            if child_category is not None and child_category not in _valid_categories:
+                child_category = None
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by, "
-                " executor, model_override, project_id, append_system_prompt) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " executor, model_override, project_id, append_system_prompt, "
+                " category) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6002,6 +6280,7 @@ def decompose_triage_task(
                     child_model,
                     root_project_id,
                     root_append_prompt,
+                    child_category,
                 ),
             )
             _append_event(

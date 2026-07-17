@@ -66,6 +66,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "assignee": t.assignee,
         "status": t.status,
         "paused": bool(t.paused),
+        "category": t.category,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -348,6 +349,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
+    p_create.add_argument("--category", default=None,
+                          help="Category key from the board catalog (managed "
+                               "set; see `hermes kanban category list`). Unknown "
+                               "keys are ignored (task stays uncategorized).")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
@@ -705,6 +710,40 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit machine-readable JSON result",
     )
 
+    # --- category catalog + per-task assignment ---
+    p_cat = sub.add_parser(
+        "category",
+        aliases=["categories"],
+        help="Manage the board's category catalog (name + icon)",
+    )
+    cat_sub = p_cat.add_subparsers(dest="category_action")
+    c_list = cat_sub.add_parser("list", aliases=["ls"], help="List the catalog")
+    c_list.add_argument("--json", action="store_true", help="Emit JSON output")
+    c_add = cat_sub.add_parser(
+        "add", aliases=["set"],
+        help="Add or update a category (upsert by key)",
+    )
+    c_add.add_argument("key", help="Stable slug, e.g. engine-room")
+    c_add.add_argument("--name", default=None, help="Display name")
+    c_add.add_argument("--icon", default=None, help="Emoji or short glyph")
+    c_add.add_argument("--sort", type=int, default=None,
+                       help="Sort order (ascending) in the dashboard")
+    c_add.add_argument("--json", action="store_true", help="Emit JSON output")
+    c_rm = cat_sub.add_parser("rm", aliases=["remove", "delete"],
+                              help="Delete a category (referring tasks become uncategorized)")
+    c_rm.add_argument("key", help="Category key to delete")
+
+    p_setcat = sub.add_parser(
+        "set-category",
+        help="Set (or clear) a task's category",
+    )
+    p_setcat.add_argument("task_id")
+    p_setcat.add_argument(
+        "category",
+        help="Category key from the catalog, or 'none'/'-' to clear",
+    )
+    p_setcat.add_argument("--json", action="store_true", help="Emit JSON output")
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -1048,6 +1087,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "promote":  _cmd_promote,
             "pause":    _cmd_pause,
             "resume":   _cmd_resume,
+            "category": _cmd_category,
+            "categories": _cmd_category,
+            "set-category": _cmd_set_category,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -1469,6 +1511,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
             model_override=getattr(args, "model", None),
+            category=getattr(args, "category", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1656,6 +1699,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
     status_line = f"{task.status}  ⏸ PAUSED (dispatcher skips)" if task.paused else task.status
     print(f"  status:    {status_line}")
     print(f"  assignee:  {task.assignee or '-'}")
+    if task.category:
+        cat = None
+        try:
+            with kb.connect_closing() as _cc:
+                cat = kb.get_category(_cc, task.category)
+        except Exception:
+            cat = None
+        label = f"{cat.icon} {cat.name}" if cat else task.category
+        print(f"  category:  {label}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
@@ -2318,6 +2370,79 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         else:
             print(f"cannot resume {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_category(args: argparse.Namespace) -> int:
+    """Handle ``hermes kanban category <list|add|rm>``."""
+    action = getattr(args, "category_action", None) or "list"
+    as_json = getattr(args, "json", False)
+    if action in ("list", "ls"):
+        with kb.connect_closing() as conn:
+            cats = kb.list_categories(conn)
+        if as_json:
+            print(json.dumps(
+                [{"key": c.key, "name": c.name, "icon": c.icon, "sort": c.sort}
+                 for c in cats],
+                indent=2, ensure_ascii=False))
+            return 0
+        if not cats:
+            print("(no categories — add one with `kanban category add <key> "
+                  "--name ... --icon ...`)")
+            return 0
+        for c in cats:
+            print(f"{c.icon}  {c.key:16s}  {c.name}")
+        return 0
+    if action in ("add", "set"):
+        try:
+            with kb.connect_closing() as conn:
+                cat = kb.upsert_category(
+                    conn, args.key,
+                    name=getattr(args, "name", None),
+                    icon=getattr(args, "icon", None),
+                    sort=getattr(args, "sort", None),
+                )
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        if as_json:
+            print(json.dumps(
+                {"key": cat.key, "name": cat.name, "icon": cat.icon, "sort": cat.sort},
+                indent=2, ensure_ascii=False))
+        else:
+            print(f"Saved category {cat.icon} {cat.key} ({cat.name})")
+        return 0
+    if action in ("rm", "remove", "delete"):
+        with kb.connect_closing() as conn:
+            ok = kb.remove_category(conn, args.key)
+        if not ok:
+            print(f"kanban: unknown category {args.key!r}", file=sys.stderr)
+            return 1
+        print(f"Removed category {args.key} (referring tasks now uncategorized)")
+        return 0
+    print(f"kanban category: unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_set_category(args: argparse.Namespace) -> int:
+    """Set or clear a task's category (``none``/``-`` clears)."""
+    raw = (args.category or "").strip()
+    category = None if raw.lower() in ("none", "-", "") else raw
+    author = _profile_author()
+    with kb.connect_closing() as conn:
+        ok, err = kb.set_task_category(conn, args.task_id, category, actor=author)
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {"task_id": args.task_id, "category": category, "ok": ok, "error": err},
+            indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+    if not ok:
+        print(f"kanban: {err}", file=sys.stderr)
+        return 1
+    if category:
+        print(f"Set category of {args.task_id} to {category}")
+    else:
+        print(f"Cleared category of {args.task_id}")
+    return 0
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:
