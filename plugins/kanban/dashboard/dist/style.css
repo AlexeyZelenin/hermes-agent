@@ -62,6 +62,16 @@
 
 /* ---- Columns layout -------------------------------------------------- */
 
+/*
+ * Fluid board: the plugin root is width:100% of whatever the Hermes host
+ * gives it, and the column row fills that width. When the operator collapses
+ * the Hermes sidebar the host's main column widens (it is flex-1), so the
+ * freed width flows straight into the columns below — no dead strip on the
+ * right. Reflow is pure flexbox: the column grow/shrink recomputes on every
+ * container-width change (sidebar toggle, chat dock open/close, window
+ * resize), so no ResizeObserver is needed for layout. Regression: t_776cf4d8
+ * (collapsed Hermes menu left empty space to the right of the last column).
+ */
 .hermes-kanban-columns {
   display: flex;
   gap: 0.75rem;
@@ -79,7 +89,10 @@
 }
 
 .hermes-kanban-column {
-  flex: 0 0 280px;
+  /* Grow to share all available width (fill 100%, no right-side gap), but
+   * never shrink below 280px so the row overflows into horizontal scroll
+   * once there are more columns than fit — instead of squashing them. */
+  flex: 1 0 280px;
   display: flex;
   flex-direction: column;
   background: color-mix(in srgb, var(--color-card) 85%, transparent);
