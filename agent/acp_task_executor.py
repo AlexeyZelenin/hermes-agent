@@ -197,11 +197,23 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
                                  extra_env={"CLAUDE_CONFIG_DIR": lease.config_dir},
                                  effort=effort, tool_activity_sink=tool_activity_sink)
             text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
-            if not subs.is_usage_limit_error(text) and not subs.is_auth_error(text):
-                return text, client, lease.name
-            limited = text
+            # A completed session/prompt is structurally NOT a limit/auth death:
+            # the request succeeded and this is the task's handoff. Substring-
+            # scanning it (e.g. a report that merely mentions "usage limit
+            # reached on 429") is what discarded committed work and looped the
+            # task. Genuine limit/auth deaths abort the request and arrive as the
+            # typed exceptions handled below, so the returned text is trusted.
+            return text, client, lease.name
         except Exception as exc:
-            if not subs.is_usage_limit_error(str(exc)) and not subs.is_auth_error(str(exc)): raise
+            # Structural signal first (typed error from the ACP client), then a
+            # last-resort substring fallback over the FULL exception text - no
+            # length cap, so a verbose limit/auth exception still rotates instead
+            # of parking the task while the pool is free.
+            from agent.copilot_acp_client import ACPUsageLimitError, ACPAuthError
+            if not isinstance(exc, (ACPUsageLimitError, ACPAuthError)) \
+                    and not subs.is_usage_limit_error(str(exc)) \
+                    and not subs.is_auth_error(str(exc)):
+                raise
             limited = str(exc)
         finally:
             subs.release(lease)
@@ -214,7 +226,7 @@ def run_task(*, executor, task_id, workspace, board=None):
         if not task: raise ValueError(f"unknown task {task_id}")
         context, run_id = kb.build_worker_context(conn, task_id), task.current_run_id
     command,args=command_for(executor)
-    prompt=("You are the sole native external coding-harness session for this already-scoped task. Work only in the supplied cwd; do not orchestrate child tasks. Follow project rules and return a concise factual handoff with tests run. Never create test fixtures on the live kanban board: tests that need a board must spin up an isolated one (set HERMES_KANBAN_HOME to a temp dir) and clean it up in teardown. If the cwd is a git repository and you changed files: run the relevant tests and COMMIT your work (conventional-commits message referencing the task id) before finishing - completing a code task with a dirty tree is a protocol violation; do not push.\n\n"+context)
+    prompt=("You are the sole native external coding-harness session for this already-scoped task. Work only in the supplied cwd; do not orchestrate child tasks. Follow project rules and return a concise factual handoff with tests run. Never create test fixtures against live shared or host state: tests that need a kanban board must spin up an isolated one (set HERMES_KANBAN_HOME to a temp dir); tests that touch the OS keychain, credential stores, or other host state must use a temporary/throwaway store (e.g. a temp keychain via `security create-keychain`) or mock the calls - NEVER the real login keychain or live data, which prompts the user and pollutes their system. Clean up in teardown. If the cwd is a git repository and you changed files: run the relevant tests and COMMIT your work (conventional-commits message referencing the task id) before finishing - completing a code task with a dirty tree is a protocol violation; do not push.\n\n"+context)
     try:
         timeout=float(os.getenv("HERMES_ACP_TIMEOUT_SECONDS", "3600"))
         model=os.getenv("HERMES_KANBAN_MODEL","").strip() or None
