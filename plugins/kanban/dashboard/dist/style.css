@@ -1543,6 +1543,13 @@
   border-color: color-mix(in srgb, var(--color-ring) 40%, var(--color-border));
   color: var(--color-muted-foreground);
 }
+/* The ‖ media-pause glyph: bold two bars, tightened so it reads as a
+   pause icon rather than punctuation. Inherits the muted grey of its
+   badge/toggle so a held card is legible-but-dimmed at a glance. */
+.hermes-kanban-pause-glyph {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
 .hermes-kanban-pause-toggle {
   margin-left: 0.15rem;
   padding: 0 0.2rem;

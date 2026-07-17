@@ -3013,7 +3013,10 @@
                   variant: "outline",
                   className: "hermes-kanban-paused-badge",
                   title: tx(i18n, "pausedHint", "Paused — the dispatcher skips this task. Its status is preserved; resume to re-enable."),
-                }, tx(i18n, "paused", "⏸ Paused"))
+                },
+                  h("span", { className: "hermes-kanban-pause-glyph", "aria-hidden": "true" }, "‖"),
+                  " ",
+                  tx(i18n, "paused", "Paused"))
               : null,
             // Pause/resume toggle — only where a hold makes sense (pre-run
             // statuses) or to lift an existing hold.
@@ -3033,7 +3036,10 @@
                     e.preventDefault();
                     props.onTogglePause(t.id, !t.paused);
                   },
-                }, t.paused ? "▶" : "⏸")
+                },
+                  t.paused
+                    ? "▶"
+                    : h("span", { className: "hermes-kanban-pause-glyph", "aria-hidden": "true" }, "‖"))
               : null,
           ),
           h("div", { className: "hermes-kanban-card-title" },
