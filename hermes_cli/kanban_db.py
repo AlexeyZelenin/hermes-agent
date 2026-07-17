@@ -4491,6 +4491,10 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
+    # Janitor pass: for preserved (dir/worktree) workspaces, detect a dirty tree
+    # or stray files left behind and route them to the reviewer stage. Never
+    # commits — detection and routing only (t_7f2f37f8).
+    _janitor_dir_workspace(conn, task_id, run_id)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -4919,6 +4923,176 @@ def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
             _log.debug("Killed stale tmux session: %s", session)
     except Exception:
         pass  # best-effort — never block completion
+
+
+# ---------------------------------------------------------------------------
+# Post-completion janitor: dirty-tree / stray-file detection (t_7f2f37f8)
+# ---------------------------------------------------------------------------
+#
+# Scratch workspaces are wiped by ``_cleanup_workspace`` on completion, so they
+# cannot strand uncommitted work. ``dir`` and ``worktree`` workspaces are
+# preserved by design, and sessions occasionally complete leaving changes
+# uncommitted or files written outside the declared workspace (the overseer
+# previously hand-committed each). The janitor DETECTS and ROUTES only — it
+# never commits or discards, because it cannot judge whether the changes are
+# correct. That decision belongs to the reviewer stage (t_caa5f626).
+
+# Cap on how many changed paths we enumerate in the event payload / comment. A
+# tree with thousands of dirty entries (e.g. a stray build dir) should still
+# route to the reviewer without bloating the board DB or the comment thread.
+_JANITOR_MAX_LISTED_PATHS = 100
+
+
+def _git_status_porcelain_entries(repo_root: Path) -> Optional[list[tuple[str, str]]]:
+    """Return ``(status_code, repo_relative_path)`` for every dirty entry.
+
+    Paths are relative to ``repo_root`` (git porcelain semantics, verified) and
+    renames/copies resolve to the destination path. ``core.quotePath=false``
+    keeps non-ASCII paths readable, and ``--untracked-files=all`` expands
+    untracked directories to individual files. Returns ``None`` when git cannot
+    be queried (not a repo, git missing, non-zero exit, timeout) so callers can
+    distinguish "clean" (``[]``) from "unknown".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "-c", "core.quotePath=false",
+                "status", "--porcelain", "--untracked-files=all",
+            ],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    entries: list[tuple[str, str]] = []
+    for line in (result.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        code = line[:2]
+        rest = line[3:]
+        # Rename/copy lines read "R  old -> new"; the destination is what exists.
+        if " -> " in rest:
+            rest = rest.split(" -> ", 1)[1]
+        rest = rest.strip()
+        if rest:
+            entries.append((code, rest))
+    return entries
+
+
+def _janitor_dir_workspace(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int]
+) -> None:
+    """Detect a dirty tree / stray files after a ``dir``/``worktree`` completion.
+
+    On a dirty tree this appends a human-readable ``janitor`` comment listing
+    the changed files and records a ``completion_dirty_tree`` event carrying the
+    file lists, so the reviewer stage (t_caa5f626) can find suspect completions
+    and decide commit vs discard. Files changed inside the repo but OUTSIDE the
+    declared workspace (stray sibling paths) are reported separately.
+
+    Never commits or discards. Best-effort: any error is swallowed so the
+    janitor never blocks or reverses a completion.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return
+        kind: Optional[str] = row["workspace_kind"]
+        path: Optional[str] = row["workspace_path"]
+        # Only preserved workspaces can strand work; scratch is already gone.
+        if kind not in ("dir", "worktree") or not path:
+            return
+        workspace = Path(path).expanduser()
+        if not workspace.is_dir():
+            return
+        repo_root = _git_toplevel(workspace)
+        if repo_root is None:
+            return  # not a git repo — nothing to reconcile
+        entries = _git_status_porcelain_entries(repo_root)
+        if not entries:
+            return  # clean, or git unavailable — either way nothing to route
+        try:
+            workspace_resolved = workspace.resolve(strict=False)
+        except OSError:
+            workspace_resolved = workspace
+
+        in_workspace: list[str] = []
+        stray: list[str] = []
+        for code, rel in entries:
+            abs_path = (repo_root / rel).resolve(strict=False)
+            try:
+                inside = abs_path.is_relative_to(workspace_resolved)
+            except ValueError:
+                inside = False
+            (in_workspace if inside else stray).append(f"{code} {rel}")
+
+        total = len(in_workspace) + len(stray)
+        listed_in = in_workspace[:_JANITOR_MAX_LISTED_PATHS]
+        listed_stray = stray[: max(0, _JANITOR_MAX_LISTED_PATHS - len(listed_in))]
+        truncated = total > len(listed_in) + len(listed_stray)
+        # A shared ``dir`` checkout at the repo root reflects every worker's
+        # uncommitted changes, so the list may not be solely this task's work.
+        shared_checkout = kind == "dir" and workspace_resolved == repo_root
+
+        payload = {
+            "workspace_kind": kind,
+            "workspace_path": str(workspace),
+            "repo_root": str(repo_root),
+            "dirty_count": total,
+            "in_workspace": listed_in,
+            "stray_outside_workspace": listed_stray,
+            "truncated": truncated,
+            "shared_checkout": shared_checkout,
+            "note": (
+                "janitor detection only — the reviewer stage decides commit vs "
+                "discard; the janitor never auto-commits"
+            ),
+        }
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_dirty_tree", payload, run_id=run_id
+            )
+
+        lines = [
+            f"⚠️ Janitor: {kind} workspace left {total} uncommitted "
+            "change(s) after completion — routing to reviewer "
+            "(never auto-committed).",
+            f"repo: {repo_root}",
+            f"workspace: {workspace}",
+        ]
+        if listed_in:
+            lines.append("")
+            lines.append("Changed inside workspace:")
+            lines.extend(f"  {e}" for e in listed_in)
+        if listed_stray:
+            lines.append("")
+            lines.append(
+                "Stray changes elsewhere in repo (outside declared workspace):"
+            )
+            lines.extend(f"  {e}" for e in listed_stray)
+        if truncated:
+            shown = len(listed_in) + len(listed_stray)
+            lines.append("")
+            lines.append(
+                f"... {total - shown} more not listed "
+                f"(capped at {_JANITOR_MAX_LISTED_PATHS})."
+            )
+        if shared_checkout:
+            lines.append("")
+            lines.append(
+                "Note: this is a shared checkout at the repo root — the list "
+                "may include other workers' uncommitted changes."
+            )
+        try:
+            add_comment(conn, task_id, "janitor", "\n".join(lines))
+        except Exception:
+            pass
+    except Exception:
+        pass  # best-effort — never block or reverse a completion
 
 
 # ---------------------------------------------------------------------------

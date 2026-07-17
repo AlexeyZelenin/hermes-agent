@@ -2762,6 +2762,142 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
     assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
 
 
+# ---------------------------------------------------------------------------
+# Post-completion janitor: dirty-tree / stray-file detection (t_7f2f37f8)
+# ---------------------------------------------------------------------------
+
+
+def _dirty_tree_events(conn, task_id):
+    return [e for e in kb.list_events(conn, task_id) if e.kind == "completion_dirty_tree"]
+
+
+def test_janitor_flags_dirty_dir_workspace(kanban_home, tmp_path):
+    """A dir workspace left dirty routes to review via event + comment; no commit."""
+    repo = tmp_path / "proj"
+    _init_git_repo(repo)
+    (repo / "leftover.py").write_text("print('uncommitted')\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="build", workspace_kind="dir", workspace_path=str(repo)
+        )
+        assert kb.complete_task(conn, t, result="done")
+
+        events = _dirty_tree_events(conn, t)
+        assert len(events) == 1, "one completion_dirty_tree event expected"
+        payload = events[0].payload
+        assert payload["dirty_count"] == 1
+        assert payload["in_workspace"] == ["?? leftover.py"]
+        assert payload["stray_outside_workspace"] == []
+        assert payload["shared_checkout"] is True
+
+        comments = kb.list_comments(conn, t)
+        assert any(c.author == "janitor" and "leftover.py" in c.body for c in comments)
+        # Task stays done — the janitor routes, it does not reverse completion.
+        assert kb.get_task(conn, t).status == "done"
+
+    # Never auto-committed: the file is still uncommitted after completion.
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "leftover.py" in status.stdout
+
+
+def test_janitor_silent_on_clean_dir_workspace(kanban_home, tmp_path):
+    """A clean dir workspace produces no dirty-tree event and no janitor comment."""
+    repo = tmp_path / "proj"
+    _init_git_repo(repo)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="clean build", workspace_kind="dir", workspace_path=str(repo)
+        )
+        assert kb.complete_task(conn, t, result="done")
+        assert _dirty_tree_events(conn, t) == []
+        assert [c for c in kb.list_comments(conn, t) if c.author == "janitor"] == []
+
+
+def test_janitor_detects_stray_files_outside_workspace(kanban_home, tmp_path):
+    """Files changed in the repo but outside the declared workspace are flagged stray."""
+    repo = tmp_path / "proj"
+    _init_git_repo(repo)
+    workspace = repo / "sub"
+    workspace.mkdir()
+    (workspace / "keep.py").write_text("x=1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "sub"], check=True, capture_output=True
+    )
+    # Dirty inside the declared workspace...
+    (workspace / "inside.py").write_text("y=2\n", encoding="utf-8")
+    # ...and a stray file elsewhere in the same repo.
+    (repo / "Projects").mkdir()
+    (repo / "Projects" / "stray.md").write_text("oops\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="scoped build", workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        assert kb.complete_task(conn, t, result="done")
+        payload = _dirty_tree_events(conn, t)[0].payload
+
+    assert payload["in_workspace"] == ["?? sub/inside.py"]
+    assert payload["stray_outside_workspace"] == ["?? Projects/stray.md"]
+    assert payload["shared_checkout"] is False
+
+
+def test_janitor_ignores_scratch_workspace(kanban_home):
+    """Scratch workspaces are wiped on completion — the janitor must not fire."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="scratchy")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        assert kb.complete_task(conn, t, result="ok")
+        assert _dirty_tree_events(conn, t) == []
+
+
+def test_janitor_ignores_dir_workspace_not_in_git(kanban_home, tmp_path):
+    """A dir workspace that is not a git repo yields nothing to reconcile."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "note.txt").write_text("hi\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="notes", workspace_kind="dir", workspace_path=str(plain)
+        )
+        assert kb.complete_task(conn, t, result="done")
+        assert _dirty_tree_events(conn, t) == []
+
+
+def test_janitor_flags_dirty_worktree(kanban_home, tmp_path):
+    """A worktree workspace left dirty is routed to review the same way."""
+    repo = tmp_path / "proj"
+    _init_git_repo(repo)
+    worktree = tmp_path / "wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "wt/x", str(worktree), "HEAD"],
+        check=True, capture_output=True, text=True,
+    )
+    (worktree / "wip.py").write_text("z=3\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="wt build", workspace_kind="worktree",
+            workspace_path=str(worktree), branch_name="wt/x",
+        )
+        assert kb.complete_task(conn, t, result="done")
+        payload = _dirty_tree_events(conn, t)[0].payload
+
+    # In a worktree the checkout IS its own toplevel, so nothing is "stray".
+    assert payload["in_workspace"] == ["?? wip.py"]
+    assert payload["stray_outside_workspace"] == []
+    assert payload["shared_checkout"] is False
+
+
 def test_is_managed_scratch_path_accepts_per_board_workspaces(kanban_home, tmp_path):
     """Per-board scratch dirs under ``<kanban_home>/kanban/boards/<slug>/workspaces`` are managed."""
     board_scratch = kanban_home / "kanban" / "boards" / "my-board" / "workspaces" / "task-1"
