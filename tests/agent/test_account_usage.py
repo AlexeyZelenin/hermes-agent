@@ -275,6 +275,30 @@ def _usage_payload_with_resets(primary_used, secondary_used, banked):
     }
 
 
+def test_anthropic_usage_uses_explicit_pooled_token(monkeypatch):
+    calls = []
+    payload = {"five_hour": {"utilization": 0.25, "resets_at": "2026-07-17T10:00:00Z"}}
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, payload),
+    )
+    monkeypatch.setattr(
+        account_usage,
+        "resolve_anthropic_token",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("must not fall back to the active credential")
+        ),
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic", api_key="sk-ant-oat01-pooled")
+
+    assert snapshot is not None and snapshot.provider == "anthropic"
+    assert snapshot.windows[0].label == "Current session"
+    assert snapshot.windows[0].used_percent == 25.0
+    assert calls[0]["headers"]["Authorization"] == "Bearer sk-ant-oat01-pooled"
+
+
 def test_usage_snapshot_shows_banked_resets_hint(monkeypatch):
     calls = []
     monkeypatch.setattr(

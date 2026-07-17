@@ -9,6 +9,7 @@ import {
   Cpu,
   Database,
   Download,
+  Gauge,
   Globe,
   HardDrive,
   KeyRound,
@@ -50,6 +51,7 @@ import type {
   MemoryStatus,
   MemoryProviderInfo,
   CredentialPoolProvider,
+  CredentialUsageAccount,
   CheckpointsResponse,
   HooksResponse,
   HookEntry,
@@ -74,6 +76,15 @@ function formatDuration(seconds: number): string {
   if (d > 0) return `${d}d ${h}h ${m}m`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+/** "in 2h 5m" until an ISO timestamp, "now" once passed, null when absent/invalid. */
+function resetsIn(iso: string | null): string | null {
+  if (!iso) return null;
+  const delta = Math.floor((new Date(iso).getTime() - Date.now()) / 1000);
+  if (Number.isNaN(delta)) return null;
+  if (delta <= 0) return "now";
+  return `in ${formatDuration(delta)}`;
 }
 
 type BackupImportTarget =
@@ -212,6 +223,12 @@ export default function SystemPage() {
   const [credKey, setCredKey] = useState("");
   const [credLabel, setCredLabel] = useState("");
   const [addingCred, setAddingCred] = useState(false);
+
+  // Per-account subscription limits, keyed by `${provider}|${index}`.
+  const [poolUsage, setPoolUsage] = useState<
+    Record<string, CredentialUsageAccount>
+  >({});
+  const [checkingLimits, setCheckingLimits] = useState(false);
 
   const [pendingBackupArchive, setPendingBackupArchive] = useState<string | null>(
     null,
@@ -359,6 +376,20 @@ export default function SystemPage() {
       showToast(`Failed to add credential: ${e}`, "error");
     } finally {
       setAddingCred(false);
+    }
+  };
+
+  const checkLimits = async () => {
+    setCheckingLimits(true);
+    try {
+      const res = await api.getCredentialUsage();
+      const map: Record<string, CredentialUsageAccount> = {};
+      for (const acc of res.accounts) map[`${acc.provider}|${acc.index}`] = acc;
+      setPoolUsage(map);
+    } catch (e) {
+      showToast(`Failed to check limits: ${e}`, "error");
+    } finally {
+      setCheckingLimits(false);
     }
   };
 
@@ -1163,7 +1194,12 @@ export default function SystemPage() {
                 <Input id="cred-label" value={credLabel} onChange={(e) => setCredLabel(e.target.value)} placeholder="optional" />
               </div>
             </div>
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
+              {pool.length > 0 && (
+                <Button size="sm" ghost onClick={checkLimits} disabled={checkingLimits} prefix={checkingLimits ? <Spinner /> : <Gauge className="h-3.5 w-3.5" />}>
+                  Check limits
+                </Button>
+              )}
               <Button size="sm" className="uppercase" onClick={addCredential} disabled={addingCred} prefix={addingCred ? <Spinner /> : undefined}>
                 Add key
               </Button>
@@ -1178,17 +1214,64 @@ export default function SystemPage() {
                 <span className="text-xs uppercase tracking-wider text-muted-foreground">
                   {prov.provider}
                 </span>
-                {prov.entries.map((entry) => (
-                  <div key={`${prov.provider}-${entry.index}`} className="flex items-center gap-3 border border-border bg-background/40 px-3 py-2">
-                    <span className="text-sm font-medium">{entry.label}</span>
-                    <span className="font-mono text-xs text-muted-foreground">{entry.token_preview}</span>
-                    <Badge tone="outline">{entry.auth_type}</Badge>
-                    {entry.last_status && <Badge tone="secondary">{entry.last_status}</Badge>}
-                    <Button ghost size="icon" className="ml-auto text-destructive" aria-label="Remove credential" onClick={() => credDelete.requestDelete(`${prov.provider}|${entry.index}`)}>
-                      <Trash2 />
-                    </Button>
-                  </div>
-                ))}
+                {prov.entries.map((entry) => {
+                  const coolingSeconds = entry.cooldown_until
+                    ? Math.floor(entry.cooldown_until - Date.now() / 1000)
+                    : 0;
+                  const usage = poolUsage[`${prov.provider}|${entry.index}`]?.usage;
+                  return (
+                    <div key={`${prov.provider}-${entry.index}`} className="flex flex-col gap-2 border border-border bg-background/40 px-3 py-2">
+                      <div className="flex items-center gap-3">
+                        <span className="text-sm font-medium">{entry.label}</span>
+                        <span className="font-mono text-xs text-muted-foreground">{entry.token_preview}</span>
+                        <Badge tone="outline">{entry.auth_type}</Badge>
+                        {coolingSeconds > 0 ? (
+                          <Badge tone="destructive">
+                            {entry.last_error_code === 429 ? "rate-limited" : "cooldown"} · {formatDuration(coolingSeconds)}
+                          </Badge>
+                        ) : (
+                          entry.last_status && <Badge tone="secondary">{entry.last_status}</Badge>
+                        )}
+                        {entry.request_count > 0 && (
+                          <Badge tone="outline">{entry.request_count} req</Badge>
+                        )}
+                        <Button ghost size="icon" className="ml-auto text-destructive" aria-label="Remove credential" onClick={() => credDelete.requestDelete(`${prov.provider}|${entry.index}`)}>
+                          <Trash2 />
+                        </Button>
+                      </div>
+                      {usage && (
+                        <div className="flex flex-col gap-1 border-l border-border pl-3">
+                          {usage.plan && (
+                            <span className="text-xs text-muted-foreground">{usage.plan}</span>
+                          )}
+                          {usage.unavailable_reason && (
+                            <span className="text-xs text-muted-foreground">{usage.unavailable_reason}</span>
+                          )}
+                          {usage.windows.map((w) => {
+                            const pct = Math.max(0, Math.min(100, w.used_percent ?? 0));
+                            const reset = resetsIn(w.reset_at);
+                            return (
+                              <div key={w.label} className="flex items-center gap-2 text-xs">
+                                <span className="w-28 shrink-0 text-muted-foreground">{w.label}</span>
+                                <div className="h-1.5 w-32 shrink-0 overflow-hidden bg-border/60">
+                                  <div
+                                    className={cn("h-full", pct >= 90 ? "bg-destructive" : "bg-primary")}
+                                    style={{ width: `${pct}%` }}
+                                  />
+                                </div>
+                                <span>{pct.toFixed(0)}% used{reset ? ` · resets ${reset}` : ""}</span>
+                                {w.detail && <span className="text-muted-foreground">{w.detail}</span>}
+                              </div>
+                            );
+                          })}
+                          {usage.details.map((d) => (
+                            <span key={d} className="text-xs text-muted-foreground">{d}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             ))}
           </CardContent>
