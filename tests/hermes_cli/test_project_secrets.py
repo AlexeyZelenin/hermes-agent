@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -177,6 +179,237 @@ def test_build_scope_returns_fresh_dict(store):
     scope["K"] = "mutated"
     # Mutating the returned scope must not corrupt the store.
     assert store.get("p_alpha1", "K") == "v"
+
+
+# ---------------------------------------------------------------------------
+# macOS Keychain backend
+# ---------------------------------------------------------------------------
+
+
+class _FakeSecurity:
+    """In-memory stand-in for the ``security`` CLI (add/find/delete-generic).
+
+    Keyed by (service, account) -> password, so the store's command
+    construction and JSON-blob round-trip are exercised without touching the
+    real login Keychain. Return codes mirror ``security``: 0 on success, 44
+    ("item not found") on a miss.
+    """
+
+    def __init__(self):
+        self.items: dict = {}
+
+    def run(self, cmd, **kwargs):
+        assert cmd[0] == "security"
+        sub = cmd[1]
+        flags = self._parse(cmd[2:])
+        key = (flags.get("-s"), flags.get("-a"))
+        if sub == "add-generic-password":
+            self.items[key] = flags["-w"]
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if sub == "find-generic-password":
+            if key not in self.items:
+                return subprocess.CompletedProcess(cmd, 44, "", "not found")
+            return subprocess.CompletedProcess(cmd, 0, self.items[key] + "\n", "")
+        if sub == "delete-generic-password":
+            if key not in self.items:
+                return subprocess.CompletedProcess(cmd, 44, "", "not found")
+            del self.items[key]
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        raise AssertionError(f"unexpected security subcommand {sub}")
+
+    @staticmethod
+    def _parse(argv) -> dict:
+        out: dict = {}
+        i = 0
+        while i < len(argv):
+            tok = argv[i]
+            # ``-w`` takes a value on write (add) but is the value-less read flag
+            # on find (where it is the last token).
+            if tok in ("-s", "-a", "-D") or (tok == "-w" and i + 1 < len(argv)):
+                out[tok] = argv[i + 1]
+                i += 2
+            else:  # value-less flags (-U, -A, read -w) or trailing keychain arg
+                out.setdefault(tok, True)
+                i += 1
+        return out
+
+
+@pytest.fixture
+def fake_keychain(monkeypatch):
+    fake = _FakeSecurity()
+    monkeypatch.setattr("hermes_cli.project_secrets.subprocess.run", fake.run)
+    monkeypatch.setattr(
+        psec.KeychainProjectSecretStore, "is_available", staticmethod(lambda: True)
+    )
+    return fake
+
+
+@pytest.fixture
+def kc_store(fake_keychain):
+    return psec.KeychainProjectSecretStore()
+
+
+class TestKeychainStoreFaked:
+    """Backend logic + command construction against a faked ``security``."""
+
+    def test_set_get_roundtrip(self, kc_store):
+        kc_store.set("p_alpha1", "ANTHROPIC_API_KEY", "sk-alpha")
+        assert kc_store.get("p_alpha1", "ANTHROPIC_API_KEY") == "sk-alpha"
+        assert kc_store.get_all("p_alpha1") == {"ANTHROPIC_API_KEY": "sk-alpha"}
+
+    def test_two_projects_isolated(self, kc_store):
+        kc_store.set("p_alpha1", "PROVIDER_KEY", "value-A")
+        kc_store.set("p_beta22", "PROVIDER_KEY", "value-B")
+        assert kc_store.get_all("p_alpha1") == {"PROVIDER_KEY": "value-A"}
+        assert kc_store.get_all("p_beta22") == {"PROVIDER_KEY": "value-B"}
+        assert kc_store.get("p_alpha1", "PROVIDER_KEY") == "value-A"
+
+    def test_empty_and_unknown_project_is_safe(self, kc_store):
+        assert kc_store.get_all("p_unknown") == {}
+        assert kc_store.get("p_unknown", "ANY") is None
+        assert kc_store.names("p_unknown") == []
+
+    def test_delete(self, kc_store):
+        kc_store.set("p_alpha1", "TOKEN_X", "v")
+        assert kc_store.delete("p_alpha1", "TOKEN_X") is True
+        assert kc_store.delete("p_alpha1", "TOKEN_X") is False
+        assert kc_store.get("p_alpha1", "TOKEN_X") is None
+
+    def test_deleting_last_secret_removes_item(self, kc_store, fake_keychain):
+        kc_store.set("p_alpha1", "ONLY", "v")
+        kc_store.delete("p_alpha1", "ONLY")
+        # Empty set -> no husk item left in the keychain.
+        assert (psec._KEYCHAIN_SERVICE, "p_alpha1") not in fake_keychain.items
+
+    def test_stored_blob_is_json_map_only(self, kc_store, fake_keychain):
+        kc_store.set("p_alpha1", "K1", "v1")
+        kc_store.set("p_alpha1", "K2", "v2")
+        raw = fake_keychain.items[(psec._KEYCHAIN_SERVICE, "p_alpha1")]
+        assert json.loads(raw) == {"K1": "v1", "K2": "v2"}
+
+    def test_corrupt_item_fails_closed(self, kc_store, fake_keychain):
+        fake_keychain.items[(psec._KEYCHAIN_SERVICE, "p_alpha1")] = "{not json"
+        assert kc_store.get_all("p_alpha1") == {}
+
+    def test_write_deletes_then_adds_accessible(self, kc_store, monkeypatch):
+        calls = []
+
+        def _capture(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr("hermes_cli.project_secrets.subprocess.run", _capture)
+        kc_store.replace_all("p_alpha1", {"K": "v"})
+        # delete-then-add: never ``add -U`` (that update path hangs on a prompt).
+        assert calls[0][1] == "delete-generic-password"
+        add = calls[1]
+        assert add[1] == "add-generic-password"
+        assert "-U" not in add
+        assert "-A" in add  # non-interactive read for autonomous spawns
+        assert add[add.index("-s") + 1] == psec._KEYCHAIN_SERVICE
+        assert add[add.index("-a") + 1] == "p_alpha1"
+
+    def test_read_never_passes_value_on_argv(self, kc_store, monkeypatch):
+        seen = {}
+
+        def _capture(cmd, **kwargs):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 44, "", "")
+
+        monkeypatch.setattr("hermes_cli.project_secrets.subprocess.run", _capture)
+        kc_store.get_all("p_alpha1")
+        assert "-w" in seen["cmd"] and seen["cmd"][-1] == "-w"  # read flag, no value
+
+    def test_traversal_project_id_rejected(self, kc_store):
+        with pytest.raises(psec.ProjectSecretError):
+            kc_store.set("../escape", "K", "v")
+        with pytest.raises(psec.ProjectSecretError):
+            kc_store.get_all("../escape")
+
+    def test_invalid_name_rejected(self, kc_store):
+        with pytest.raises(psec.InvalidSecretName):
+            kc_store.set("p_alpha1", "has-dash", "v")
+
+    def test_security_unavailable_fails_closed_on_read(self, kc_store, monkeypatch):
+        def _boom(cmd, **kwargs):
+            raise FileNotFoundError("security missing")
+
+        monkeypatch.setattr("hermes_cli.project_secrets.subprocess.run", _boom)
+        # Read must never crash the spawn path when the keychain is unreachable.
+        assert kc_store.get_all("p_alpha1") == {}
+
+    def test_security_failure_raises_on_write(self, kc_store, monkeypatch):
+        def _fail(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 1, "", "boom")
+
+        monkeypatch.setattr("hermes_cli.project_secrets.subprocess.run", _fail)
+        # A failed write must surface, never silently drop the secret.
+        with pytest.raises(psec.ProjectSecretError):
+            kc_store.replace_all("p_alpha1", {"K": "v"})
+
+
+class TestDefaultBackendSelection:
+    def test_macos_selects_keychain(self, monkeypatch):
+        monkeypatch.setattr(
+            psec.KeychainProjectSecretStore, "is_available", staticmethod(lambda: True)
+        )
+        assert isinstance(psec._build_default_store(), psec.KeychainProjectSecretStore)
+
+    def test_non_macos_falls_back_to_file(self, monkeypatch):
+        monkeypatch.setattr(
+            psec.KeychainProjectSecretStore, "is_available", staticmethod(lambda: False)
+        )
+        assert isinstance(psec._build_default_store(), psec.FileProjectSecretStore)
+
+
+@pytest.mark.skipif(
+    not psec.KeychainProjectSecretStore.is_available(),
+    reason="macOS Keychain (security) not available",
+)
+class TestKeychainStoreReal:
+    """End-to-end against the real ``security`` in an isolated temp keychain.
+
+    Never touches the user's login keychain: a throwaway keychain file is
+    created/unlocked for the test and deleted in teardown.
+    """
+
+    @pytest.fixture
+    def real_store(self, tmp_path):
+        kc_path = str(tmp_path / f"hermes-test-{uuid.uuid4().hex[:8]}.keychain-db")
+        subprocess.run(
+            ["security", "create-keychain", "-p", "test", kc_path],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["security", "unlock-keychain", "-p", "test", kc_path],
+            check=True, capture_output=True, text=True,
+        )
+        service = f"hermes-project-secrets-test-{uuid.uuid4().hex[:8]}"
+        try:
+            yield psec.KeychainProjectSecretStore(service=service, keychain=kc_path)
+        finally:
+            subprocess.run(
+                ["security", "delete-keychain", kc_path],
+                capture_output=True, text=True,
+            )
+
+    def test_real_roundtrip_and_isolation(self, real_store):
+        real_store.set("p_alpha1", "PROVIDER_KEY", "value-A")
+        real_store.set("p_beta22", "PROVIDER_KEY", "value-B")
+        real_store.set("p_alpha1", "ALPHA_ONLY", "only-A")
+
+        assert real_store.get("p_alpha1", "PROVIDER_KEY") == "value-A"
+        assert real_store.get("p_beta22", "PROVIDER_KEY") == "value-B"
+        assert real_store.get_all("p_alpha1") == {
+            "PROVIDER_KEY": "value-A", "ALPHA_ONLY": "only-A",
+        }
+        assert "only-A" not in real_store.get_all("p_beta22").values()
+
+    def test_real_delete_and_empty(self, real_store):
+        real_store.set("p_alpha1", "K", "v")
+        assert real_store.delete("p_alpha1", "K") is True
+        assert real_store.get_all("p_alpha1") == {}
+        assert real_store.delete("p_alpha1", "K") is False
 
 
 # ---------------------------------------------------------------------------

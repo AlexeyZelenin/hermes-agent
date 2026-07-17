@@ -17,11 +17,14 @@ strict:
   default (a *safe* absence) - it never falls through to another project or to
   ``os.environ``.
 
-Storage (v1, "option (a)"): a gitignored, ``0600`` JSON file at
+Storage: on macOS (the *standard of care*) secrets live encrypted in the OS
+login Keychain via :class:`KeychainProjectSecretStore` - never a plaintext file,
+so they are excluded from Time Machine and backups. Other platforms fall back to
+:class:`FileProjectSecretStore`: a gitignored, ``0600`` JSON file at
 ``$HERMES_HOME/projects/<project_id>/secrets.json``, co-located with the
-per-profile ``projects.db``. It sits behind the :class:`ProjectSecretStore`
-interface so an OS-keychain backend can replace it later without touching any
-caller.
+per-profile ``projects.db``. Both sit behind the :class:`ProjectSecretStore`
+interface, so :func:`get_default_store` swaps backend by platform without
+touching any caller (native Windows / Linux keychain backends deferred).
 
 The resolution contract is **env-inject at spawn**: the kanban dispatcher's
 ``_default_spawn`` layers a task's project secrets over the child's inherited
@@ -39,7 +42,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import re
+import shutil
+import subprocess
 import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -270,17 +276,142 @@ def _atomic_write_private(path: Path, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# macOS Keychain backend
+# ---------------------------------------------------------------------------
+
+# One login-Keychain generic-password item per project; its password field
+# holds that project's ``{NAME: value}`` map as a JSON string. This mirrors how
+# Claude Code stores its OAuth payload (see
+# :func:`agent.claude_subscriptions._read_credentials_keychain`).
+_KEYCHAIN_SERVICE = "hermes-project-secrets"
+_SECURITY_TIMEOUT = 5
+
+
+class KeychainProjectSecretStore(ProjectSecretStore):
+    """macOS Keychain backend - the *standard of care* for project secrets.
+
+    Secret material is stored encrypted in the OS login Keychain instead of a
+    plaintext file, so it is never exposed to Time Machine snapshots, cloud or
+    local backups, or a stray ``cat`` of the profile directory - the concrete
+    at-rest risk the file backend carries. The store keeps one generic-password
+    item per ``project_id`` (service ``hermes-project-secrets``) whose password
+    field is the project's validated ``{NAME: value}`` map as JSON, so
+    :meth:`get_all` / :meth:`replace_all` stay a single Keychain read / write.
+
+    macOS only; :meth:`is_available` gates selection so non-Darwin hosts keep
+    the :class:`FileProjectSecretStore` fallback (a real OS-keychain backend for
+    Windows / Linux is deferred behind this same interface).
+
+    Known limitation: writes shell out to ``security add-generic-password -w``,
+    which places the value on the process argv (briefly visible to a same-user
+    ``ps``). Items are created ``-A`` (any same-user app may read) so autonomous
+    spawns never block on an interactive Keychain-access prompt. Both are
+    same-user exposures no worse than the ``0600`` file this replaces; the win
+    is encryption at rest and exclusion from backups.
+    """
+
+    def __init__(self, *, service: Optional[str] = None, keychain: Optional[str] = None):
+        # ``keychain`` targets a specific keychain file (tests point at an
+        # isolated temp keychain); ``None`` uses the user's default search list.
+        self._service = service or _KEYCHAIN_SERVICE
+        self._keychain = keychain
+
+    @staticmethod
+    def is_available() -> bool:
+        """Whether this host can use the Keychain backend (macOS + ``security``)."""
+        return platform.system() == "Darwin" and shutil.which("security") is not None
+
+    def _run(self, args: List[str]) -> Optional[subprocess.CompletedProcess]:
+        cmd = ["security", *args]
+        if self._keychain is not None:
+            cmd.append(self._keychain)
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=_SECURITY_TIMEOUT, stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def get_all(self, project_id: str) -> Dict[str, str]:
+        account = _safe_project_id(project_id)
+        result = self._run([
+            "find-generic-password", "-s", self._service, "-a", account, "-w",
+        ])
+        if result is None:
+            _log.warning("keychain unavailable reading project secrets for %s "
+                         "(treating as empty)", project_id)
+            return {}
+        if result.returncode != 0 or not result.stdout.strip():
+            return {}
+        try:
+            data = json.loads(result.stdout.strip())
+        except (ValueError, TypeError):
+            # Corrupt item -> fail closed (no secrets), never crash the spawn
+            # path. Log the project only, never any parsed content.
+            _log.warning("project secrets keychain item for %s is unreadable; "
+                         "treating as empty", project_id)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for name, value in data.items():
+            if isinstance(name, str) and isinstance(value, str) \
+                    and is_valid_env_name(name):
+                out[name] = value
+        return out
+
+    def replace_all(self, project_id: str, secrets: Dict[str, str]) -> None:
+        account = _safe_project_id(project_id)
+        cleaned = validate_secrets(secrets)
+        # Always delete-then-add. ``add -U`` (update-in-place) of an existing
+        # item blocks on an interactive Keychain-authorization prompt, which
+        # would hang an autonomous spawn; deleting first (ignore "not found")
+        # then adding fresh never prompts. Also leaves no empty husk when the
+        # set becomes empty.
+        self._run(["delete-generic-password", "-s", self._service, "-a", account])
+        if not cleaned:
+            return
+        payload = json.dumps(cleaned, ensure_ascii=False, sort_keys=True)
+        result = self._run([
+            "add-generic-password", "-s", self._service, "-a", account,
+            "-w", payload, "-A", "-D", "hermes project secrets",
+        ])
+        if result is None:
+            raise ProjectSecretError(
+                f"could not write project secrets for {project_id}: the macOS "
+                "Keychain (security) is unavailable or timed out"
+            )
+        if result.returncode != 0:
+            raise ProjectSecretError(
+                f"could not write project secrets for {project_id} to the macOS "
+                f"Keychain (security exited {result.returncode})"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Default store + resolution entry points
 # ---------------------------------------------------------------------------
 
 _default_store: Optional[ProjectSecretStore] = None
 
 
+def _build_default_store() -> ProjectSecretStore:
+    """Keychain on macOS (standard of care); file backend elsewhere."""
+    if KeychainProjectSecretStore.is_available():
+        return KeychainProjectSecretStore()
+    return FileProjectSecretStore()
+
+
 def get_default_store() -> ProjectSecretStore:
-    """Return the process default store (a :class:`FileProjectSecretStore`)."""
+    """Return the process default store.
+
+    macOS resolves to :class:`KeychainProjectSecretStore`; other platforms keep
+    the :class:`FileProjectSecretStore` until a native backend lands for them.
+    """
     global _default_store
     if _default_store is None:
-        _default_store = FileProjectSecretStore()
+        _default_store = _build_default_store()
     return _default_store
 
 
