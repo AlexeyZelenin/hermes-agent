@@ -509,6 +509,46 @@ def test_complete_missing_scratch_artifact_stays_in_flight(worker_env):
     assert workspace.exists()
 
 
+def test_complete_records_structured_decision_in_project_vault(worker_env, tmp_path, monkeypatch):
+    """Completion records an opted-in decision before the task becomes done."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+    import subprocess
+
+    repo = tmp_path / "zeus"
+    registry = repo / "knowledge" / "decisions.md"
+    registry.parent.mkdir(parents=True)
+    registry.write_text("# Decision registry\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(project_conn, name="Zeus", folders=[str(repo)])
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="record decision", assignee="test-worker", project_id=project_id
+        )
+        assert kb.claim_task(conn, task_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    out = kt._handle_complete({
+        "summary": "completed with decision",
+        "decision": {
+            "summary": "Keep decisions in Markdown",
+            "rationale": "The project history stays reviewable in Git.",
+            "links": ["knowledge/README.md"],
+        },
+    })
+    assert json.loads(out)["ok"] is True
+    text = registry.read_text(encoding="utf-8")
+    assert "<!-- kanban-decision:" + task_id + " -->" in text
+    assert "kanban:default/" + task_id in text
+
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, task_id)
+        assert run.metadata["decision_registry"] == str(registry)
+
+
 def test_complete_rejects_no_handoff(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({})
