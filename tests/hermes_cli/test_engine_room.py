@@ -100,6 +100,14 @@ def test_surfaces_returns_defensive_copies():
     assert second[0]["title"] != "MUTATED"
 
 
+def test_unified_log_surface_present():
+    """The engine room exposes the unified log surface (t_adf37522)."""
+    by_key = {s["key"]: s for s in engine_room.surfaces()}
+    assert "logs" in by_key
+    assert by_key["logs"]["route"] == "/api/kanban/engine-log"
+    assert by_key["logs"]["owner_task"] == "t_adf37522"
+
+
 # --- Pillar 3: substrate ----------------------------------------------------
 
 
@@ -118,6 +126,9 @@ def test_substrate_presence_reflects_injected_tables():
     # task_events lives in kanban.db, not zeus.db.
     assert by_key["task_events"]["db"] == engine_room.DB_KANBAN
     assert by_key["task_events"]["present"] is True
+    # The unified engine_log is a kanban.db substrate source (t_adf37522).
+    assert by_key["engine_log"]["db"] == engine_room.DB_KANBAN
+    assert by_key["engine_log"]["present"] is False  # not in injected set
     # OTel has no local table and follows the configured flag.
     assert by_key["otel"]["table"] is None
     assert by_key["otel"]["present"] is False

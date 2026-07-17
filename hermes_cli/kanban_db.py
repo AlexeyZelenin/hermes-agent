@@ -1319,6 +1319,49 @@ class Comment:
 
 
 @dataclass
+class LogEntry:
+    """In-memory view of an ``engine_log`` row — one structured log line.
+
+    ``source`` is ``operator`` (native oversight/cron breadcrumb) or ``client``
+    (browser-submitted). ``payload`` is decoded from its stored JSON string to a
+    dict for callers/serialisation; a malformed/absent blob decodes to ``None``.
+    See :mod:`hermes_cli.engine_log` for the vocabulary and validation.
+    """
+
+    id: int
+    source: str
+    severity: str
+    category: Optional[str]
+    event: str
+    task_id: Optional[str]
+    session_id: Optional[str]
+    payload: Optional[dict]
+    created_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "LogEntry":
+        raw = row["payload"]
+        payload: Optional[dict] = None
+        if raw:
+            try:
+                decoded = json.loads(raw)
+                payload = decoded if isinstance(decoded, dict) else {"value": decoded}
+            except (ValueError, TypeError):
+                payload = None
+        return cls(
+            id=int(row["id"]),
+            source=row["source"],
+            severity=row["severity"],
+            category=row["category"],
+            event=row["event"],
+            task_id=row["task_id"],
+            session_id=row["session_id"],
+            payload=payload,
+            created_at=int(row["created_at"]) if row["created_at"] is not None else 0,
+        )
+
+
+@dataclass
 class Attachment:
     """In-memory view of a row from the ``task_attachments`` table."""
 
@@ -1499,6 +1542,27 @@ CREATE TABLE IF NOT EXISTS task_events (
 -- v2 of the kanban schema will use ``step_key`` to drive per-stage
 -- workflow routing; in v1 the column is nullable and unused (kernel
 -- ignores it).
+-- Unified structured engine-room log ("под капотом"). ONE store, two producers
+-- (see hermes_cli.engine_log): source='operator' rows are native oversight/cron
+-- breadcrumbs (what was SEEN / DONE / DECIDED); source='client' rows are the
+-- FRONTEND's own log (UI actions, WS events, optimistic renders, JS errors),
+-- POSTed from the browser. The client rows are the only trace a frontend-only
+-- bug leaves — a phantom card that renders but never hits the backend is
+-- invisible to every server log, which is exactly the gap this table closes
+-- (t_adf37522). Append-only; pruned by age like task_events. Feeds the
+-- log-watcher cron and the Регулярные registry.
+CREATE TABLE IF NOT EXISTS engine_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    source     TEXT NOT NULL,   -- operator | client
+    severity   TEXT NOT NULL,   -- debug | info | warn | error
+    category   TEXT,            -- coarse group: ws | optimistic | action | error | oversight | cron
+    event      TEXT NOT NULL,   -- short stable event name
+    task_id    TEXT,            -- optional card this line is about
+    session_id TEXT,            -- browser session / operator run correlation id
+    payload    TEXT,            -- capped JSON blob (see engine_log.MAX_PAYLOAD_CHARS)
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_runs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id             TEXT NOT NULL,
@@ -1564,6 +1628,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_engine_log_recent     ON engine_log(id DESC);
+CREATE INDEX IF NOT EXISTS idx_engine_log_source     ON engine_log(source, id DESC);
+CREATE INDEX IF NOT EXISTS idx_engine_log_task       ON engine_log(task_id, id DESC);
 """
 
 
@@ -5860,6 +5927,163 @@ def set_task_category(
             {"category": slug, "actor": actor},
         )
     return True, None
+
+
+# --- Engine-room structured log (engine_log) --------------------------------
+#
+# See hermes_cli.engine_log for the vocabulary + validation. These are the thin
+# store edges: one insert for a trusted operator/cron breadcrumb, one bulk insert
+# for an already-sanitised client batch, and one unified query for the "под
+# капотом" viewer / log-watcher cron.
+
+
+def record_log(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    event: str,
+    severity: str = "info",
+    category: Optional[str] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    payload: Optional[dict] = None,
+    created_at: Optional[int] = None,
+) -> int:
+    """Append one ``engine_log`` row. Returns the new row id.
+
+    The trusted server-side path (native oversight / crons writing an
+    ``operator`` breadcrumb, or the plugin writing a pre-validated ``client``
+    batch item). ``source`` must be a known value; the caller owns validation of
+    free-text fields (the client path routes through
+    :func:`hermes_cli.engine_log.normalize_client_entry` first).
+    """
+    from hermes_cli import engine_log as _el
+
+    if source not in _el.SOURCES:
+        raise ValueError(f"unknown engine_log source {source!r}")
+    now = int(created_at) if created_at is not None else int(time.time())
+    pl = json.dumps(payload, ensure_ascii=False, default=str) if payload else None
+    with write_txn(conn):
+        cur = conn.execute(
+            "INSERT INTO engine_log "
+            "(source, severity, category, event, task_id, session_id, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (source, severity, category, event, task_id, session_id, pl, now),
+        )
+        return int(cur.lastrowid)
+
+
+def record_client_logs(
+    entries: list[dict],
+    *,
+    board: Optional[str] = None,
+) -> int:
+    """Bulk-insert an already-sanitised client batch. Returns rows written.
+
+    ``entries`` must have passed through
+    :func:`hermes_cli.engine_log.sanitize_client_batch` (each dict carries the
+    validated ``source``/``severity``/``event``/``created_at`` shape). Opens and
+    closes its own connection so the plugin route need not thread one through.
+    """
+    if not entries:
+        return 0
+    rows = [
+        (
+            e["source"], e["severity"], e.get("category"), e["event"],
+            e.get("task_id"), e.get("session_id"), e.get("payload"), e["created_at"],
+        )
+        for e in entries
+    ]
+    with connect_closing(board=board) as conn:
+        with write_txn(conn):
+            conn.executemany(
+                "INSERT INTO engine_log "
+                "(source, severity, category, event, task_id, session_id, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+    return len(rows)
+
+
+def query_log(
+    conn: sqlite3.Connection,
+    *,
+    source: Optional[str] = None,
+    severity: Optional[str] = None,
+    event: Optional[str] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    search: Optional[str] = None,
+    since_id: Optional[int] = None,
+    limit: int = 200,
+) -> list[LogEntry]:
+    """The unified log search for the "под капотом" viewer and the log-watcher.
+
+    All filters are ANDed. ``severity`` is a *minimum* on the ladder (an
+    ``error`` filter also excludes ``warn``/``info``/``debug``), applied in
+    Python via :func:`engine_log.severity_at_least` so the ordering lives in one
+    place. ``search`` is a case-insensitive substring over ``event``/``payload``.
+    ``since_id`` returns only rows with a higher id (tail/poll cursor). Newest
+    first, capped at ``limit`` (1..2000).
+    """
+    from hermes_cli import engine_log as _el
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if source is not None:
+        clauses.append("source = ?")
+        params.append(source)
+    if event is not None:
+        clauses.append("event = ?")
+        params.append(event)
+    if task_id is not None:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    if session_id is not None:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if since_id is not None:
+        clauses.append("id > ?")
+        params.append(int(since_id))
+    if search:
+        clauses.append("(event LIKE ? OR payload LIKE ?)")
+        like = f"%{search}%"
+        params.extend([like, like])
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    capped = max(1, min(int(limit), 2000))
+    # Fetch extra headroom when a severity floor is set, since it filters in
+    # Python: a strict floor could otherwise starve the page. 2000 is the hard
+    # ceiling either way.
+    fetch = min(capped * 4, 2000) if severity else capped
+    rows = conn.execute(
+        f"SELECT * FROM engine_log{where} ORDER BY id DESC LIMIT ?",
+        (*params, fetch),
+    ).fetchall()
+    out: list[LogEntry] = []
+    for r in rows:
+        if severity and not _el.severity_at_least(r["severity"], severity):
+            continue
+        out.append(LogEntry.from_row(r))
+        if len(out) >= capped:
+            break
+    return out
+
+
+def prune_engine_log(
+    conn: sqlite3.Connection,
+    *,
+    older_than_seconds: int,
+    now: Optional[int] = None,
+) -> int:
+    """Delete ``engine_log`` rows older than the cutoff. Returns rows removed.
+
+    Mirrors the task_events retention path so the log doesn't grow unbounded; the
+    log-watcher cron (neighbour card) owns the schedule.
+    """
+    cutoff = (int(now) if now is not None else int(time.time())) - int(older_than_seconds)
+    with write_txn(conn):
+        cur = conn.execute("DELETE FROM engine_log WHERE created_at < ?", (cutoff,))
+        return cur.rowcount
 
 
 def pause_task(

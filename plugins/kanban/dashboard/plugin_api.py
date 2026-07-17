@@ -1494,6 +1494,90 @@ def list_diagnostics(
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Engine-room structured log — the unified "под капотом" log (t_adf37522).
+# POST /client-log ingests the browser's own log (UI actions, WS events,
+# optimistic renders, JS errors) — the only trace a frontend-only bug leaves,
+# since server logs never see a phantom card that never reached the backend.
+# GET /engine-log is the unified search over operator + client rows that the
+# viewer and the log-watcher cron read.
+# ---------------------------------------------------------------------------
+
+
+class ClientLogBody(BaseModel):
+    """A batch of browser-submitted log entries.
+
+    ``entries`` is the buffered client log; ``session_id`` correlates one page
+    load and back-fills any entry that omitted its own. Every field is treated as
+    untrusted and clamped in ``hermes_cli.engine_log`` before it touches the DB.
+    """
+
+    # Untyped list on purpose: every element is untrusted and gets clamped in
+    # ``engine_log.sanitize_client_batch``. Declaring ``list[dict]`` would make
+    # Pydantic 422 the whole batch on a single non-dict element, defeating the
+    # best-effort contract (a buggy tab must never get its console spammed with
+    # 4xx from the logger itself).
+    entries: list[Any] = Field(default_factory=list)
+    session_id: Optional[str] = None
+
+
+@router.post("/client-log")
+def ingest_client_log(payload: ClientLogBody, board: Optional[str] = Query(None)):
+    """Sanitise + persist a batch of frontend log entries. Returns accepted count.
+
+    Best-effort by design: malformed or oversized entries are dropped (not
+    rejected) so a buggy tab can't 4xx-spam the console — the browser keeps
+    logging regardless. Auth is the standard dashboard session gate.
+    """
+    from hermes_cli import engine_log as el
+
+    board = _resolve_board(board)
+    now = int(time.time())
+    clean = el.sanitize_client_batch(
+        payload.entries, now=now, session_id=payload.session_id,
+    )
+    written = kanban_db.record_client_logs(clean, board=board)
+    return {"accepted": written, "received": len(payload.entries or [])}
+
+
+@router.get("/engine-log")
+def list_engine_log(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    source: Optional[str] = Query(None, description="operator | client"),
+    severity: Optional[str] = Query(None, description="Minimum severity: debug|info|warn|error"),
+    event: Optional[str] = Query(None, description="Exact event name"),
+    task_id: Optional[str] = Query(None, description="Only lines about this card"),
+    session_id: Optional[str] = Query(None, description="Only lines from this session"),
+    q: Optional[str] = Query(None, description="Substring search over event/payload"),
+    since_id: Optional[int] = Query(None, description="Only rows newer than this id (tail cursor)"),
+    limit: int = Query(200, ge=1, le=2000, description="Max rows (newest first)"),
+):
+    """Unified search over the engine-room log — operator + client rows in one
+    place, newest first. Feeds the "под капотом" viewer and the log-watcher.
+    """
+    from hermes_cli import engine_log as el
+    from dataclasses import asdict as _asdict
+
+    if source is not None and source not in el.SOURCES:
+        raise HTTPException(status_code=400, detail=f"unknown source {source!r}")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        entries = kanban_db.query_log(
+            conn,
+            source=source,
+            severity=severity,
+            event=event,
+            task_id=task_id,
+            session_id=session_id,
+            search=q,
+            since_id=since_id,
+            limit=limit,
+        )
+        return {"entries": [_asdict(e) for e in entries], "count": len(entries)}
+    finally:
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Worker visibility — cross-task active-worker list and per-run inspection
