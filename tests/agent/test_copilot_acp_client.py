@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from agent.copilot_acp_client import CopilotACPClient, _canonical_turn_usage
 
 
@@ -462,6 +464,47 @@ def test_run_prompt_captures_mode_effort_and_context_window(tmp_path):
     assert client.last_context["cost_usd"] == 0.25
     assert client.last_context["cost_currency"] == "USD"
     assert client.last_turn_usage["total_tokens"] == 42
+
+
+_FAKE_ACP_SERVER_LIMIT_MIDTURN = r'''
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "sess-1"}})
+    elif method == "session/prompt":
+        # Stream real partial work, THEN die on a usage limit mid-turn.
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess-1", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "partial work so far"}}}})
+        send({"jsonrpc": "2.0", "id": mid, "error": {
+            "code": -32000, "message": "You've hit your session limit"}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+'''
+
+
+def test_run_prompt_preserves_partial_text_on_midturn_error(tmp_path):
+    """A turn that raises mid-stream must still expose the streamed-so-far text
+    on ``last_partial_text`` so the executor can salvage it before rotating."""
+    server = tmp_path / "fake_acp_limit.py"
+    server.write_text(_FAKE_ACP_SERVER_LIMIT_MIDTURN)
+    client = CopilotACPClient(
+        acp_command=_sys.executable, acp_args=[str(server)], acp_cwd=str(tmp_path),
+    )
+    with pytest.raises(RuntimeError, match="session limit"):
+        client._run_prompt("do the task", timeout_seconds=15)
+    assert client.last_partial_text == "partial work so far"
 
 
 def test_run_prompt_replays_operator_steer_on_same_session(tmp_path):

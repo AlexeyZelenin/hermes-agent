@@ -87,7 +87,28 @@ def _new_client(command, args, workspace, model, extra_env=None):
     return CopilotACPClient(acp_command=command, acp_args=args, acp_cwd=workspace,
                             allow_permissions=True, session_model=model,
                             extra_env=extra_env)
-def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None):
+def _salvage_partial_output(task_id, board, client):
+    """Persist a limit/auth-interrupted session's partial output as a task
+    comment so the next attempt resumes with context instead of blind.
+
+    The streamed agent text is otherwise discarded when the pool rotates to
+    the next subscription (the dying session's ``client`` is dropped). Only
+    real streamed work is salvaged - an empty or whitespace buffer is a no-op.
+    Best-effort: a persistence failure must never mask the underlying limit."""
+    try:
+        partial = (getattr(client, "last_partial_text", "") or "").strip()
+    except Exception:
+        partial = ""
+    if not partial:
+        return
+    try:
+        from hermes_cli import kanban_db as kb
+        with kb.connect_closing(board=board) as conn:
+            kb.add_comment(conn, task_id, author="claude-code",
+                           body="partial handoff (limit-interrupted)\n\n" + partial)
+    except Exception:
+        pass
+def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None):
     """Run the prompt on the Claude subscription pool, rotating on usage limits.
 
     Each session gets CLAUDE_CONFIG_DIR pinned to a leased subscription dir
@@ -105,6 +126,7 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
     while True:
         lease = subs.acquire(task_id=task_id)
         limited = None
+        client = None
         try:
             client = _new_client(command, args, workspace, model,
                                  extra_env={"CLAUDE_CONFIG_DIR": lease.config_dir})
@@ -117,6 +139,7 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
             limited = str(exc)
         finally:
             subs.release(lease)
+        _salvage_partial_output(task_id, board, client)
         subs.mark_limited(lease.name, limited)
 def run_task(*, executor, task_id, workspace, board=None):
     from hermes_cli import kanban_db as kb
@@ -132,7 +155,7 @@ def run_task(*, executor, task_id, workspace, board=None):
         subscription=None
         follow_up=(lambda: _drain_steer(task_id, board)) if _steering_enabled() else None
         if executor == "claude-code":
-            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up)
+            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board)
         else:
             client=_new_client(command,args,workspace,model)
             text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)

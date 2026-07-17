@@ -718,6 +718,11 @@ class CopilotACPClient:
         self.last_turn_usage = None
         self.last_context = None
         self._last_usage_update = None
+        # Streamed agent output captured live, so a mid-turn crash (usage
+        # limit / auth death) can still salvage the partial work instead of
+        # discarding it when the turn raises. See _run_claude_code_session.
+        self.last_partial_text = ""
+        self._live_text_parts: list[str] = []
         with self._active_process_lock:
             self._active_process = proc
 
@@ -864,6 +869,9 @@ class CopilotACPClient:
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
+            # Publish the live buffer so a caller can recover partial output
+            # even when a turn below raises before we return.
+            self._live_text_parts = text_parts
 
             def _prompt_turn(turn_text: str) -> None:
                 result = _request(
@@ -898,6 +906,7 @@ class CopilotACPClient:
 
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
+            self.last_partial_text = "".join(self._live_text_parts)
             self.close()
 
     def _handle_server_message(

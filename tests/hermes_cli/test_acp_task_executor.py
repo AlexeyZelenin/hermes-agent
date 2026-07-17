@@ -178,6 +178,104 @@ class _connection_context:
         return False
 
 
+class _FakeLease:
+    def __init__(self, name):
+        self.id = 1
+        self.name = name
+        self.config_dir = f"/cfg/{name}"
+
+
+def test_partial_output_salvaged_on_limit_rotation(monkeypatch, kanban_conn, tmp_path):
+    """A session dying mid-work on a usage limit must persist its partial output
+    as a 'partial handoff (limit-interrupted)' comment before the pool rotates,
+    so the next attempt resumes with context instead of starting blind."""
+    from agent import acp_task_executor as executor
+    from agent import claude_subscriptions as subs
+
+    task_id = kb.create_task(kanban_conn, title="Long task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    # Two-pocket pool: pocket 1 dies mid-work on a limit, pocket 2 finishes.
+    monkeypatch.setattr(subs, "pool_size", lambda: 2)
+    leases = iter([_FakeLease("p1"), _FakeLease("p2")])
+    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "release", lambda lease: None)
+    marked: list = []
+    monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: marked.append(name))
+
+    attempts = {"n": 0}
+
+    class FakeClient:
+        last_model = "claude-opus-4-8"
+        last_turn_usage = None
+
+        def __init__(self, **kwargs):
+            self.last_partial_text = ""
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                # Real streamed work accumulated before the limit death.
+                self.last_partial_text = "Wrote the migration and half the test."
+                raise RuntimeError(
+                    "Copilot ACP session/prompt failed: You've hit your session limit"
+                )
+            return "Finished the task.", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    result = executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+    )
+    assert result == "Finished the task."
+    assert marked == ["p1"], "the limit-dead pocket must be cooled down"
+
+    comments = kb.list_comments(kanban_conn, task_id)
+    salvage = [c for c in comments if "partial handoff (limit-interrupted)" in c.body]
+    assert len(salvage) == 1
+    assert "Wrote the migration and half the test." in salvage[0].body
+    assert kb.get_task(kanban_conn, task_id).status == "done"
+
+
+def test_no_salvage_comment_when_no_partial_output(monkeypatch, kanban_conn, tmp_path):
+    """An empty partial buffer must not create a noise comment on rotation."""
+    from agent import acp_task_executor as executor
+    from agent import claude_subscriptions as subs
+
+    task_id = kb.create_task(kanban_conn, title="Task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+    monkeypatch.setattr(subs, "pool_size", lambda: 2)
+    leases = iter([_FakeLease("p1"), _FakeLease("p2")])
+    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "release", lambda lease: None)
+    monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: None)
+
+    attempts = {"n": 0}
+
+    class FakeClient:
+        last_model = "claude-opus-4-8"
+        last_turn_usage = None
+
+        def __init__(self, **kwargs):
+            self.last_partial_text = ""  # nothing streamed before the death
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("You've hit your usage limit")
+            return "Done.", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    executor.run_task(executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test")
+    comments = kb.list_comments(kanban_conn, task_id)
+    assert [c for c in comments if "partial handoff" in c.body] == []
+
+
 def test_acp_worker_passes_requested_model_to_session(monkeypatch, kanban_conn, tmp_path):
     """HERMES_KANBAN_MODEL from the dispatcher reaches the ACP client."""
     from agent import acp_task_executor as executor
