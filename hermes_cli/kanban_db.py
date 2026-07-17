@@ -2575,6 +2575,45 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def configured_default_assignee() -> Optional[str]:
+    """Board/global fallback owner from ``kanban.default_assignee`` config.
+
+    Returns the canonicalised profile name, or ``None`` when unset/blank.
+    Used at task-creation and decomposition time so a task never enters a
+    dispatchable lane (``ready``/``todo``) unowned — an unassigned ready task
+    is silently skipped by the dispatcher, a recurring source of silent queue
+    stalls (t_0831813e). The dispatcher keeps a secondary net + WARNING for
+    rows that still slip through (e.g. un-assigned from the dashboard).
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        configured = ((load_config() or {}).get("kanban") or {}).get("default_assignee")
+    except Exception:
+        return None
+    if isinstance(configured, str) and configured.strip():
+        return _canonical_assignee(configured.strip())
+    return None
+
+
+def _first_parent_assignee(
+    conn: sqlite3.Connection, parents: Iterable[str]
+) -> Optional[str]:
+    """Assignee of the first parent that has one — for inheritance at create.
+
+    A child of an owned task inherits that owner by default, so decomposed /
+    linked work stays with the profile that scoped it instead of parking
+    unassigned. Returns ``None`` when no parent carries an assignee.
+    """
+    for pid in parents:
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (pid,)
+        ).fetchone()
+        if row and row["assignee"]:
+            return row["assignee"]
+    return None
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2827,6 +2866,19 @@ def create_task(
                     missing = _find_missing_parents(conn, parents)
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+
+                # Invariant: never let a task enter a dispatchable lane
+                # (ready/todo) without an owner. An unassigned ready task is
+                # silently skipped by the dispatcher, stalling the queue with
+                # no signal (t_0831813e). Prefer inheriting the parent's owner;
+                # else fall back to the configured board default. Triage/blocked
+                # tasks are exempt — they are not dispatched and acquire an
+                # owner at promotion/decompose/take time.
+                if not assignee and task_status in ("ready", "todo"):
+                    assignee = (
+                        _first_parent_assignee(conn, parents)
+                        or configured_default_assignee()
+                    )
 
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
@@ -5563,7 +5615,7 @@ def decompose_triage_task(
     with write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path, "
-            "       executor, model_override, project_id "
+            "       executor, model_override, project_id, assignee "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5572,6 +5624,15 @@ def decompose_triage_task(
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        # Children must never land unowned: an unassigned child promoted to
+        # ready is silently skipped by the dispatcher (t_0831813e). Inherit the
+        # root's owner (the explicit new owner if the caller set one, else the
+        # root's existing assignee), falling back to the configured board
+        # default. A child that names its own assignee still wins. Resolved
+        # once here so every child agrees on the same fallback.
+        _child_inherited_assignee = (
+            root_assignee or root_row["assignee"] or configured_default_assignee()
+        )
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -5593,7 +5654,7 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
-            assignee = _canonical_assignee(child.get("assignee"))
+            assignee = _canonical_assignee(child.get("assignee")) or _child_inherited_assignee
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -8304,6 +8365,20 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # Defensive invariant: a task reached a dispatchable lane with no owner and
+    # no default_assignee fallback, so the dispatcher just skipped it. Create /
+    # decompose assign an owner up front (t_0831813e), so this should be empty;
+    # when it is not, the queue is silently stalled for these ids. Surface a
+    # visible WARNING rather than a silent skip so the stall is diagnosable.
+    if result.skipped_unassigned:
+        _log.warning(
+            "kanban dispatch: %d ready/review task(s) have no assignee and no "
+            "kanban.default_assignee fallback — queue is stalled (silently "
+            "skipped) for: %s. Set kanban.default_assignee or assign them.",
+            len(result.skipped_unassigned),
+            ", ".join(result.skipped_unassigned),
+        )
     return result
 
 
