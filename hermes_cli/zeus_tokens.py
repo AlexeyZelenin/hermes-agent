@@ -95,6 +95,105 @@ def aggregate_by_task(
     return out
 
 
+def _cron_session_like(job_id: str) -> str:
+    """LIKE pattern matching a cron job's run sessions.
+
+    Cron runs tag every ``token_usage`` row with ``session_id`` =
+    ``cron_<job_id>_<timestamp>`` (``cron/scheduler.py`` builds it as
+    ``f"cron_{job_id}_{now:%Y%m%d_%H%M%S}"``). Cron job ids are fixed-length
+    hex (``uuid4().hex[:12]``) so the literal underscores in the pattern — which
+    SQLite ``LIKE`` treats as single-char wildcards — always sit over real
+    underscores, and no id is a prefix of another; the match is exact for our
+    data.
+    """
+    return f"cron_{job_id}_%"
+
+
+def aggregate_by_cron(
+    conn: Optional[sqlite3.Connection],
+    job_ids: Iterable[str],
+    since_ts: Optional[float] = None,
+) -> dict[str, dict]:
+    """Per-cron token/cost totals, keyed by the ``cron_<id>_*`` session prefix.
+
+    Unlike :func:`aggregate_by_task`, cron spend is *not* grouped by ``task_id``
+    (each firing gets a throwaway agent UUID there); the stable key is the run
+    ``session_id`` prefix — see :func:`_cron_session_like`. ``since_ts`` (epoch
+    seconds) optionally bounds the window to "spend over the last N days".
+
+    Returns ``{job_id: {total_tokens, prompt_tokens, completion_tokens,
+    cost_usd, run_count, last_ts}}`` — only ids with rows appear; ``run_count``
+    counts distinct run sessions. ``conn is None`` or a missing ``token_usage``
+    table yields ``{}``. Script-only crons (``no_agent``) never spend tokens, so
+    they simply won't appear here.
+    """
+    ids = [jid for jid in dict.fromkeys(job_ids) if jid]  # dedupe, drop empties
+    if conn is None or not ids:
+        return {}
+    out: dict[str, dict] = {}
+    for jid in ids:
+        params: list = [_cron_session_like(jid)]
+        clause = "session_id LIKE ?"
+        if since_ts is not None:
+            clause += " AND ts >= ?"
+            params.append(since_ts)
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(total_tokens), 0) AS total, "
+                "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                "COALESCE(SUM(completion_tokens), 0) AS completion, "
+                "SUM(cost_usd) AS cost, "
+                "COUNT(DISTINCT session_id) AS runs, "
+                "MAX(ts) AS last_ts "
+                f"FROM token_usage WHERE {clause}",
+                tuple(params),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return {}  # ledger table absent (zeus plugin not installed)
+        if not row or not row["runs"]:
+            continue  # no run sessions for this cron in-window
+        out[jid] = {
+            "total_tokens": int(row["total"] or 0),
+            "prompt_tokens": int(row["prompt"] or 0),
+            "completion_tokens": int(row["completion"] or 0),
+            "cost_usd": float(row["cost"]) if row["cost"] is not None else None,
+            "run_count": int(row["runs"] or 0),
+            "last_ts": float(row["last_ts"]) if row["last_ts"] is not None else None,
+        }
+    return out
+
+
+def per_run_token_totals(
+    conn: Optional[sqlite3.Connection],
+    job_id: str,
+    since_ts: Optional[float] = None,
+) -> list[int]:
+    """Total tokens per cron run session, oldest run first.
+
+    One entry per distinct ``cron_<job_id>_*`` session, summed across the turns
+    within that run and ordered by when the run started. Feeds the
+    token-spike baseline (compare the latest run against the median of the
+    prior ones). ``conn is None`` / missing table -> ``[]``.
+    """
+    if conn is None or not job_id:
+        return []
+    params: list = [_cron_session_like(job_id)]
+    clause = "session_id LIKE ?"
+    if since_ts is not None:
+        clause += " AND ts >= ?"
+        params.append(since_ts)
+    try:
+        rows = conn.execute(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS t, MIN(ts) AS started "
+            f"FROM token_usage WHERE {clause} "
+            "GROUP BY session_id ORDER BY started",
+            tuple(params),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [int(r["t"] or 0) for r in rows]
+
+
 def build_children_map(links: Iterable[tuple[str, str]]) -> dict[str, list[str]]:
     """``{parent_id: [child_id, ...]}`` from ``(parent_id, child_id)`` pairs."""
     m: dict[str, list[str]] = {}

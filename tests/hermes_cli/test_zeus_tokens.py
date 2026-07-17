@@ -130,6 +130,87 @@ def test_aggregate_none_conn_and_empty_ids(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# aggregate_by_cron / per_run_token_totals  (session-prefix attribution)
+# ---------------------------------------------------------------------------
+
+
+def _make_zeus_sessions(path: Path, rows=()) -> Path:
+    """zeus.db with ``(session_id, ts, total, cost)`` rows for cron tests."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_SCHEMA)
+    conn.executemany(
+        "INSERT INTO token_usage (session_id, ts, total_tokens, cost_usd) "
+        "VALUES (?, ?, ?, ?)",
+        list(rows),
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_aggregate_by_cron_groups_by_session_prefix(tmp_path):
+    # Two runs of job "abc" (two turns each) plus an unrelated job "def".
+    db = _make_zeus_sessions(tmp_path / "zeus.db", rows=[
+        ("cron_abc_20260101_010000", 10.0, 100, 0.01),
+        ("cron_abc_20260101_010000", 11.0, 50, 0.005),
+        ("cron_abc_20260102_010000", 20.0, 200, 0.02),
+        ("cron_def_20260101_010000", 30.0, 999, 0.10),
+    ])
+    conn = zeus_tokens.connect(db)
+    try:
+        agg = zeus_tokens.aggregate_by_cron(conn, ["abc", "def", "ghi"])
+    finally:
+        conn.close()
+    assert agg["abc"]["total_tokens"] == 350  # 100 + 50 + 200
+    assert agg["abc"]["run_count"] == 2        # two distinct sessions
+    assert agg["abc"]["cost_usd"] == pytest.approx(0.035)
+    assert agg["abc"]["last_ts"] == 20.0
+    assert agg["def"]["total_tokens"] == 999
+    assert "ghi" not in agg  # no run sessions -> omitted
+
+
+def test_aggregate_by_cron_since_ts_window(tmp_path):
+    db = _make_zeus_sessions(tmp_path / "zeus.db", rows=[
+        ("cron_abc_old", 100.0, 500, None),
+        ("cron_abc_new", 200.0, 40, None),
+    ])
+    conn = zeus_tokens.connect(db)
+    try:
+        agg = zeus_tokens.aggregate_by_cron(conn, ["abc"], since_ts=150.0)
+    finally:
+        conn.close()
+    assert agg["abc"]["total_tokens"] == 40   # old run excluded by window
+    assert agg["abc"]["run_count"] == 1
+
+
+def test_aggregate_by_cron_degrades(tmp_path):
+    assert zeus_tokens.aggregate_by_cron(None, ["abc"]) == {}
+    db = _make_zeus_sessions(tmp_path / "zeus.db")
+    conn = zeus_tokens.connect(db)
+    try:
+        assert zeus_tokens.aggregate_by_cron(conn, []) == {}
+    finally:
+        conn.close()
+
+
+def test_per_run_token_totals_ordered_oldest_first(tmp_path):
+    db = _make_zeus_sessions(tmp_path / "zeus.db", rows=[
+        ("cron_abc_r2", 20.0, 200, None),
+        ("cron_abc_r1", 10.0, 100, None),
+        ("cron_abc_r1", 11.0, 5, None),   # second turn of the older run
+        ("cron_abc_r3", 30.0, 600, None),
+    ])
+    conn = zeus_tokens.connect(db)
+    try:
+        totals = zeus_tokens.per_run_token_totals(conn, "abc")
+    finally:
+        conn.close()
+    assert totals == [105, 200, 600]  # r1(100+5), r2, r3 — chronological
+    assert zeus_tokens.per_run_token_totals(None, "abc") == []
+
+
+# ---------------------------------------------------------------------------
 # graph helpers
 # ---------------------------------------------------------------------------
 

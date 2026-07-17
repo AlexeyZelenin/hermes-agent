@@ -416,6 +416,77 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     return 0
 
 
+def cron_registry(args):
+    """Render (or scan) the "Регулярные" registry for the active profile."""
+    import json as _json
+
+    from cron.jobs import list_jobs
+    from hermes_cli import regular_crons, zeus_tokens
+
+    period_days = getattr(args, "period_days", 30)
+    jobs = list_jobs(include_disabled=True)
+    zeus_conn = zeus_tokens.connect()
+    try:
+        rows = regular_crons.registry_for_jobs(
+            jobs, zeus_conn=zeus_conn, period_days=period_days
+        )
+    finally:
+        if zeus_conn is not None:
+            zeus_conn.close()
+
+    if getattr(args, "scan", False):
+        conn = regular_crons.open_findings_db()
+        try:
+            emitted = regular_crons.scan_and_emit(rows, conn)
+        finally:
+            if conn is not None:
+                conn.close()
+        if getattr(args, "json", False):
+            print(_json.dumps({"emitted": emitted}, ensure_ascii=False, indent=2))
+        else:
+            print(color(f"Scanned {len(rows)} crons; {len(emitted)} finding(s) pushed.",
+                        Colors.CYAN))
+            for f in emitted:
+                print(f"  {color('⚠', Colors.YELLOW)} {f['title']}")
+        return 0
+
+    if getattr(args, "json", False):
+        print(_json.dumps({"crons": rows, "period_days": period_days},
+                          ensure_ascii=False, indent=2))
+        return 0
+
+    _print_registry_rows(rows, period_days)
+    return 0
+
+
+def _print_registry_rows(rows, period_days):
+    """Human-readable registry, grouped by purpose then cadence."""
+    if not rows:
+        print(color("No regular crons.", Colors.DIM))
+        return
+    order = ["supervision", "reflection", "security", "resources", "other"]
+    from hermes_cli.regular_crons import PURPOSE_LABELS
+    print()
+    print(color(f"Регулярные процессы (токены за {period_days}д)", Colors.CYAN))
+    for purpose in order:
+        group = [r for r in rows if r["purpose"] == purpose]
+        if not group:
+            continue
+        print(f"\n  {color(PURPOSE_LABELS[purpose], Colors.CYAN)}")
+        for r in group:
+            state = "[active]" if r["enabled"] else "[off]"
+            state_c = Colors.GREEN if r["enabled"] else Colors.RED
+            tok = r["tokens"]["display"] if r.get("tokens") else "-"
+            outcome = r.get("last_status") or "never"
+            outcome_c = Colors.RED if outcome == "error" else Colors.DIM
+            flags = " ".join(f"⚠{a['kind']}" for a in r.get("anomalies") or [])
+            print(f"    {color(r['id'], Colors.YELLOW)} {color(state, state_c)} "
+                  f"{r['name']}")
+            print(f"      {r['cadence_badge']} · outcome={color(outcome, outcome_c)} "
+                  f"· tokens={tok}"
+                  + (f" · {color(flags, Colors.YELLOW)}" if flags else ""))
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -424,6 +495,9 @@ def cron_command(args):
         show_all = getattr(args, 'all', False)
         cron_list(show_all)
         return 0
+
+    if subcmd == "registry":
+        return cron_registry(args)
 
     if subcmd == "status":
         cron_status()
@@ -452,5 +526,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick]")
+    print("Usage: hermes cron [list|registry|create|edit|pause|resume|run|remove|status|tick]")
     sys.exit(1)

@@ -10595,6 +10595,81 @@ async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: 
     return await _run_cron_dashboard_io(_list_cron_job_runs_sync, job_id, profile, limit)
 
 
+def _clamp_registry_period(period_days: int) -> int:
+    try:
+        return max(1, min(int(period_days), 365))
+    except (TypeError, ValueError):
+        return 30
+
+
+def _cron_registry_sync(profile: str = "all", period_days: int = 30):
+    """The "Регулярные" registry: every cron job classified + priced.
+
+    Rows carry the two-axis taxonomy (cadence / purpose), on/off state, last
+    run+outcome, and token spend over ``period_days`` from the zeus ledger. Run
+    history for the failure-streak anomaly is read per profile home, so a
+    multi-profile dashboard attributes streaks to the right output dir. This is
+    the pull view — it never writes findings; that is the scan path.
+    """
+    from hermes_cli import regular_crons, zeus_tokens
+
+    period_days = _clamp_registry_period(period_days)
+    jobs = _list_cron_jobs_sync(profile)
+    by_home: Dict[str, List[Dict[str, Any]]] = {}
+    for job in jobs:
+        by_home.setdefault(str(job.get("hermes_home") or ""), []).append(job)
+
+    zeus_conn = zeus_tokens.connect()
+    try:
+        rows: List[Dict[str, Any]] = []
+        for home, group in by_home.items():
+            out_dir = (Path(home) / "cron" / "output") if home else None
+            rows.extend(
+                regular_crons.registry_for_jobs(
+                    group, zeus_conn=zeus_conn, output_dir=out_dir,
+                    period_days=period_days,
+                )
+            )
+    finally:
+        if zeus_conn is not None:
+            zeus_conn.close()
+    return {
+        "crons": rows,
+        "ticker": regular_crons.ticker_health(),
+        "period_days": period_days,
+    }
+
+
+@app.get("/api/cron/registry")
+async def get_cron_registry(profile: str = "all", period_days: int = 30):
+    return await _run_cron_dashboard_io(_cron_registry_sync, profile, period_days)
+
+
+def _cron_registry_scan_sync(profile: str = "all", period_days: int = 30, board: str = ""):
+    """Anomaly scan (the push path): emit/clear findings, don't render.
+
+    Detects crons failing repeatedly or burning tokens far above baseline and
+    upserts findings into the zeus store; recovered anomalies are cleared. Safe
+    to call on a schedule (e.g. from the health-check cron). No-op when the
+    zeus ledger is absent.
+    """
+    from hermes_cli import regular_crons
+
+    payload = _cron_registry_sync(profile, period_days)
+    conn = regular_crons.open_findings_db()
+    try:
+        emitted = regular_crons.scan_and_emit(payload["crons"], conn, board=board)
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"emitted": emitted, "count": len(emitted)}
+
+
+@app.post("/api/cron/registry/scan")
+async def scan_cron_registry(profile: str = "all", period_days: int = 30, board: str = ""):
+    return await _run_cron_dashboard_io(_cron_registry_scan_sync, profile, period_days, board)
+
+
 def _create_cron_job_sync(body: CronJobCreate, profile: str = "default"):
     try:
         profile_name, profile_home = _cron_profile_home(profile)

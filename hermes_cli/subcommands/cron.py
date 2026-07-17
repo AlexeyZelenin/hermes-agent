@@ -153,6 +153,20 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_remove.add_argument("job_id", help="Job ID to remove")
 
+    # cron registry — the "Регулярные" token-aware view of the crons
+    cron_registry = cron_subparsers.add_parser(
+        "registry", help="Show regular crons classified by cadence/purpose with token spend"
+    )
+    cron_registry.add_argument(
+        "--period-days", type=int, default=30, help="Token-spend window (default 30)"
+    )
+    cron_registry.add_argument("--json", action="store_true", help="Emit JSON")
+    cron_registry.add_argument(
+        "--scan",
+        action="store_true",
+        help="Detect anomalies and push findings (failing crons / token spikes)",
+    )
+
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
