@@ -155,10 +155,37 @@ BOARD_COLUMNS: list[str] = [
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
+_CARD_TOOL_FEED_LIMIT = 8
+
+
+def _compact_tool_feed(tool_calls: Optional[list[dict]]) -> Optional[list[dict]]:
+    """Project the run's tool-call feed to the small shape a card needs.
+
+    Keeps only the last few calls and the identity/status fields (drops content,
+    diffs, raw io - those live in the drawer via the run metadata), so the board
+    payload stays light even when a task has fired many tools."""
+    if not tool_calls:
+        return None
+    tail = tool_calls[-_CARD_TOOL_FEED_LIMIT:]
+    compact = []
+    for call in tail:
+        if not isinstance(call, dict):
+            continue
+        compact.append(
+            {
+                key: call[key]
+                for key in ("id", "seq", "title", "kind", "status")
+                if call.get(key) is not None
+            }
+        )
+    return compact or None
+
+
 def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
+    live_tool_calls: Optional[list[dict]] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
     # Add derived age metrics so the UI can colour stale cards without
@@ -172,6 +199,8 @@ def _task_dict(
     # ``task_runs.summary`` (the kanban-worker pattern) instead of
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
+    # Compact live tool-call feed for the card (None when idle / no activity).
+    d["live_tool_calls"] = _compact_tool_feed(live_tool_calls)
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -458,13 +487,21 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        # Live tool-call feed of the active run per task, so running cards can
+        # show what the external executor is doing right now (incl. sub-agent
+        # spawns). One query; empty for tasks with no active tool activity.
+        tool_calls_map = kanban_db.latest_run_tool_calls(conn, [t.id for t in tasks])
 
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
-            d = _task_dict(t, latest_summary=preview)
+            d = _task_dict(
+                t,
+                latest_summary=preview,
+                live_tool_calls=tool_calls_map.get(t.id),
+            )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children

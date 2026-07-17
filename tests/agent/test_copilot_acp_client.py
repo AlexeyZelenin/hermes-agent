@@ -164,6 +164,99 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(self.client._last_usage_update["used"], 1234)
 
+    def _tool_update(self, update: dict) -> bool:
+        return self.client._handle_server_message(
+            {"jsonrpc": "2.0", "method": "session/update",
+             "params": {"update": update}},
+            process=_FakeProcess(), cwd="/tmp",
+            text_parts=[], reasoning_parts=[],
+        )
+
+    def test_tool_call_is_captured_with_max_fields(self) -> None:
+        handled = self._tool_update({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "Task: spawn reviewer subagent",
+            "kind": "other",
+            "status": "pending",
+            "rawInput": {"prompt": "review the diff"},
+            "rawOutput": None,
+            "locations": [{"path": "/repo/a.py", "line": 12},
+                          {"path": "/repo/b.py"}],
+            "content": [{"type": "content",
+                         "content": {"type": "text", "text": "spawning"}},
+                        {"type": "diff", "path": "/repo/a.py",
+                         "oldText": "x", "newText": "y"}],
+        })
+        self.assertTrue(handled)
+        snap = self.client.tool_activity_snapshot()
+        self.assertEqual(len(snap), 1)
+        entry = snap[0]
+        self.assertEqual(entry["id"], "tc-1")
+        self.assertEqual(entry["seq"], 1)
+        self.assertEqual(entry["title"], "Task: spawn reviewer subagent")
+        self.assertEqual(entry["kind"], "other")
+        self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["raw_input"], '{"prompt": "review the diff"}')
+        self.assertEqual(
+            entry["locations"],
+            [{"path": "/repo/a.py", "line": 12}, {"path": "/repo/b.py"}],
+        )
+        self.assertEqual(
+            entry["content"],
+            [{"type": "content", "text": "spawning"},
+             {"type": "diff", "path": "/repo/a.py", "old_text": "x", "new_text": "y"}],
+        )
+
+    def test_tool_call_update_applies_replace_deltas(self) -> None:
+        self._tool_update({
+            "sessionUpdate": "tool_call", "toolCallId": "tc-2",
+            "title": "Read config", "kind": "read", "status": "pending",
+        })
+        # Delta carries only status; other fields are preserved.
+        self._tool_update({
+            "sessionUpdate": "tool_call_update", "toolCallId": "tc-2",
+            "status": "completed",
+        })
+        entry = self.client.tool_activity_snapshot()[0]
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["title"], "Read config")
+        self.assertEqual(entry["kind"], "read")
+
+    def test_tool_activity_callback_fires_only_on_transitions(self) -> None:
+        fired: list[str] = []
+        self.client._on_tool_activity = lambda e: fired.append(e["status"])
+        self._tool_update({
+            "sessionUpdate": "tool_call", "toolCallId": "tc-3",
+            "title": "Grep", "kind": "search", "status": "in_progress",
+        })
+        # Content-only update, no status change: must NOT fire.
+        self._tool_update({
+            "sessionUpdate": "tool_call_update", "toolCallId": "tc-3",
+            "content": [{"type": "content",
+                         "content": {"type": "text", "text": "match"}}],
+        })
+        # Status change: fires.
+        self._tool_update({
+            "sessionUpdate": "tool_call_update", "toolCallId": "tc-3",
+            "status": "completed",
+        })
+        self.assertEqual(len(fired), 2)
+
+    def test_tool_call_without_id_is_ignored(self) -> None:
+        self._tool_update({"sessionUpdate": "tool_call", "title": "no id"})
+        self.assertEqual(self.client.tool_activity_snapshot(), [])
+
+    def test_tool_calls_reset_between_runs(self) -> None:
+        self._tool_update({
+            "sessionUpdate": "tool_call", "toolCallId": "tc-4",
+            "title": "x", "status": "completed",
+        })
+        self.assertEqual(len(self.client.tool_calls), 1)
+        # A fresh run clears prior aggregation (mirrors _run_prompt reset).
+        self.client.tool_calls = {}
+        self.assertEqual(self.client.tool_activity_snapshot(), [])
+
     def test_canonical_turn_usage_prefers_prompt_result_usage(self) -> None:
         usage = _canonical_turn_usage(
             {
@@ -464,6 +557,62 @@ def test_run_prompt_captures_mode_effort_and_context_window(tmp_path):
     assert client.last_context["cost_usd"] == 0.25
     assert client.last_context["cost_currency"] == "USD"
     assert client.last_turn_usage["total_tokens"] == 42
+
+
+_FAKE_ACP_SERVER_TOOLS = r'''
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "sess-t"}})
+    elif method == "session/prompt":
+        for upd in (
+            {"sessionUpdate": "tool_call", "toolCallId": "tc-1",
+             "title": "Task: spawn subagent", "kind": "other", "status": "pending",
+             "rawInput": {"prompt": "go"}},
+            {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1",
+             "status": "in_progress"},
+            {"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": "working"}},
+            {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1",
+             "status": "completed"},
+        ):
+            send({"jsonrpc": "2.0", "method": "session/update",
+                  "params": {"sessionId": "sess-t", "update": upd}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+'''
+
+
+def test_run_prompt_aggregates_tool_calls_and_fires_callback(tmp_path):
+    server = tmp_path / "fake_acp_tools.py"
+    server.write_text(_FAKE_ACP_SERVER_TOOLS)
+    client = CopilotACPClient(
+        acp_command=_sys.executable, acp_args=[str(server)], acp_cwd=str(tmp_path),
+    )
+    fired: list[dict] = []
+    text, _ = client._run_prompt(
+        "do it", timeout_seconds=15,
+        on_tool_activity=lambda e: fired.append(dict(e)),
+    )
+    assert "working" in text
+    snap = client.tool_activity_snapshot()
+    assert len(snap) == 1
+    assert snap[0]["title"] == "Task: spawn subagent"
+    assert snap[0]["status"] == "completed"
+    assert snap[0]["raw_input"] == '{"prompt": "go"}'
+    # pending (new) + in_progress + completed = 3 transitions surfaced live.
+    assert [f["status"] for f in fired] == ["pending", "in_progress", "completed"]
 
 
 _FAKE_ACP_SERVER_LIMIT_MIDTURN = r'''

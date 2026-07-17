@@ -102,7 +102,7 @@ def test_acp_worker_completes_claimed_task_with_single_session(monkeypatch, kanb
         def __init__(self, **kwargs):
             calls.append(kwargs)
 
-        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None, on_tool_activity=None):
             calls.append((prompt, timeout_seconds))
             return "Implemented and tested.", ""
 
@@ -142,7 +142,7 @@ def test_acp_worker_reports_turn_usage_via_post_api_request_hook(monkeypatch, ka
         def __init__(self, **kwargs):
             pass
 
-        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None, on_tool_activity=None):
             return "Implemented and tested.", ""
 
     recorded = {}
@@ -235,7 +235,7 @@ def test_run_task_passes_effort_to_client_and_stamps_requested(monkeypatch, kanb
         def __init__(self, **kwargs):
             calls.append(kwargs)
 
-        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None, on_tool_activity=None):
             return "done", ""
 
     monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
@@ -303,7 +303,7 @@ def test_partial_output_salvaged_on_limit_rotation(monkeypatch, kanban_conn, tmp
         def __init__(self, **kwargs):
             self.last_partial_text = ""
 
-        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None, on_tool_activity=None):
             attempts["n"] += 1
             if attempts["n"] == 1:
                 # Real streamed work accumulated before the limit death.
@@ -352,7 +352,7 @@ def test_no_salvage_comment_when_no_partial_output(monkeypatch, kanban_conn, tmp
         def __init__(self, **kwargs):
             self.last_partial_text = ""  # nothing streamed before the death
 
-        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None, on_tool_activity=None):
             attempts["n"] += 1
             if attempts["n"] == 1:
                 raise RuntimeError("You've hit your usage limit")
@@ -381,7 +381,7 @@ def test_acp_worker_passes_requested_model_to_session(monkeypatch, kanban_conn, 
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None, on_tool_activity=None):
             return "done", ""
 
     monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
@@ -430,3 +430,47 @@ def test_steering_toggle_env(monkeypatch):
     assert executor._steering_enabled() is False
     monkeypatch.setenv("HERMES_ACP_STEERING", "off")
     assert executor._steering_enabled() is False
+
+
+def test_acp_worker_streams_and_stamps_tool_activity(monkeypatch, kanban_conn, tmp_path):
+    """Live tool_call activity is streamed to the run mid-flight (via the
+    on_tool_activity callback → tool_call event + run metadata) and the final
+    aggregate is stamped onto the completed run's metadata."""
+    from agent import acp_task_executor as executor
+
+    task_id = kb.create_task(kanban_conn, title="tooltask", assignee="external")
+    kb.claim_task(kanban_conn, task_id, claimer="test-lock")
+    run_id = kb._current_run_id(kanban_conn, task_id)
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self._snapshot = []
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None, on_tool_activity=None):
+            captured["cb"] = on_tool_activity
+            # Simulate a live sub-agent spawn transition mid-run.
+            self._snapshot = [{"id": "tc-1", "seq": 1, "title": "Task: spawn",
+                               "kind": "other", "status": "in_progress"}]
+            if on_tool_activity:
+                on_tool_activity(self._snapshot[0])
+            return "done", ""
+
+        def tool_activity_snapshot(self):
+            return [dict(e) for e in self._snapshot]
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    executor.run_task(executor="claude-code", task_id=task_id,
+                      workspace=str(tmp_path), board="test")
+
+    # Callback was wired because the run id was known at spawn.
+    assert captured["cb"] is not None
+    run = kb.get_run(kanban_conn, run_id)
+    assert run.metadata["tool_calls"][0]["title"] == "Task: spawn"
+    tool_events = [e for e in kb.list_events(kanban_conn, task_id) if e.kind == "tool_call"]
+    assert len(tool_events) == 1
+    assert tool_events[0].payload["status"] == "in_progress"

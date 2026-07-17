@@ -2943,6 +2943,26 @@
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
+          (t.live_tool_calls && t.live_tool_calls.length > 0)
+            ? (function () {
+                var calls = t.live_tool_calls;
+                var last = calls[calls.length - 1];
+                return h("div", {
+                  className: cn("hermes-kanban-card-tool",
+                    TOOL_STATUS_CLASS[last.status] || ""),
+                  title: `Live tool activity: ${calls.length} call${calls.length === 1 ? "" : "s"} this run`,
+                },
+                  h("span", { className: "hermes-kanban-card-tool-icon" },
+                    TOOL_KIND_ICON[last.kind] || TOOL_KIND_ICON.other),
+                  h("span", { className: "hermes-kanban-card-tool-title" },
+                    last.title || last.kind || "tool"),
+                  calls.length > 1
+                    ? h("span", { className: "hermes-kanban-card-tool-count" },
+                        `+${calls.length - 1}`)
+                    : null,
+                );
+              })()
+            : null,
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
@@ -3737,6 +3757,7 @@
               );
             }),
       ),
+      h(ToolActivitySection, { runs: props.data.runs || [] }),
       h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" },
           `${tx(i18n, "events", "Events")} (${events.length})`),
@@ -3784,6 +3805,58 @@
       ),
       h(WorkerLogSection, { taskId: t.id, boardSlug: props.boardSlug }),
       h(RunHistorySection, { runs: props.data.runs || [] }),
+    );
+  }
+
+  // Live tool-call feed --------------------------------------------------
+  // The ACP executor streams tool_call / tool_call_update into the active
+  // run's metadata.tool_calls (see agent/copilot_acp_client.py). Sub-agent /
+  // teammate spawns arrive as the harness Task/Agent tool (kind "other").
+  const TOOL_KIND_ICON = {
+    read: "📖", edit: "✏️", delete: "🗑", move: "↪", search: "🔎",
+    execute: "⚡", think: "💭", fetch: "🌐", switch_mode: "🔀", other: "🧩",
+  };
+  const TOOL_STATUS_CLASS = {
+    pending: "hermes-kanban-tool--pending",
+    in_progress: "hermes-kanban-tool--running",
+    completed: "hermes-kanban-tool--done",
+    failed: "hermes-kanban-tool--failed",
+  };
+
+  function toolCallsFromRuns(runs) {
+    if (!runs || runs.length === 0) return [];
+    var active = null;
+    for (var i = 0; i < runs.length; i++) {
+      if (!runs[i].ended_at) { active = runs[i]; break; }
+    }
+    var run = active || runs[runs.length - 1];
+    var calls = run && run.metadata && run.metadata.tool_calls;
+    return Array.isArray(calls) ? calls : [];
+  }
+
+  function ToolActivitySection(props) {
+    const { t } = useI18n();
+    const calls = toolCallsFromRuns(props.runs);
+    if (calls.length === 0) return null;
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" },
+        `${tx(t, "toolActivity", "Tool activity")} (${calls.length})`),
+      h("div", { className: "hermes-kanban-tool-feed" },
+        calls.map(function (c) {
+          return h("div", {
+            key: c.id || c.seq,
+            className: cn("hermes-kanban-tool", TOOL_STATUS_CLASS[c.status] || ""),
+          },
+            h("span", { className: "hermes-kanban-tool-icon" },
+              TOOL_KIND_ICON[c.kind] || TOOL_KIND_ICON.other),
+            h("span", { className: "hermes-kanban-tool-title", title: c.title || "" },
+              c.title || c.kind || "tool"),
+            c.status
+              ? h("span", { className: "hermes-kanban-tool-status" }, c.status)
+              : null,
+          );
+        }),
+      ),
     );
   }
 

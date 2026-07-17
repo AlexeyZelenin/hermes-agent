@@ -87,6 +87,29 @@ def _new_client(command, args, workspace, model, extra_env=None, effort=None):
     return CopilotACPClient(acp_command=command, acp_args=args, acp_cwd=workspace,
                             allow_permissions=True, session_model=model,
                             session_effort=effort, extra_env=extra_env)
+def _tool_activity_writer(task_id, board, run_id, client):
+    """Build the ACP ``on_tool_activity`` callback that streams the live feed.
+
+    Fires on each tool-call transition (new call / status change): writes the
+    aggregated per-run snapshot into ``task_runs.metadata`` and appends a
+    compact ``tool_call`` event so the dashboard card/drawer update live -
+    sub-agent spawns show up as a row that flips running -> completed. Returns
+    ``None`` (no callback) when there is no run to attach activity to.
+    Best-effort: a DB hiccup must never break the running session."""
+    if not run_id:
+        return None
+    def _on_activity(changed):
+        try:
+            snapshot = client.tool_activity_snapshot()
+        except Exception:
+            return
+        try:
+            from hermes_cli import kanban_db as kb
+            with kb.connect_closing(board=board) as conn:
+                kb.record_run_tool_activity(conn, task_id, run_id, snapshot, changed)
+        except Exception:
+            pass
+    return _on_activity
 def _salvage_partial_output(task_id, board, client):
     """Persist a limit/auth-interrupted session's partial output as a task
     comment so the next attempt resumes with context instead of blind.
@@ -108,7 +131,7 @@ def _salvage_partial_output(task_id, board, client):
                            body="partial handoff (limit-interrupted)\n\n" + partial)
     except Exception:
         pass
-def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None):
+def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None, run_id=None):
     """Run the prompt on the Claude subscription pool, rotating on usage limits.
 
     Each session gets CLAUDE_CONFIG_DIR pinned to a leased subscription dir
@@ -121,7 +144,8 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
     from agent import claude_subscriptions as subs
     if subs.pool_size() == 0:
         client = _new_client(command, args, workspace, model, effort=effort)
-        text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
+        text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up,
+                                     on_tool_activity=_tool_activity_writer(task_id, board, run_id, client))
         return text, client, None
     while True:
         lease = subs.acquire(task_id=task_id)
@@ -131,7 +155,8 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
             client = _new_client(command, args, workspace, model,
                                  extra_env={"CLAUDE_CONFIG_DIR": lease.config_dir},
                                  effort=effort)
-            text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
+            text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up,
+                                         on_tool_activity=_tool_activity_writer(task_id, board, run_id, client))
             if not subs.is_usage_limit_error(text) and not subs.is_auth_error(text):
                 return text, client, lease.name
             limited = text
@@ -157,10 +182,11 @@ def run_task(*, executor, task_id, workspace, board=None):
         subscription=None
         follow_up=(lambda: _drain_steer(task_id, board)) if _steering_enabled() else None
         if executor == "claude-code":
-            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort)
+            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort,run_id)
         else:
             client=_new_client(command,args,workspace,model,effort=effort)
-            text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
+            text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up,
+                                      on_tool_activity=_tool_activity_writer(task_id,board,run_id,client))
         _report_usage(client,executor,task_id,subscription)
     except Exception as exc:
         with kb.connect_closing(board=board) as conn: kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)
@@ -171,6 +197,11 @@ def run_task(*, executor, task_id, workspace, board=None):
     if effort: metadata["effort_requested"]=effort
     if subscription: metadata["subscription"]=subscription
     _stamp_session_metadata(metadata, client)
+    try:
+        tool_calls=client.tool_activity_snapshot()
+    except Exception:
+        tool_calls=[]
+    if tool_calls: metadata["tool_calls"]=tool_calls
     with kb.connect_closing(board=board) as conn:
         if not kb.complete_task(conn,task_id,summary=text.strip() or f"External {executor} ACP session completed.",metadata=metadata,expected_run_id=run_id): raise RuntimeError("task was reclaimed or terminal")
     return text

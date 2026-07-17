@@ -1598,3 +1598,86 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---- Live tool-call feed --------------------------------------------- */
+/* Drawer feed of the running executor's tool activity (incl. sub-agent
+ * spawns). Fed by task_runs.metadata.tool_calls and refreshed live via the
+ * event WebSocket. Status is coded on the left border. */
+
+.hermes-kanban-tool-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.hermes-kanban-tool {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.78rem;
+  border-left: 2px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-foreground) 4%, transparent);
+}
+
+.hermes-kanban-tool-icon { flex: 0 0 auto; line-height: 1; }
+
+.hermes-kanban-tool-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-foreground);
+}
+
+.hermes-kanban-tool-status {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--color-muted-foreground);
+}
+
+.hermes-kanban-tool--running {
+  border-left-color: var(--color-ring, #5b9dd9);
+}
+.hermes-kanban-tool--running .hermes-kanban-tool-status {
+  color: var(--color-ring, #5b9dd9);
+}
+.hermes-kanban-tool--done {
+  border-left-color: color-mix(in srgb, var(--color-foreground) 30%, transparent);
+}
+.hermes-kanban-tool--failed {
+  border-left-color: var(--color-destructive, #d14a4a);
+}
+.hermes-kanban-tool--failed .hermes-kanban-tool-status {
+  color: var(--color-destructive, #d14a4a);
+}
+
+/* Compact one-line live indicator on the card. */
+.hermes-kanban-card-tool {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.2rem;
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground);
+}
+
+.hermes-kanban-card-tool-icon { flex: 0 0 auto; line-height: 1; }
+
+.hermes-kanban-card-tool-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-kanban-card-tool-count { flex: 0 0 auto; opacity: 0.7; }
+
+.hermes-kanban-card-tool.hermes-kanban-tool--running {
+  color: var(--color-ring, #5b9dd9);
+}

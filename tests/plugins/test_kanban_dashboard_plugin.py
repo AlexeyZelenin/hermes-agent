@@ -115,6 +115,59 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_surfaces_live_tool_calls_for_running_task(client):
+    """A running task with captured tool activity carries a compact
+    ``live_tool_calls`` feed on its card (drops content/raw io)."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="live tools", assignee="w")
+        kb.claim_task(conn, task_id, claimer="host:w0")
+        run_id = kb._current_run_id(conn, task_id)
+        kb.record_run_tool_activity(conn, task_id, run_id, [
+            {"id": "tc-1", "seq": 1, "title": "Read cfg", "kind": "read",
+             "status": "completed", "content": [{"type": "content", "text": "x"}],
+             "raw_input": "secret args"},
+            {"id": "tc-2", "seq": 2, "title": "Task: spawn subagent",
+             "kind": "other", "status": "in_progress"},
+        ])
+
+    data = client.get("/api/plugins/kanban/board").json()
+    card = None
+    for column in data["columns"]:
+        for task in column["tasks"]:
+            if task["id"] == task_id:
+                card = task
+    assert card is not None
+    feed = card["live_tool_calls"]
+    assert len(feed) == 2
+    assert feed[1]["title"] == "Task: spawn subagent"
+    assert feed[1]["status"] == "in_progress"
+    # Heavy fields are stripped from the card feed.
+    assert "content" not in feed[0]
+    assert "raw_input" not in feed[0]
+    assert set(feed[0]) == {"id", "seq", "title", "kind", "status"}
+
+
+def test_compact_tool_feed_caps_length_and_ignores_empty():
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "hermes_dashboard_plugin_kanban_compact_test",
+        repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    assert mod._compact_tool_feed(None) is None
+    assert mod._compact_tool_feed([]) is None
+    many = [{"id": f"t{i}", "seq": i, "status": "completed"} for i in range(20)]
+    feed = mod._compact_tool_feed(many)
+    assert len(feed) == mod._CARD_TOOL_FEED_LIMIT
+    # Keeps the most recent tail.
+    assert feed[-1]["id"] == "t19"
+
+
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
     client, tmp_path
 ):

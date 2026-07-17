@@ -513,6 +513,85 @@ def _context_state(last_update: Any) -> dict[str, Any] | None:
     return state
 
 
+# --- Live tool-call capture (session/update tool_call / tool_call_update) ----
+# The ACP session streams tool activity as ``tool_call`` (a brand-new call with
+# its full fields) and ``tool_call_update`` (a delta carrying only the fields
+# that changed). We aggregate them per ``toolCallId`` so a running executor's
+# activity - including sub-agent / teammate spawns, which the harness surfaces
+# as a ``tool_call`` for its Task/Agent tool - can be shown as a live feed on
+# the Kanban card. This is deliberately a compact *live view*, distinct from the
+# full post-hoc tool history the native OTel exporter ships to Langfuse; fields
+# are clipped so the aggregate stays small enough to ride in run metadata.
+
+_TOOL_TEXT_PREVIEW_LIMIT = 2000
+_TOOL_MAX_CONTENT_BLOCKS = 12
+_TOOL_MAX_LOCATIONS = 20
+
+
+def _clip_tool_text(value: Any, limit: int = _TOOL_TEXT_PREVIEW_LIMIT) -> str:
+    """Render ``value`` as a bounded string preview (JSON for non-strings)."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    if len(text) > limit:
+        return text[:limit] + "…[truncated]"
+    return text
+
+
+def _normalize_tool_locations(raw: Any) -> list[dict[str, Any]] | None:
+    """Compact ACP ``ToolCallLocation[]`` to ``[{path, line?}]`` (capped)."""
+    if not isinstance(raw, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for loc in raw[:_TOOL_MAX_LOCATIONS]:
+        if not isinstance(loc, dict) or not loc.get("path"):
+            continue
+        entry: dict[str, Any] = {"path": str(loc["path"])}
+        line = loc.get("line")
+        if isinstance(line, int):
+            entry["line"] = line
+        out.append(entry)
+    return out or None
+
+
+def _normalize_tool_content(raw: Any) -> list[dict[str, Any]] | None:
+    """Compact ACP ``ToolCallContent[]`` (content / diff / terminal) blocks.
+
+    Keeps the block ``type`` plus the single most useful field - a text preview,
+    a diff's file path, or a terminal id - so the live feed can show *what* a
+    tool did without carrying full file contents."""
+    if not isinstance(raw, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for block in raw[:_TOOL_MAX_CONTENT_BLOCKS]:
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type") or "unknown")
+        item: dict[str, Any] = {"type": btype}
+        if btype == "content":
+            inner = block.get("content")
+            inner_text = inner.get("text") if isinstance(inner, dict) else None
+            if inner_text:
+                item["text"] = _clip_tool_text(inner_text)
+            elif isinstance(inner, dict) and inner.get("type"):
+                item["text"] = f"[{inner['type']} content]"
+        elif btype == "diff":
+            if block.get("path"):
+                item["path"] = str(block["path"])
+            if block.get("newText") is not None:
+                item["new_text"] = _clip_tool_text(block["newText"])
+            if block.get("oldText") is not None:
+                item["old_text"] = _clip_tool_text(block["oldText"])
+        elif btype == "terminal" and block.get("terminalId"):
+            item["terminal_id"] = str(block["terminalId"])
+        out.append(item)
+    return out or None
+
+
 def _match_session_model_id(wanted: str, available: Any) -> str | None:
     """Pick the advertised modelId matching ``wanted``.
 
@@ -614,6 +693,54 @@ class CopilotACPClient:
         self.last_turn_usage: dict[str, int] | None = None
         self.last_context: dict[str, Any] | None = None
         self._last_usage_update: dict[str, Any] | None = None
+        # Aggregated per-run tool activity, keyed by ACP toolCallId and ordered
+        # by first appearance (dict preserves insertion order on 3.7+). Fed by
+        # the ``tool_call`` / ``tool_call_update`` session updates.
+        self.tool_calls: dict[str, dict[str, Any]] = {}
+        # Optional live callback: invoked with the merged tool-call entry on
+        # each *transition* (a new call or a status change) so a caller can
+        # stream the activity somewhere (the Kanban executor persists it).
+        self._on_tool_activity: Optional[Callable[[dict[str, Any]], None]] = None
+
+    def tool_activity_snapshot(self) -> list[dict[str, Any]]:
+        """Ordered (first-seen) copy of the aggregated tool calls this run."""
+        return [dict(entry) for entry in self.tool_calls.values()]
+
+    def _record_tool_call(self, update: dict[str, Any]) -> dict[str, Any] | None:
+        """Merge one ``tool_call`` / ``tool_call_update`` into ``tool_calls``.
+
+        ACP sends the initial ``tool_call`` with full fields and later
+        ``tool_call_update`` deltas that carry only the changed fields; each
+        present field *replaces* the stored one (ACP replace semantics).
+        Returns the merged entry when this update is a transition worth
+        surfacing live (a newly-seen call or a status change), else ``None`` so
+        callers can throttle update spam."""
+        tc_id = str(update.get("toolCallId") or "").strip()
+        if not tc_id:
+            return None
+        is_new = tc_id not in self.tool_calls
+        entry = self.tool_calls.get(tc_id)
+        if entry is None:
+            entry = {"id": tc_id, "seq": len(self.tool_calls) + 1}
+            self.tool_calls[tc_id] = entry
+        prev_status = entry.get("status")
+        if update.get("title"):
+            entry["title"] = str(update["title"])
+        if update.get("kind"):
+            entry["kind"] = str(update["kind"])
+        if update.get("status"):
+            entry["status"] = str(update["status"])
+        content = _normalize_tool_content(update.get("content"))
+        if content is not None:
+            entry["content"] = content
+        locations = _normalize_tool_locations(update.get("locations"))
+        if locations is not None:
+            entry["locations"] = locations
+        if update.get("rawInput") is not None:
+            entry["raw_input"] = _clip_tool_text(update["rawInput"])
+        if update.get("rawOutput") is not None:
+            entry["raw_output"] = _clip_tool_text(update["rawOutput"])
+        return entry if (is_new or entry.get("status") != prev_status) else None
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -702,6 +829,7 @@ class CopilotACPClient:
         *,
         timeout_seconds: float,
         follow_up: Optional[Callable[[], Optional[str]]] = None,
+        on_tool_activity: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> tuple[str, str]:
         """Run one prompt turn on a fresh ACP session, then close.
 
@@ -710,7 +838,12 @@ class CopilotACPClient:
         each non-empty return is sent as another ``session/prompt`` turn on the
         *same* live session (turn-based interactive steering). ``None``/empty
         ends the loop. Turn outputs are joined so a single response text carries
-        the whole exchange."""
+        the whole exchange.
+
+        ``on_tool_activity`` (optional) is invoked with the merged tool-call
+        entry each time a tool call starts or changes status, so callers can
+        stream a live activity feed while the turn is still running."""
+        self._on_tool_activity = on_tool_activity
         env = _build_subprocess_env()
         env.update(self._extra_env)
         try:
@@ -742,6 +875,7 @@ class CopilotACPClient:
         self.last_turn_usage = None
         self.last_context = None
         self._last_usage_update = None
+        self.tool_calls = {}
         # Streamed agent output captured live, so a mid-turn crash (usage
         # limit / auth death) can still salvage the partial work instead of
         # discarding it when the turn raises. See _run_claude_code_session.
@@ -985,6 +1119,17 @@ class CopilotACPClient:
             kind = str(update.get("sessionUpdate") or "").strip()
             if kind == "usage_update":
                 self._last_usage_update = dict(update)
+                return True
+            if kind in ("tool_call", "tool_call_update"):
+                changed = self._record_tool_call(update)
+                if changed is not None and self._on_tool_activity is not None:
+                    try:
+                        self._on_tool_activity(changed)
+                    except Exception:
+                        logger.debug(
+                            "on_tool_activity callback raised; ignoring",
+                            exc_info=True,
+                        )
                 return True
             content = update.get("content") or {}
             chunk_text = ""

@@ -3344,6 +3344,54 @@ def _append_event(
     )
 
 
+def record_run_tool_activity(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    tool_calls: list[dict],
+    changed: Optional[dict] = None,
+) -> bool:
+    """Persist live tool-call activity for an in-flight run.
+
+    Merges the aggregated ``tool_calls`` list into ``task_runs.metadata`` for
+    ``run_id`` and, when ``changed`` (the single tool call that just started or
+    changed status) is given, appends a compact ``tool_call`` event so
+    WebSocket clients wake and the card/drawer refresh live. Autocommit txn;
+    returns True when the run row was found and updated.
+
+    This is the live-UI feed of what a running external (ACP) executor is doing
+    - including sub-agent / teammate spawns, which arrive as tool calls. It is
+    deliberately separate from the full tool history the native OTel exporter
+    ships to Langfuse.
+    """
+    if not run_id:
+        return False
+    existing = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    if existing is None:
+        return False
+    merged: dict = {}
+    if existing["metadata"]:
+        try:
+            merged = json.loads(existing["metadata"]) or {}
+        except (ValueError, TypeError):
+            merged = {}
+    merged["tool_calls"] = tool_calls
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(merged, ensure_ascii=False), run_id),
+    )
+    if changed:
+        payload = {
+            key: changed[key]
+            for key in ("id", "seq", "title", "kind", "status")
+            if changed.get(key) is not None
+        }
+        _append_event(conn, task_id, "tool_call", payload, run_id=run_id)
+    return True
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9797,3 +9845,37 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+def latest_run_tool_calls(
+    conn: sqlite3.Connection, task_ids: Iterable[str]
+) -> dict[str, list[dict]]:
+    """Batch-fetch the active run's aggregated tool-call feed per task.
+
+    Reads ``task_runs.metadata.tool_calls`` for each task's ``current_run_id``
+    so the dashboard board endpoint can put a live "what is it doing now" feed
+    on running cards in one query. Returns ``task_id`` → ordered tool-call list,
+    omitting tasks with no active run or no captured tool activity.
+    """
+    ids = list(task_ids)
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"""
+        SELECT t.id AS task_id, r.metadata AS metadata
+          FROM tasks t JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.id IN ({placeholders}) AND r.metadata IS NOT NULL
+        """,
+        ids,
+    ).fetchall()
+    out: dict[str, list[dict]] = {}
+    for row in rows:
+        try:
+            meta = json.loads(row["metadata"]) or {}
+        except (ValueError, TypeError):
+            continue
+        calls = meta.get("tool_calls")
+        if isinstance(calls, list) and calls:
+            out[row["task_id"]] = calls
+    return out
