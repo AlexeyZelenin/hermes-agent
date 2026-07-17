@@ -102,6 +102,12 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Statuses from which a task may be PAUSED. Pause is a pre-run hold: it only
+# makes sense before the worker has started, so it applies to the queued
+# statuses ('triage'/'todo'/'ready'). A 'running' task must be blocked/reclaimed
+# (not paused); terminal states ('done'/'archived') have nothing to hold.
+VALID_PAUSE_STATUSES = {"triage", "todo", "ready"}
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -1094,6 +1100,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # First-class pause flag. When True the dispatcher skips this task in both
+    # promotion and spawn while its ``status`` is preserved unchanged. Resume =
+    # set back to False. Orthogonal to status; see the SCHEMA_SQL column note.
+    paused: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1180,6 +1190,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            paused=(
+                bool(row["paused"]) if "paused" in keys and row["paused"] else False
             ),
         )
 
@@ -1369,7 +1382,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- First-class PAUSE flag (issue: prose-'ON HOLD' → real state). Orthogonal
+    -- to ``status``: pausing sets this to 1 while PRESERVING the underlying
+    -- status ('triage'/'todo'/'ready'), so resume is just clearing the flag —
+    -- the task keeps its place. The dispatcher treats ``paused = 1`` as
+    -- ineligible in both promotion (recompute_ready) and spawn (dispatch tick),
+    -- so a paused task is deterministically skipped without losing "what it
+    -- was". 0 = active (the default and prior behaviour for every existing row).
+    paused               INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2190,6 +2211,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "paused" not in cols:
+        # First-class pause flag. Existing rows default to 0 (active), which
+        # preserves their prior dispatch behaviour exactly — nothing was
+        # paused before the column existed.
+        _add_column_if_missing(
+            conn, "tasks", "paused", "paused INTEGER NOT NULL DEFAULT 0"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -3653,9 +3682,12 @@ def recompute_ready(
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
+        # ``paused = 0`` keeps paused tasks pinned in their current status: a
+        # paused 'todo' must not silently graduate to 'ready' behind the flag.
+        # Resuming clears the flag and the next tick promotes it normally.
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') AND paused = 0"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -5561,6 +5593,81 @@ def promote_task(
     return True, None
 
 
+def pause_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Set the first-class pause flag, preserving the underlying status.
+
+    Pause is a hold, not a status: the task's ``status`` is left untouched so
+    resume just clears the flag and the task keeps its place in the queue. The
+    dispatcher skips ``paused`` tasks in both promotion and spawn, so a paused
+    task is deterministically excluded without losing "what it was".
+
+    Only the pre-run statuses in ``VALID_PAUSE_STATUSES`` can be paused. Returns
+    ``(True, None)`` on success (idempotent — pausing an already-paused task
+    succeeds without a duplicate event), or ``(False, reason)`` if refused.
+    """
+    row = conn.execute(
+        "SELECT status, paused FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    if row["paused"]:
+        return True, None  # already paused — idempotent no-op
+    cur_status = row["status"]
+    if cur_status not in VALID_PAUSE_STATUSES:
+        return False, (
+            f"task {task_id} is {cur_status!r}; pause only applies to "
+            f"{sorted(VALID_PAUSE_STATUSES)}"
+        )
+    with write_txn(conn):
+        upd = conn.execute(
+            "UPDATE tasks SET paused = 1 WHERE id = ? AND paused = 0",
+            (task_id,),
+        )
+        if upd.rowcount != 1:
+            return True, None  # raced with another pauser — end state matches
+        _append_event(
+            conn, task_id, "paused", {"actor": actor, "reason": reason, "status": cur_status}
+        )
+    return True, None
+
+
+def resume_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Clear the pause flag; the preserved status makes the task eligible again.
+
+    Idempotent: resuming a task that isn't paused succeeds without an event.
+    Returns ``(True, None)`` on success or ``(False, reason)`` if not found.
+    """
+    row = conn.execute(
+        "SELECT status, paused FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    if not row["paused"]:
+        return True, None  # not paused — idempotent no-op
+    with write_txn(conn):
+        upd = conn.execute(
+            "UPDATE tasks SET paused = 0 WHERE id = ? AND paused = 1",
+            (task_id,),
+        )
+        if upd.rowcount != 1:
+            return True, None  # raced with another resumer — end state matches
+        _append_event(
+            conn, task_id, "resumed", {"actor": actor, "status": row["status"]}
+        )
+    return True, None
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
@@ -6171,6 +6278,25 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _resolve_trunk_base(repo_root: Path) -> str:
+    """Base ref for a NEW task branch: the trunk, not the incidental HEAD.
+
+    Branch sprawl's root cause was every task branching from ``HEAD`` — i.e.
+    whatever the anchor checkout happened to be sitting on (often a stale task
+    branch, since the gateway rarely leaves it on ``main``). Branches then
+    stacked on random bases, main fell behind, and the gateway ran an arbitrary
+    subset. Rooting every task on the trunk instead keeps bases uniform and
+    lets the trunk-integrator merge them back cleanly.
+
+    Prefers local ``main`` then ``master``; falls back to ``HEAD`` when neither
+    exists (a repo with an unconventional trunk) — never worse than before.
+    """
+    for name in ("main", "master"):
+        if _git_branch_exists(repo_root, name):
+            return name
+    return "HEAD"
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -6185,7 +6311,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), _resolve_trunk_base(repo_root),
         ]
     result = subprocess.run(
         cmd,
@@ -6270,6 +6396,156 @@ def _resolve_worktree_workspace(
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
+
+
+def _integration_anchor(task: Task, board: Optional[str]) -> tuple[Path, Optional[Path]]:
+    """Resolve ``(repo_root, worktree_path)`` for landing/pruning a task.
+
+    The *anchor* is the board's ``default_workdir`` checkout — where trunk
+    lives and the merge happens. The *worktree* is the task's own
+    ``.worktrees/<id>`` checkout, pruned after a successful land. Falls back to
+    the task's own workspace repo when no board default is configured.
+    """
+    board_slug = board or get_current_board()
+    wt: Optional[Path] = (
+        Path(task.workspace_path).expanduser() if task.workspace_path else None
+    )
+    from hermes_cli.trunk_integrator import main_worktree_root
+
+    board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
+    # Landing merges on the MAIN checkout, never inside the task's linked
+    # worktree — normalize whatever we resolve to the main worktree root.
+    repo_root: Optional[Path] = None
+    if board_default:
+        repo_root = main_worktree_root(Path(board_default).expanduser())
+    if repo_root is None and wt is not None:
+        repo_root = main_worktree_root(wt)
+    if repo_root is None:
+        raise ValueError(
+            f"task {task.id}: cannot resolve an anchor git repo to integrate into "
+            f"(board {board_slug!r} has no default_workdir and task has no workspace)"
+        )
+    if wt is None:
+        wt = repo_root / ".worktrees" / task.id
+    return repo_root, wt
+
+
+def _prune_task_worktree(repo_root: Path, worktree: Optional[Path], branch: str) -> None:
+    """Remove a landed task's worktree + branch (branch hygiene after a land)."""
+    if worktree is not None and Path(worktree).exists():
+        subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(worktree)],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    subprocess.run(
+        ["git", "-C", str(repo_root), "branch", "-D", branch],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "prune"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+
+
+def _reopen_blocked_for_integration(
+    conn: sqlite3.Connection, task_id: str, *, reason: str, detail: str = ""
+) -> None:
+    """Move a completed task back to ``blocked`` after a failed land.
+
+    ``block_task`` only transitions ``running``/``ready`` (worker-self-block
+    during a run); an integration failure happens post-completion, on a ``done``
+    task, so we reopen it explicitly. The branch is preserved — no work lost.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status='blocked', block_kind='transient',
+                   claim_lock=NULL, claim_expires=NULL, worker_pid=NULL
+             WHERE id=? AND status IN ('done', 'review', 'running', 'ready')
+            """,
+            (task_id,),
+        )
+        if cur.rowcount == 1:
+            _append_event(
+                conn, task_id, "integration_blocked",
+                {"reason": reason, "detail": detail[:500]},
+            )
+    add_comment(
+        conn, task_id, "integrator",
+        f"BLOCKED (integration): {reason}. Branch preserved; work is not lost. "
+        f"{detail[:300]}".strip(),
+    )
+
+
+def integrate_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    test_cmd: Optional[list[str]] = None,
+    run_tests: bool = True,
+    prune: bool = True,
+):
+    """Land a completed task's branch into trunk (merge-queue landing step).
+
+    Serialized under the repo's trunk lock. On a green merge the branch is
+    merged into trunk, its worktree + branch pruned, and an
+    ``integration_landed`` event recorded. On a conflict or red suite the task
+    is reopened to ``blocked`` with its branch preserved. Idempotent: a branch
+    already in trunk is a no-op that still prunes.
+
+    Returns the :class:`trunk_integrator.IntegrationResult`.
+    """
+    from hermes_cli import trunk_integrator as _ti
+
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task {task_id!r}")
+    branch = (task.branch_name or "").strip()
+    if not branch:
+        return _ti.IntegrationResult(
+            _ti.Outcome.NO_BRANCH, "", "", detail="task has no branch to integrate"
+        )
+
+    repo_root, worktree = _integration_anchor(task, board)
+
+    with _ti.TrunkLock(repo_root):
+        res = _ti.integrate_branch(
+            repo_root, branch, test_cmd=test_cmd, run_tests=run_tests
+        )
+
+    if res.outcome.landed:
+        if prune:
+            _prune_task_worktree(repo_root, worktree, branch)
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "integration_landed",
+                {
+                    "branch": branch, "trunk": res.trunk,
+                    "merged_sha": res.merged_sha, "outcome": res.outcome.value,
+                    "pruned": bool(prune),
+                },
+            )
+        sha = f" @ {res.merged_sha[:12]}" if res.merged_sha else ""
+        add_comment(
+            conn, task_id, "integrator",
+            f"Landed {branch} -> {res.trunk}{sha} ({res.outcome.value}).",
+        )
+    elif res.outcome.should_block:
+        reason = (
+            f"integration conflict merging {branch} into {res.trunk}"
+            if res.outcome is _ti.Outcome.CONFLICT
+            else f"landing-gate tests failed on {res.trunk} merged with {branch}"
+        )
+        _reopen_blocked_for_integration(conn, task_id, reason=reason, detail=res.detail)
+    else:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "integration_skipped",
+                {"branch": branch, "outcome": res.outcome.value, "detail": res.detail[:500]},
+            )
+    return res
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -8248,9 +8524,12 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
+    # ``paused = 0`` is the hard spawn gate for the pause flag: a paused task
+    # never gets claimed/spawned regardless of how it reached 'ready'. This is
+    # the single deterministic eligibility check the design calls for.
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "WHERE status = 'ready' AND claim_lock IS NULL AND paused = 0 "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # The board pool is an additional cap to global max_in_progress. It is a

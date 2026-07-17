@@ -51,10 +51,11 @@ def _fmt_ts(ts: Optional[int]) -> str:
 
 
 def _fmt_task_line(t: kb.Task) -> str:
-    icon = _STATUS_ICONS.get(t.status, "?")
+    icon = "⏸" if getattr(t, "paused", False) else _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    status = f"{t.status} (paused)" if getattr(t, "paused", False) else t.status
+    return f"{icon} {t.id}  {status:16s}  {assignee:20s}{tenant}  {t.title}"
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
@@ -64,6 +65,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "paused": bool(t.paused),
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -602,6 +604,32 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
+    p_integrate = sub.add_parser(
+        "integrate",
+        help="Merge a completed task's branch into trunk (test-gated, serialized)",
+        description=(
+            "Trunk integrator / merge-queue landing step. Merges the task's "
+            "branch into the local trunk (main), runs the landing-gate test "
+            "suite on the MERGED result, and lands only when green. A conflict "
+            "or red suite reopens the task as blocked with its branch "
+            "preserved. Serialized under a repo lock; idempotent."
+        ),
+    )
+    p_integrate.add_argument("task_id")
+    p_integrate.add_argument(
+        "--no-tests", action="store_true",
+        help="Skip the landing-gate suite (merge + land only). Use with care.",
+    )
+    p_integrate.add_argument(
+        "--test-cmd", default=None,
+        help="Override the landing-gate command (default: scripts/run_tests.sh). "
+             "Shell-split; runs in the merged trunk checkout.",
+    )
+    p_integrate.add_argument(
+        "--no-prune", action="store_true",
+        help="Keep the task's worktree + branch after a successful land.",
+    )
+
     p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled tasks to ready")
     p_unblock.add_argument(
         "--reason",
@@ -640,6 +668,40 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--json",
         dest="json",
         action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
+    p_pause = sub.add_parser(
+        "pause",
+        help="Pause one or more triage/todo/ready tasks (flag, not status — "
+             "the dispatcher skips them; underlying status is preserved)",
+    )
+    p_pause.add_argument("task_id")
+    p_pause.add_argument(
+        "reason", nargs="*",
+        help="Audit-trail reason (recorded on the task_events row)",
+    )
+    p_pause.add_argument(
+        "--ids", nargs="+", default=None,
+        help="Additional task ids to pause with the same reason (bulk mode)",
+    )
+    p_pause.add_argument(
+        "--json", dest="json", action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
+    p_resume = sub.add_parser(
+        "resume",
+        help="Resume (unpause) one or more paused tasks — clears the flag; "
+             "the task keeps its place in the queue",
+    )
+    p_resume.add_argument("task_id")
+    p_resume.add_argument(
+        "--ids", nargs="+", default=None,
+        help="Additional task ids to resume (bulk mode)",
+    )
+    p_resume.add_argument(
+        "--json", dest="json", action="store_true",
         help="Emit machine-readable JSON result",
     )
 
@@ -980,9 +1042,12 @@ def kanban_command(args: argparse.Namespace) -> int:
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
+            "integrate": _cmd_integrate,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "pause":    _cmd_pause,
+            "resume":   _cmd_resume,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -2078,6 +2143,31 @@ def _cmd_block(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_integrate(args: argparse.Namespace) -> int:
+    """Land a completed task's branch into trunk (merge-queue landing step)."""
+    import shlex
+
+    test_cmd = shlex.split(args.test_cmd) if getattr(args, "test_cmd", None) else None
+    with kb.connect_closing() as conn:
+        res = kb.integrate_task(
+            conn,
+            args.task_id,
+            test_cmd=test_cmd,
+            run_tests=not getattr(args, "no_tests", False),
+            prune=not getattr(args, "no_prune", False),
+        )
+    print(str(res))
+    if res.outcome.landed:
+        return 0
+    if res.outcome.should_block:
+        print(
+            f"{args.task_id} reopened as blocked; branch {res.branch} preserved.",
+            file=sys.stderr,
+        )
+        return 1
+    return 2  # dirty anchor / error / no branch — nothing landed, nothing blocked
+
+
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
@@ -2170,6 +2260,62 @@ def _cmd_promote(args: argparse.Namespace) -> int:
             print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
+    return 0 if not failed else 1
+
+
+def _dedupe_ids(primary: str, extra: Optional[list]) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for tid in [primary, *(extra or [])]:
+        if tid not in seen:
+            ids.append(tid)
+            seen.add(tid)
+    return ids
+
+
+def _cmd_pause(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if getattr(args, "reason", None) else None
+    author = _profile_author()
+    as_json = getattr(args, "json", False)
+    ids = _dedupe_ids(args.task_id, getattr(args, "ids", None))
+    results: list[dict[str, object]] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            ok, err = kb.pause_task(conn, tid, actor=author, reason=reason)
+            results.append({"task_id": tid, "paused": ok, "reason": reason, "error": err})
+    failed = [r for r in results if not r["paused"]]
+    if as_json:
+        print(json.dumps(results[0] if len(results) == 1 else results,
+                         indent=2, ensure_ascii=False))
+        return 0 if not failed else 1
+    for r in results:
+        if r["paused"]:
+            suffix = f": {reason}" if reason else ""
+            print(f"Paused {r['task_id']}{suffix}")
+        else:
+            print(f"cannot pause {r['task_id']}: {r['error']}", file=sys.stderr)
+    return 0 if not failed else 1
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    author = _profile_author()
+    as_json = getattr(args, "json", False)
+    ids = _dedupe_ids(args.task_id, getattr(args, "ids", None))
+    results: list[dict[str, object]] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            ok, err = kb.resume_task(conn, tid, actor=author)
+            results.append({"task_id": tid, "resumed": ok, "error": err})
+    failed = [r for r in results if not r["resumed"]]
+    if as_json:
+        print(json.dumps(results[0] if len(results) == 1 else results,
+                         indent=2, ensure_ascii=False))
+        return 0 if not failed else 1
+    for r in results:
+        if r["resumed"]:
+            print(f"Resumed {r['task_id']}")
+        else:
+            print(f"cannot resume {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
 
 
