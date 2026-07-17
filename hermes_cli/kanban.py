@@ -1523,11 +1523,35 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        # Transitive sub-tasks for the epic token rollup (cycle-safe BFS over
+        # child links). Gathered while the board conn is open.
+        subtree: list[str] = []
+        _seen = {args.task_id}
+        _queue = list(children)
+        while _queue:
+            cur = _queue.pop()
+            if cur in _seen:
+                continue
+            _seen.add(cur)
+            subtree.append(cur)
+            _queue.extend(kb.child_ids(conn, cur))
+
+    # Build cost (ROI) from the zeus token ledger: this card's own spend plus a
+    # rollup over its sub-tasks. Degrades to None when the ledger is absent.
+    from hermes_cli import zeus_tokens
+    _zeus = zeus_tokens.connect()
+    try:
+        _per_task = zeus_tokens.aggregate_by_task(_zeus, [args.task_id, *subtree])
+    finally:
+        if _zeus is not None:
+            _zeus.close()
+    token_cost = zeus_tokens.token_cost(args.task_id, _per_task, subtree)
 
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
             "latest_summary": latest_summary,
+            "token_cost": token_cost,
             "parents": parents,
             "children": children,
             "comments": [
@@ -1601,6 +1625,23 @@ def _cmd_show(args: argparse.Namespace) -> int:
         else:
             print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
     print(f"  created:   {_fmt_ts(task.created_at)} by {task.created_by or '-'}")
+    if token_cost:
+        from hermes_cli.zeus_tokens import humanize_tokens
+        own = token_cost.get("own")
+        roll = token_cost.get("rollup")
+        if own:
+            line = f"  cost:      {humanize_tokens(own['total_tokens'])} tokens to build"
+            if own.get("cost_usd") is not None:
+                line += f" (~${own['cost_usd']:.2f})"
+            print(line)
+        if roll:
+            line = (
+                f"  epic cost: {humanize_tokens(roll['total_tokens'])} tokens "
+                f"over {roll['task_count']} cards"
+            )
+            if roll.get("cost_usd") is not None:
+                line += f" (~${roll['cost_usd']:.2f})"
+            print(line)
 
     # Diagnostics section — surface active distress signals at the top
     # of show output so CLI users see them before scrolling through

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -2564,3 +2565,121 @@ def test_orchestration_global_agent_limit_round_trip(client, kanban_home):
     r = client.put("/api/plugins/kanban/orchestration",
                    json={"max_in_progress": -1})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# ROI view — per-card build cost from the zeus token ledger (t_f5d68657)
+# ---------------------------------------------------------------------------
+
+# Mirrors the production token_usage schema (~/.hermes/zeus/zeus.db).
+_ZEUS_SCHEMA = """
+CREATE TABLE token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    task_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    subscription TEXT NOT NULL DEFAULT '',
+    effort TEXT NOT NULL DEFAULT '',
+    context_used INTEGER,
+    context_size INTEGER,
+    cost_usd REAL
+);
+CREATE INDEX idx_usage_task ON token_usage(task_id);
+"""
+
+
+def _seed_zeus(home: Path, rows):
+    """Create ``home/zeus/zeus.db`` and insert ``rows``.
+
+    Each row is ``(task_id, ts, prompt, completion, total, cost_usd)``. This is
+    the same ledger path the dashboard resolves via ``HERMES_HOME`` (set by the
+    ``kanban_home`` fixture), so no live ledger is touched.
+    """
+    db = home / "zeus" / "zeus.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    conn.executescript(_ZEUS_SCHEMA)
+    conn.executemany(
+        "INSERT INTO token_usage "
+        "(task_id, ts, prompt_tokens, completion_tokens, total_tokens, cost_usd) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        list(rows),
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _find_card(board_json, task_id):
+    for col in board_json["columns"]:
+        for card in col["tasks"]:
+            if card["id"] == task_id:
+                return card
+    return None
+
+
+def test_board_omits_token_cost_without_ledger(client):
+    """No zeus.db present -> cards carry no token_cost badge (graceful degrade)."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "no ledger"}).json()["task"]
+    card = _find_card(client.get("/api/plugins/kanban/board").json(), t["id"])
+    assert card is not None
+    assert "token_cost" not in card
+
+
+def test_board_shows_own_token_cost(client, kanban_home):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "expensive"}).json()["task"]
+    _seed_zeus(kanban_home, [
+        (t["id"], 1.0, 100, 50, 150, 0.10),
+        (t["id"], 2.0, 200, 100, 300, 0.20),  # a second turn on the same card
+    ])
+    card = _find_card(client.get("/api/plugins/kanban/board").json(), t["id"])
+    assert card["token_cost"]["own"]["total_tokens"] == 450
+    assert card["token_cost"]["own"]["cost_usd"] == pytest.approx(0.30)
+    assert "rollup" not in card["token_cost"]  # leaf card, no epic rollup
+
+
+def test_board_epic_rolls_up_child_token_cost(client, kanban_home):
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "epic"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "sub", "parents": [parent["id"]]},
+    ).json()["task"]
+    _seed_zeus(kanban_home, [
+        (parent["id"], 1.0, 40, 60, 100, 0.10),   # orchestration/meta spend
+        (child["id"], 2.0, 200, 100, 300, 0.30),  # the sub-task's build spend
+    ])
+    board = client.get("/api/plugins/kanban/board").json()
+    pcard = _find_card(board, parent["id"])
+    assert pcard["token_cost"]["own"]["total_tokens"] == 100
+    assert pcard["token_cost"]["rollup"]["total_tokens"] == 400  # 100 + 300
+    assert pcard["token_cost"]["rollup"]["cost_usd"] == pytest.approx(0.40)
+    assert pcard["token_cost"]["rollup"]["task_count"] == 2
+    # The child card shows only its own cost (it is a leaf).
+    ccard = _find_card(board, child["id"])
+    assert ccard["token_cost"]["own"]["total_tokens"] == 300
+    assert "rollup" not in ccard["token_cost"]
+
+
+def test_task_detail_includes_token_cost(client, kanban_home):
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "epic"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "sub", "parents": [parent["id"]]},
+    ).json()["task"]
+    _seed_zeus(kanban_home, [
+        (parent["id"], 1.0, 40, 60, 100, None),
+        (child["id"], 2.0, 200, 100, 300, 0.30),
+    ])
+    detail = client.get(f"/api/plugins/kanban/tasks/{parent['id']}").json()
+    tc = detail["task"]["token_cost"]
+    assert tc["own"]["total_tokens"] == 100
+    assert tc["rollup"]["total_tokens"] == 400
+    # parent cost was unpriced (None); only the child's $0.30 rolls up.
+    assert tc["rollup"]["cost_usd"] == pytest.approx(0.30)

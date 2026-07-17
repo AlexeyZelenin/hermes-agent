@@ -2789,6 +2789,40 @@
   // Card
   // -------------------------------------------------------------------------
 
+  // Compact token count for the ROI badge (e.g. 410000 -> "410K", 1.5e6 -> "1.5M").
+  // Mirrors zeus_tokens.humanize_tokens on the backend.
+  function formatTokens(n) {
+    if (n == null) return "";
+    if (n >= 1e6) {
+      const v = n / 1e6;
+      const r = Math.round(v);
+      return (Math.abs(v - r) < 0.05 ? r : v.toFixed(1)) + "M";
+    }
+    if (n >= 1e3) {
+      const v = n / 1e3;
+      const r = Math.round(v);
+      return (Math.abs(v - r) < 0.05 ? r : v.toFixed(1)) + "K";
+    }
+    return String(n);
+  }
+
+  // Human sentence for a card/drawer token-cost tooltip.
+  function tokenCostTitle(tc) {
+    if (!tc) return "";
+    const parts = [];
+    if (tc.own) {
+      let s = `This card burned ${tc.own.total_tokens.toLocaleString()} tokens to build`;
+      if (tc.own.cost_usd != null) s += ` (~$${tc.own.cost_usd.toFixed(2)})`;
+      parts.push(s + ".");
+    }
+    if (tc.rollup) {
+      let s = `Epic total: ${tc.rollup.total_tokens.toLocaleString()} tokens over ${tc.rollup.task_count} card${tc.rollup.task_count === 1 ? "" : "s"}`;
+      if (tc.rollup.cost_usd != null) s += ` (~$${tc.rollup.cost_usd.toFixed(2)})`;
+      parts.push(s + ".");
+    }
+    return parts.join(" ");
+  }
+
   // Staleness tiers — amber after a grace window, red when clearly stuck.
   // Values below are seconds.
   const STALENESS = {
@@ -2966,6 +3000,22 @@
                             title: `Model: ${t.model_override}` },
                   "⚙ ", t.model_override)
               : null,
+            (function () {
+              // ROI badge — "what did this card cost to build". Shows the
+              // card's own token spend, plus the epic rollup when it has
+              // sub-tasks that also burned tokens.
+              const tc = t.token_cost;
+              if (!tc) return null;
+              const ownTok = tc.own ? tc.own.total_tokens : 0;
+              const rollTok = tc.rollup ? tc.rollup.total_tokens : 0;
+              const label = tc.rollup
+                ? `🔥 ${formatTokens(rollTok)}` + (tc.own ? ` (${formatTokens(ownTok)})` : "")
+                : `🔥 ${formatTokens(ownTok)}`;
+              return h("span", {
+                className: "hermes-kanban-count hermes-kanban-token-cost",
+                title: tokenCostTitle(tc),
+              }, label);
+            })(),
             h("span", { className: "hermes-kanban-ago",
                         title: t.created_at ? `Created ${t.created_at}` : "" },
               timeAgo ? timeAgo(t.created_at) : ""),
@@ -3623,6 +3673,31 @@
             : "on",
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
+        (function () {
+          // ROI: build cost for this card, and the epic rollup when present.
+          const tc = t.token_cost;
+          if (!tc) return null;
+          const rows = [];
+          if (tc.own) {
+            let v = `${tc.own.total_tokens.toLocaleString()} tokens`;
+            if (tc.own.cost_usd != null) v += ` (~$${tc.own.cost_usd.toFixed(2)})`;
+            rows.push(h(MetaRow, {
+              key: "tok-own",
+              label: tx(i18n, "buildCost", "Build cost"),
+              value: v,
+            }));
+          }
+          if (tc.rollup) {
+            let v = `${tc.rollup.total_tokens.toLocaleString()} tokens over ${tc.rollup.task_count} card${tc.rollup.task_count === 1 ? "" : "s"}`;
+            if (tc.rollup.cost_usd != null) v += ` (~$${tc.rollup.cost_usd.toFixed(2)})`;
+            rows.push(h(MetaRow, {
+              key: "tok-epic",
+              label: tx(i18n, "epicCost", "Epic cost"),
+              value: v,
+            }));
+          }
+          return rows;
+        })(),
       ),
       h(StatusActions, {
         task: t,

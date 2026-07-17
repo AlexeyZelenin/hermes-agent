@@ -593,6 +593,14 @@
   align-items: center;
 }
 
+/* ROI build-cost chip — token spend per card / epic rollup. Muted so it
+   reads as a secondary metric, not an alert. */
+.hermes-kanban-token-cost {
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* Per-task model chip — long model ids ellipsize instead of widening cards. */
 .hermes-kanban-model {
   max-width: 11rem;

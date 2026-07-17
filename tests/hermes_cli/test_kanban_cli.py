@@ -565,3 +565,91 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+# ---------------------------------------------------------------------------
+# ROI view — build cost surfaced in `kanban show` (t_f5d68657)
+# ---------------------------------------------------------------------------
+
+_ZEUS_SCHEMA = """
+CREATE TABLE token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    task_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    subscription TEXT NOT NULL DEFAULT '',
+    effort TEXT NOT NULL DEFAULT '',
+    context_used INTEGER,
+    context_size INTEGER,
+    cost_usd REAL
+);
+CREATE INDEX idx_usage_task ON token_usage(task_id);
+"""
+
+
+def _seed_zeus_cli(home: Path, rows):
+    import sqlite3
+    db = home / "zeus" / "zeus.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    conn.executescript(_ZEUS_SCHEMA)
+    conn.executemany(
+        "INSERT INTO token_usage "
+        "(task_id, ts, prompt_tokens, completion_tokens, total_tokens, cost_usd) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        list(rows),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _tid(out: str) -> str:
+    import re
+    return re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+
+def test_show_reports_build_cost(kanban_home):
+    tid = _tid(kc.run_slash("create 'expensive feature'"))
+    _seed_zeus_cli(kanban_home, [
+        (tid, 1.0, 100, 50, 150000, 0.10),
+        (tid, 2.0, 200, 100, 300000, 0.20),
+    ])
+    show = kc.run_slash(f"show {tid}")
+    assert "cost:" in show
+    assert "450K tokens to build" in show
+    assert "$0.30" in show
+
+
+def test_show_epic_rolls_up_child_cost(kanban_home):
+    parent = _tid(kc.run_slash("create 'epic'"))
+    child = _tid(kc.run_slash(f"create 'sub' --parent {parent}"))
+    _seed_zeus_cli(kanban_home, [
+        (parent, 1.0, 40, 60, 100000, 0.10),
+        (child, 2.0, 200, 100, 300000, 0.30),
+    ])
+    show = kc.run_slash(f"show {parent}")
+    assert "epic cost:" in show
+    assert "400K tokens over 2 cards" in show
+
+
+def test_show_json_includes_token_cost(kanban_home):
+    tid = _tid(kc.run_slash("create 'x'"))
+    _seed_zeus_cli(kanban_home, [(tid, 1.0, 100, 50, 150, 0.10)])
+    out = kc.run_slash(f"show {tid} --json")
+    payload = json.loads(out)
+    assert payload["token_cost"]["own"]["total_tokens"] == 150
+
+
+def test_show_without_ledger_has_no_cost_line(kanban_home):
+    tid = _tid(kc.run_slash("create 'x'"))
+    show = kc.run_slash(f"show {tid}")
+    assert "cost:" not in show
+    out = kc.run_slash(f"show {tid} --json")
+    assert json.loads(out)["token_cost"] is None

@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import zeus_tokens
 
 log = logging.getLogger(__name__)
 
@@ -174,6 +175,38 @@ def _task_dict(
     d["latest_summary"] = latest_summary
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
+
+
+def _board_token_costs(
+    task_ids: list[str],
+    children_map: dict[str, list[str]],
+) -> dict[str, dict[str, Any]]:
+    """Map each task id to its ROI build cost (own spend + epic rollup).
+
+    Reads the zeus token ledger once for the whole board — across the visible
+    cards *and* their transitive sub-tasks, so an epic's rollup still counts
+    children that are archived or filtered out of the current view. Only ids
+    with ledger data appear in the result; a missing ledger yields ``{}``.
+    """
+    wanted: set[str] = set(task_ids)
+    for tid in task_ids:
+        wanted |= zeus_tokens.descendants(tid, children_map)
+    zeus_conn = zeus_tokens.connect()
+    try:
+        per_task = zeus_tokens.aggregate_by_task(zeus_conn, wanted)
+    finally:
+        if zeus_conn is not None:
+            zeus_conn.close()
+    if not per_task:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for tid in task_ids:
+        tc = zeus_tokens.token_cost(
+            tid, per_task, zeus_tokens.descendants(tid, children_map)
+        )
+        if tc:
+            out[tid] = tc
+    return out
 
 
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
@@ -406,8 +439,11 @@ def get_board(
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
-        # Pre-fetch link counts per task (cheap: one query).
+        # Pre-fetch link counts per task (cheap: one query). The same pass
+        # builds the parent->children adjacency used to roll up an epic's
+        # token cost over its sub-tasks.
         link_counts: dict[str, dict[str, int]] = {}
+        children_map: dict[str, list[str]] = {}
         for row in conn.execute(
             "SELECT parent_id, child_id FROM task_links"
         ).fetchall():
@@ -417,6 +453,7 @@ def get_board(
             link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})[
                 "parents"
             ] += 1
+            children_map.setdefault(row["parent_id"], []).append(row["child_id"])
 
         # Comment + event counts (both cheap aggregates).
         comment_counts: dict[str, int] = {
@@ -459,6 +496,11 @@ def get_board(
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
 
+        # Per-card build cost from the zeus token ledger (ROI view). One
+        # batched read across every card on the board; degrades to {} when
+        # the ledger is absent so the cards simply carry no cost badge.
+        token_costs = _board_token_costs([t.id for t in tasks], children_map)
+
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
@@ -468,6 +510,9 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            tc = token_costs.get(t.id)
+            if tc:
+                d["token_cost"] = tc  # omitted when the card burned no tokens
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
@@ -568,6 +613,24 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
+        # Build cost (ROI): this card's own token spend plus a rollup over its
+        # sub-tasks. Built from the full task_links graph so a deep epic rolls
+        # up correctly. Omitted when neither the card nor its sub-tasks cost
+        # anything (or the zeus ledger is absent).
+        children_map = zeus_tokens.build_children_map(
+            (r["parent_id"], r["child_id"])
+            for r in conn.execute("SELECT parent_id, child_id FROM task_links")
+        )
+        subtree = zeus_tokens.descendants(task_id, children_map)
+        zeus_conn = zeus_tokens.connect()
+        try:
+            per_task = zeus_tokens.aggregate_by_task(zeus_conn, {task_id, *subtree})
+        finally:
+            if zeus_conn is not None:
+                zeus_conn.close()
+        tc = zeus_tokens.token_cost(task_id, per_task, subtree)
+        if tc:
+            task_d["token_cost"] = tc
         return {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
