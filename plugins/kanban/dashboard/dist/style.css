@@ -147,14 +147,6 @@
   background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
 }
 
-.hermes-kanban-column-sub {
-  padding: 0 0.25rem 0.5rem;
-  font-size: 0.7rem;
-  color: var(--color-muted-foreground);
-  border-bottom: 1px solid color-mix(in srgb, var(--color-border) 60%, transparent);
-  margin-bottom: 0.5rem;
-}
-
 .hermes-kanban-column-body {
   display: flex;
   flex-direction: column;

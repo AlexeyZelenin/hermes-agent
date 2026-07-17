@@ -343,6 +343,97 @@
     } catch (_e) { /* ignore malformed URL / hardened browser */ }
   }
 
+  // -------------------------------------------------------------------------
+  // Client log (t_adf37522). The engine room needs the FRONTEND's own log:
+  // UI actions, WS events, optimistic renders, and JS errors. This is the only
+  // trace a frontend-only bug leaves — a phantom card that renders but never
+  // reaches the backend is invisible to every server log. Entries are buffered
+  // and flushed in throttled batches to POST /client-log, which sanitises and
+  // stores them into engine_log. Everything here is best-effort and MUST NEVER
+  // throw into the app: logging is a diagnostic, not a feature.
+  // -------------------------------------------------------------------------
+  const clientLog = (function () {
+    // Correlate one page load. Random enough to group a session without any PII.
+    const sessionId = "web-" + Math.random().toString(36).slice(2, 10) + "-" +
+      (Date.now ? Date.now().toString(36) : "0");
+    const MAX_BUFFER = 100;   // cap so a runaway loop can't grow memory unbounded
+    const FLUSH_MS = 2000;    // coalesce bursts; errors flush immediately
+    let buffer = [];
+    let board = null;
+    let timer = null;
+    let flushing = false;
+
+    function setBoard(slug) { board = slug || null; }
+
+    function flush() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (flushing || !buffer.length) return;
+      const batch = buffer;
+      buffer = [];
+      flushing = true;
+      const payload = JSON.stringify({ entries: batch, session_id: sessionId });
+      let done = false;
+      const finish = function () { flushing = false; };
+      try {
+        // authedFetch handles auth in both loopback + gated modes and applies
+        // the dashboard base path. Fire-and-forget; on failure the batch is
+        // dropped (diagnostics, not durable data — never block the UI on it).
+        SDK.authedFetch(withBoard(`${API}/client-log`, board), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: payload,
+        }).then(finish, finish);
+        done = true;
+      } catch (_e) { /* authedFetch missing / threw synchronously */ }
+      if (!done) finish();
+    }
+
+    function log(severity, category, event, extra) {
+      try {
+        if (!event) return;
+        const entry = {
+          severity: severity || "info",
+          category: category || null,
+          event: String(event).slice(0, 120),
+          created_at: Math.floor((Date.now ? Date.now() : 0) / 1000),
+        };
+        if (extra) {
+          if (extra.task_id) entry.task_id = String(extra.task_id).slice(0, 80);
+          if (extra.payload) entry.payload = extra.payload;
+        }
+        buffer.push(entry);
+        if (buffer.length > MAX_BUFFER) buffer.shift();
+        if (severity === "error") { flush(); return; }
+        if (!timer) timer = setTimeout(flush, FLUSH_MS);
+      } catch (_e) { /* logging must never throw */ }
+    }
+
+    // Global JS-error hooks — the phantom-row catcher. Installed once; a render
+    // that throws or an unhandled promise rejection now leaves a client-log row.
+    if (!window.__HERMES_KANBAN_CLIENTLOG__) {
+      window.__HERMES_KANBAN_CLIENTLOG__ = true;
+      try {
+        window.addEventListener("error", function (e) {
+          log("error", "error", "window.error", {
+            payload: {
+              message: e && e.message ? String(e.message).slice(0, 500) : "",
+              source: e && e.filename ? String(e.filename).slice(0, 200) : "",
+              line: e ? e.lineno : null,
+            },
+          });
+        });
+        window.addEventListener("unhandledrejection", function (e) {
+          const r = e && e.reason;
+          log("error", "error", "unhandledrejection", {
+            payload: { reason: r ? String(r.message || r).slice(0, 500) : "" },
+          });
+        });
+      } catch (_e) { /* addEventListener unavailable — skip */ }
+    }
+
+    return { log: log, flush: flush, setBoard: setBoard, sessionId: sessionId };
+  })();
+
   // The SDK's Select component fires ``onValueChange(value)`` directly
   // (it's a shadcn-style popup, not a native <select>). Older plugin
   // code calls ``onChange({target: {value}})`` which silently never
@@ -758,12 +849,18 @@
           let ws;
           try { ws = new WebSocket(url); } catch (_e) { return; }
           wsRef.current = ws;
-          ws.onopen = function () { wsBackoffRef.current = 1000; };
+          ws.onopen = function () {
+            wsBackoffRef.current = 1000;
+            clientLog.log("info", "ws", "ws.open", { payload: { board: board || null } });
+          };
           ws.onmessage = function (ev) {
             try {
               const msg = JSON.parse(ev.data);
               if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
                 cursorRef.current = msg.cursor || cursorRef.current;
+                clientLog.log("debug", "ws", "ws.events", {
+                  payload: { count: msg.events.length, cursor: cursorRef.current },
+                });
                 // Stamp per-task signal so the TaskDrawer can reload itself.
                 setTaskEventTick(function (prev) {
                   const next = Object.assign({}, prev);
@@ -778,6 +875,10 @@
           };
           ws.onclose = function (ev) {
             if (wsClosedRef.current) return;
+            clientLog.log(
+              (ev && ev.code === 1008) ? "error" : "warn", "ws", "ws.close",
+              { payload: { code: ev ? ev.code : null } },
+            );
             if (ev && ev.code === 1008) {
               setError(tx(t, "wsAuthFailed",
                 "WebSocket auth failed — reload the page to refresh the session token."));
@@ -802,6 +903,14 @@
         try { wsRef.current && wsRef.current.close(); } catch (_e) { /* noop */ }
       };
     }, [!!boardData, board, scheduleReload]);
+
+    // Keep the client logger pointed at the board the user is viewing so its
+    // flushed entries land on the right board's engine_log. Flush any pending
+    // buffer on unmount so a navigation away doesn't drop the tail.
+    useEffect(function () {
+      clientLog.setBoard(board);
+      return function () { clientLog.flush(); };
+    }, [board]);
 
     // --- filtering ----------------------------------------------------------
     const filteredBoard = useMemo(function () {
@@ -832,6 +941,11 @@
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       const patch = withCompletionSummary({ status: newStatus }, 1, t);
       if (!patch) return;
+      // Optimistic render: the card jumps columns before the server confirms.
+      // Log it so a phantom/desynced card is traceable to the exact move.
+      clientLog.log("info", "optimistic", "task.move", {
+        task_id: taskId, payload: { to: newStatus },
+      });
       setBoardData(function (b) {
         if (!b) return b;
         let moved = null;
@@ -853,6 +967,12 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
       }).catch(function (err) {
+        // Optimistic move rejected — the card is reverting. This is exactly the
+        // frontend/backend divergence that produces phantom rows, so log it.
+        clientLog.log("error", "optimistic", "task.move.revert", {
+          task_id: taskId,
+          payload: { to: newStatus, error: parseApiErrorMessage(err) },
+        });
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         loadBoard();
       });
@@ -2912,8 +3032,6 @@
           onClick: function () { setShowCreate(function (v) { return !v; }); },
         }, showCreate ? "×" : "+"),
       ),
-      h("div", { className: "hermes-kanban-column-sub" },
-        colHelp || ""),
       showCreate ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
