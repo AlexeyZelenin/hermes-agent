@@ -303,7 +303,7 @@ def update_subscription(name: str, **fields: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 _LIMIT_PATTERNS = re.compile(
-    r"hit your usage limit"
+    r"hit your (?:usage|session|weekly|5-hour|five-hour) limit"
     r"|usage limit reached"
     r"|reached your (?:usage|session|weekly) limit"
     r"|(?:5-hour|five-hour|session|weekly) limit reached"
