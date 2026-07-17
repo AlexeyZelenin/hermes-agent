@@ -7039,6 +7039,94 @@ class TestPtyWebSocket:
                     break
             assert b"99" in buf and b"41" in buf
 
+    # --- live zellij-session attach (variant A, task t_d2259745) --------
+
+    def test_zellij_session_regex_accepts_and_rejects(self):
+        re_ = self.ws_module._ZELLIJ_SESSION_RE
+        for good in ("main", "op_session", "fleet-1", "a.b.c", "A1", "x" * 64):
+            assert re_.match(good), good
+        for bad in (
+            "",
+            "-flag",          # leading dash → would look like a zellij flag
+            ".hidden",        # leading dot
+            "has space",
+            "semi;colon",
+            "pipe|x",
+            "dollar$x",
+            "slash/x",
+            "x" * 65,         # over the length ceiling
+        ):
+            assert not re_.match(bad), bad
+
+    def test_zellij_attach_argv_builds_plain_attach(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module, "_resolve_zellij_bin", lambda: "/usr/bin/zellij"
+        )
+        assert self.ws_module._zellij_attach_argv("main", create=False) == [
+            "/usr/bin/zellij",
+            "attach",
+            "main",
+        ]
+
+    def test_zellij_attach_argv_create_flag(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module, "_resolve_zellij_bin", lambda: "/usr/bin/zellij"
+        )
+        assert self.ws_module._zellij_attach_argv("main", create=True) == [
+            "/usr/bin/zellij",
+            "attach",
+            "--create",
+            "main",
+        ]
+
+    def test_zellij_attach_argv_raises_when_binary_missing(self, monkeypatch):
+        monkeypatch.setattr(self.ws_module, "_resolve_zellij_bin", lambda: None)
+        with pytest.raises(FileNotFoundError):
+            self.ws_module._zellij_attach_argv("main", create=False)
+
+    def test_zellij_attach_streams_to_client(self, monkeypatch):
+        # End-to-end through the ?zellij= branch + _legacy_pump: swap the real
+        # ``zellij attach`` argv for a fake that prints a marker and exits.
+        monkeypatch.setattr(
+            self.ws_module,
+            "_zellij_attach_argv",
+            lambda session, create: ["/bin/sh", "-c", "printf zellij-attach-ok"],
+        )
+        with self.client.websocket_connect(self._url(zellij="main")) as conn:
+            buf = b""
+            import time
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    frame = conn.receive_bytes()
+                except Exception:
+                    break
+                if frame:
+                    buf += frame
+                if b"zellij-attach-ok" in buf:
+                    break
+            assert b"zellij-attach-ok" in buf
+
+    def test_zellij_invalid_session_name_closes_with_message(self, monkeypatch):
+        # A name that fails the allowlist must never reach a spawn.
+        spawned = {"called": False}
+        monkeypatch.setattr(
+            self.ws_module,
+            "_zellij_attach_argv",
+            lambda *a, **k: spawned.__setitem__("called", True) or ["/bin/true"],
+        )
+        with self.client.websocket_connect(self._url(zellij="bad;name")) as conn:
+            msg = conn.receive_text()
+        assert "Invalid zellij session name" in msg
+        assert spawned["called"] is False
+
+    def test_zellij_missing_binary_closes_with_message(self, monkeypatch):
+        monkeypatch.setattr(self.ws_module, "_resolve_zellij_bin", lambda: None)
+        with self.client.websocket_connect(self._url(zellij="main")) as conn:
+            msg = conn.receive_text()
+        assert "not installed" in msg
+
     def test_unavailable_platform_closes_with_message(self, monkeypatch):
         from hermes_cli.pty_bridge import PtyUnavailableError
 

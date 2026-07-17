@@ -14680,6 +14680,107 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
         await asyncio.to_thread(bridge.close)
 
 
+# ---------------------------------------------------------------------------
+# Live zellij-session attach (task t_d2259745 — operator "variant A").
+#
+# The operator drives fleet work inside a persistent zellij session from a
+# native terminal (Ghostty).  To let that SAME session render in the dashboard
+# — not a fresh spawn — ``/api/pty`` accepts ``?zellij=<session>`` and, instead
+# of launching ``hermes --tui``, runs ``zellij attach <session>`` behind the
+# PTY.  zellij has a client/server split: the attach process is a thin client
+# while the session (panes, statusline, running agents) lives in the zellij
+# *server* daemon.  So the browser mirrors Ghostty pane-for-pane, and a browser
+# disconnect only kills the attach client — never the session.
+#
+# Security: this reuses the exact gate the rest of ``/api/pty`` enforces —
+# localhost-only + session token, checked in ``pty_ws`` before we get here.  A
+# shell running with --skip-permissions is an open shell, so this MUST NOT be
+# reachable off-loopback.  The session name is validated against a strict
+# allowlist so it can never smuggle extra argv/flags into the invocation.
+# ---------------------------------------------------------------------------
+
+# zellij session names are user-chosen but constrained here to letters, digits,
+# and ``_-.`` (first char alphanumeric).  Rejecting everything else keeps the
+# value a single positional arg: no leading ``-`` that zellij would read as a
+# flag, no whitespace or shell metacharacters.  Length-capped to a sane ceiling.
+_ZELLIJ_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _resolve_zellij_bin() -> Optional[str]:
+    """Absolute path to the ``zellij`` binary, or None when not installed."""
+    return shutil.which("zellij")
+
+
+def _zellij_attach_argv(session: str, *, create: bool) -> list[str]:
+    """Build the ``zellij attach`` argv for an already-validated session name.
+
+    ``create=True`` maps to ``--create`` so a missing session is created rather
+    than erroring; the default is strict attach, because variant A wants the
+    operator's *existing* live session, never a new one.  Raises
+    :class:`FileNotFoundError` when zellij is not installed.
+    """
+    zellij = _resolve_zellij_bin()
+    if zellij is None:
+        raise FileNotFoundError("zellij is not installed on this host")
+    argv = [zellij, "attach"]
+    if create:
+        argv.append("--create")
+    argv.append(session)
+    return argv
+
+
+async def _pty_attach_zellij(ws: "WebSocket", session: str) -> None:
+    """Attach the WebSocket terminal to a live zellij session.
+
+    Assumes auth + loopback + PTY-availability were already checked by the
+    caller (``pty_ws``).  Validates the session name, builds the ``zellij
+    attach`` argv, spawns it behind the PTY bridge, and hands the socket to
+    ``_legacy_pump`` — the 1:1 pump is the correct semantics here because
+    zellij, not this process, owns session persistence, so we WANT the attach
+    client torn down on disconnect while the zellij server keeps the session
+    (and its running agents) alive for the next attach.
+    """
+    if not _ZELLIJ_SESSION_RE.match(session):
+        await ws.send_text(
+            "\r\n\x1b[31mInvalid zellij session name.\x1b[0m\r\n"
+        )
+        await ws.close(code=1011)
+        return
+
+    create = (ws.query_params.get("create") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    try:
+        argv = _zellij_attach_argv(session, create=create)
+    except FileNotFoundError as exc:
+        await ws.send_text(
+            f"\r\n\x1b[31mTerminal unavailable: {exc}. "
+            "Install zellij to embed the operator session.\x1b[0m\r\n"
+        )
+        await ws.close(code=1011)
+        return
+
+    try:
+        bridge = PtyBridge.spawn(
+            argv, cwd=os.path.expanduser("~"), env=os.environ.copy()
+        )
+    except PtyUnavailableError as exc:
+        await ws.send_text(f"\r\n\x1b[31mTerminal unavailable: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+    except (FileNotFoundError, OSError) as exc:
+        await ws.send_text(f"\r\n\x1b[31mTerminal failed to start: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+
+    _log.info("pty zellij-attach session=%s create=%s", session, create)
+    await _legacy_pump(ws, bridge)
+
+
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
@@ -15857,6 +15958,16 @@ async def pty_ws(ws: WebSocket) -> None:
             "tab — the rest of the dashboard works here.\x1b[0m\r\n"
         )
         await ws.close(code=1011)
+        return
+
+    # --- live zellij-session attach (variant A) -------------------------
+    # ``?zellij=<session>`` mirrors the operator's existing zellij session
+    # instead of spawning a fresh hermes TUI.  A raw zellij client has no
+    # gateway sidecar, so this bypasses the channel / keep-alive / chat-argv
+    # resolution below entirely.
+    zellij_session = ws.query_params.get("zellij") or None
+    if zellij_session is not None:
+        await _pty_attach_zellij(ws, zellij_session)
         return
 
     # --- spawn PTY ------------------------------------------------------
