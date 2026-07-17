@@ -167,6 +167,96 @@ def test_acp_worker_reports_turn_usage_via_post_api_request_hook(monkeypatch, ka
     assert recorded["usage"]["total_tokens"] == 18
 
 
+def test_effort_override_exported_in_spawn_env(monkeypatch, tmp_path):
+    """A task's effort_override must reach the ACP worker as HERMES_KANBAN_EFFORT
+    (the dispatcher's set-path for first-class effort control, t_2d1964f1)."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "external").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    task = kb.Task(
+        id="t_acp_effort",
+        title="external",
+        body=None,
+        assignee="external",
+        status="running",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=None,
+        claim_lock="test-lock",
+        claim_expires=None,
+        tenant=None,
+        current_run_id=9,
+        executor="claude-code",
+        effort_override="high",
+    )
+    captured = {}
+
+    class FakeProc:
+        pid = 4321
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert kb._default_spawn(task, str(workspace)) == 4321
+    assert captured["env"]["HERMES_KANBAN_EFFORT"] == "high"
+
+
+def test_run_task_passes_effort_to_client_and_stamps_requested(monkeypatch, kanban_conn, tmp_path):
+    """The executor forwards HERMES_KANBAN_EFFORT to the ACP client as
+    session_effort and records the requested level in run metadata so the card
+    can show requested-vs-actual."""
+    from agent import acp_task_executor as executor
+
+    monkeypatch.setenv("HERMES_KANBAN_EFFORT", "high")
+    task_id = kb.create_task(kanban_conn, title="External task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    calls = []
+
+    class FakeClient:
+        last_session_id = "s1"
+        last_model = "claude-opus-4-8"
+        last_effort = "medium"   # adapter clamped high -> medium
+        last_turn_usage = None
+        last_context = None
+
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            return "done", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    executor.run_task(executor="claude-code", task_id=task_id,
+                      workspace=str(tmp_path), board="test")
+
+    assert calls[0]["session_effort"] == "high"
+    task = kb.get_task(kanban_conn, task_id)
+    assert task.status == "done"
+    run = kanban_conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    import json as _json
+    meta = _json.loads(run["metadata"])
+    assert meta["effort_requested"] == "high"
+    assert meta["effort"] == "medium"
+
+
 class _connection_context:
     def __init__(self, conn):
         self.conn = conn

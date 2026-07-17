@@ -459,6 +459,25 @@ def _config_option_value(session: dict[str, Any], option_id: str) -> str:
     return ""
 
 
+def _config_option_values(session: dict[str, Any], option_id: str) -> list[str]:
+    """Return the selectable value ids of a ``session/new`` configOption.
+
+    Empty when the option is absent (e.g. the model exposes no reasoning
+    levels). Lets a caller pre-validate a requested value instead of firing a
+    ``session/set_config_option`` the adapter would reject."""
+    options = session.get("configOptions")
+    if not isinstance(options, list):
+        return []
+    for option in options:
+        if isinstance(option, dict) and option.get("id") == option_id:
+            values: list[str] = []
+            for entry in option.get("options") or []:
+                if isinstance(entry, dict) and entry.get("value") is not None:
+                    values.append(str(entry["value"]).strip())
+            return values
+    return []
+
+
 def _mode_from_session(session: dict[str, Any]) -> str:
     """Current permission mode: prefer the ``modes.currentModeId`` block, fall
     back to the mirrored ``mode`` configOption."""
@@ -559,6 +578,7 @@ class CopilotACPClient:
         args: list[str] | None = None,
         allow_permissions: bool = False,
         session_model: str | None = None,
+        session_effort: str | None = None,
         extra_env: dict[str, str] | None = None,
         **_: Any,
     ):
@@ -574,6 +594,10 @@ class CopilotACPClient:
         # Requested session model (ACP session/set_model). Best-effort: an
         # agent that doesn't support it keeps its own default.
         self._session_model = (session_model or "").strip()
+        # Requested reasoning effort (ACP session/set_config_option, configId
+        # "effort"). Best-effort: applied only when the session advertises an
+        # effort selector whose options include the value; otherwise ignored.
+        self._session_effort = (session_effort or "").strip()
         # Per-session env overrides for the ACP subprocess — e.g. the Kanban
         # executor pins CLAUDE_CONFIG_DIR to the leased subscription's dir.
         self._extra_env = dict(extra_env or {})
@@ -866,6 +890,39 @@ class CopilotACPClient:
                         "agent's default model (%s): %s",
                         model_id, self.last_model or "unknown", exc,
                     )
+
+            # Pin reasoning effort after the model — the adapter rebuilds the
+            # effort selector on a model switch, so the available values are
+            # only known once the final model is set. Best-effort: skip silently
+            # when the model exposes no effort selector or the requested level
+            # isn't offered (an unsupported value would just be rejected).
+            if self._session_effort:
+                effort_values = _config_option_values(session, "effort")
+                if not effort_values:
+                    logger.info(
+                        "ACP session exposes no effort selector; requested "
+                        "effort %r ignored", self._session_effort,
+                    )
+                elif self._session_effort not in effort_values:
+                    logger.warning(
+                        "ACP effort %r not offered (available: %s); keeping "
+                        "the session default %r",
+                        self._session_effort, effort_values, self.last_effort,
+                    )
+                else:
+                    try:
+                        _request(
+                            "session/set_config_option",
+                            {"sessionId": session_id, "configId": "effort",
+                             "value": self._session_effort},
+                        )
+                        self.last_effort = self._session_effort
+                    except Exception as exc:
+                        logger.warning(
+                            "ACP session/set_config_option(effort=%s) failed; "
+                            "continuing on the session default effort (%s): %s",
+                            self._session_effort, self.last_effort or "unknown", exc,
+                        )
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []

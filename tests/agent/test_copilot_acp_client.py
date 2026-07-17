@@ -522,3 +522,80 @@ def test_run_prompt_replays_operator_steer_on_same_session(tmp_path):
     assert "echo:do the task" in text
     assert "echo:please also add tests" in text
     assert "[operator steer]" in text
+
+
+# The effort set-path (t_2d1964f1): the adapter exposes effort as a session/new
+# configOption and accepts session/set_config_option. This fake server offers a
+# real set of effort values and appends every set_config_option it receives to a
+# sidecar file so the test can assert the client actually pinned effort.
+_FAKE_ACP_SERVER_EFFORT = r'''
+import json, os, sys
+REC = os.environ["EFFORT_REC_FILE"]
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": "sess-1",
+            "configOptions": [
+                {"id": "effort", "name": "Effort", "type": "select",
+                 "currentValue": "medium", "options": [
+                    {"value": "default", "name": "Default"},
+                    {"value": "low", "name": "Low"},
+                    {"value": "medium", "name": "Medium"},
+                    {"value": "high", "name": "High"}]},
+            ]}})
+    elif method == "session/set_config_option":
+        with open(REC, "a") as fh:
+            fh.write(json.dumps(msg["params"]) + "\n")
+        send({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": []}})
+    elif method == "session/prompt":
+        text = msg["params"]["prompt"][0]["text"]
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess-1", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "echo:" + text}}}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+'''
+
+
+def _effort_client(tmp_path, monkeypatch, effort):
+    rec = tmp_path / "effort_calls.jsonl"
+    monkeypatch.setenv("EFFORT_REC_FILE", str(rec))
+    server = tmp_path / "fake_acp_effort.py"
+    server.write_text(_FAKE_ACP_SERVER_EFFORT)
+    client = CopilotACPClient(
+        acp_command=_sys.executable, acp_args=[str(server)],
+        acp_cwd=str(tmp_path), session_effort=effort,
+    )
+    return client, rec
+
+
+def test_session_effort_is_applied_via_set_config_option(tmp_path, monkeypatch):
+    client, rec = _effort_client(tmp_path, monkeypatch, "high")
+    client._run_prompt("do the task", timeout_seconds=15)
+
+    calls = [json.loads(l) for l in rec.read_text().splitlines() if l.strip()]
+    assert any(c.get("configId") == "effort" and c.get("value") == "high"
+               for c in calls)
+    assert client.last_effort == "high"
+
+
+def test_unsupported_effort_is_not_sent(tmp_path, monkeypatch):
+    # "xhigh" is not among the model's offered levels -> no set call fires, and
+    # the session keeps its advertised default effort.
+    client, rec = _effort_client(tmp_path, monkeypatch, "xhigh")
+    client._run_prompt("do the task", timeout_seconds=15)
+
+    assert not rec.exists() or not rec.read_text().strip()
+    assert client.last_effort == "medium"

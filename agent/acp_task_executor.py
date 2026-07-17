@@ -83,10 +83,10 @@ def _report_usage(client, executor, task_id, subscription=None):
                     cost_usd=context.get("cost_usd"))
     except Exception:
         pass
-def _new_client(command, args, workspace, model, extra_env=None):
+def _new_client(command, args, workspace, model, extra_env=None, effort=None):
     return CopilotACPClient(acp_command=command, acp_args=args, acp_cwd=workspace,
                             allow_permissions=True, session_model=model,
-                            extra_env=extra_env)
+                            session_effort=effort, extra_env=extra_env)
 def _salvage_partial_output(task_id, board, client):
     """Persist a limit/auth-interrupted session's partial output as a task
     comment so the next attempt resumes with context instead of blind.
@@ -108,7 +108,7 @@ def _salvage_partial_output(task_id, board, client):
                            body="partial handoff (limit-interrupted)\n\n" + partial)
     except Exception:
         pass
-def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None):
+def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None):
     """Run the prompt on the Claude subscription pool, rotating on usage limits.
 
     Each session gets CLAUDE_CONFIG_DIR pinned to a leased subscription dir
@@ -120,7 +120,7 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
     """
     from agent import claude_subscriptions as subs
     if subs.pool_size() == 0:
-        client = _new_client(command, args, workspace, model)
+        client = _new_client(command, args, workspace, model, effort=effort)
         text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
         return text, client, None
     while True:
@@ -129,7 +129,8 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
         client = None
         try:
             client = _new_client(command, args, workspace, model,
-                                 extra_env={"CLAUDE_CONFIG_DIR": lease.config_dir})
+                                 extra_env={"CLAUDE_CONFIG_DIR": lease.config_dir},
+                                 effort=effort)
             text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
             if not subs.is_usage_limit_error(text) and not subs.is_auth_error(text):
                 return text, client, lease.name
@@ -152,12 +153,13 @@ def run_task(*, executor, task_id, workspace, board=None):
     try:
         timeout=float(os.getenv("HERMES_ACP_TIMEOUT_SECONDS", "3600"))
         model=os.getenv("HERMES_KANBAN_MODEL","").strip() or None
+        effort=os.getenv("HERMES_KANBAN_EFFORT","").strip() or None
         subscription=None
         follow_up=(lambda: _drain_steer(task_id, board)) if _steering_enabled() else None
         if executor == "claude-code":
-            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board)
+            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort)
         else:
-            client=_new_client(command,args,workspace,model)
+            client=_new_client(command,args,workspace,model,effort=effort)
             text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
         _report_usage(client,executor,task_id,subscription)
     except Exception as exc:
@@ -166,6 +168,7 @@ def run_task(*, executor, task_id, workspace, board=None):
     metadata={"executor":executor,"acp_command":command,"provider":f"acp-{executor}","workspace":workspace}
     run_model=getattr(client,"last_model","") or model
     if run_model: metadata["model"]=run_model
+    if effort: metadata["effort_requested"]=effort
     if subscription: metadata["subscription"]=subscription
     _stamp_session_metadata(metadata, client)
     with kb.connect_closing(board=board) as conn:

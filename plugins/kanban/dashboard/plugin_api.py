@@ -2039,6 +2039,7 @@ class CreateBoardBody(BaseModel):
     agent_limit: Optional[int] = None
     executor: Optional[str] = None
     models: Optional[dict] = None
+    models_effort: Optional[dict] = None
     switch: bool = False
 
 
@@ -2050,6 +2051,7 @@ class RenameBoardBody(BaseModel):
     agent_limit: Optional[int] = None
     executor: Optional[str] = None
     models: Optional[dict] = None
+    models_effort: Optional[dict] = None
 
 
 def _board_counts(slug: str) -> dict[str, int]:
@@ -2122,6 +2124,7 @@ def create_board_endpoint(payload: CreateBoardBody):
             agent_limit=payload.agent_limit,
             executor=payload.executor,
             models=payload.models,
+            models_effort=payload.models_effort,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2153,6 +2156,7 @@ def rename_board(slug: str, payload: RenameBoardBody):
             agent_limit=payload.agent_limit,
             executor=payload.executor,
             models=payload.models,
+            models_effort=payload.models_effort,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

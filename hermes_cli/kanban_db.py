@@ -688,6 +688,76 @@ def resolve_model_map(board: Optional[str] = None,
     return merged
 
 
+# Reasoning-effort levels a board / task may request, keyed by the same roles
+# as the model map. ``default`` clears any override so the executor's own
+# default applies. The Claude Code ACP adapter clamps an unsupported level to
+# the model's advertised options and the hermes-worker path clamps via
+# run_agent, so this canonical superset only needs to reject outright typos.
+VALID_EFFORT_LEVELS = ("default", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _clean_effort_map(raw: Any) -> dict[str, str]:
+    """Normalise an effort map to known roles with valid effort levels."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for role in MODEL_MAP_ROLES:
+        value = raw.get(role)
+        if isinstance(value, str):
+            value = value.strip().lower()
+            if value in VALID_EFFORT_LEVELS and value != "default":
+                out[role] = value
+    return out
+
+
+def _merge_effort_map(existing: Any, updates: dict) -> dict[str, str]:
+    """Merge ``updates`` into ``existing`` role-by-role.
+
+    An empty / ``default`` value clears the role (falls back to the executor
+    default). Unknown roles and invalid effort levels are rejected so config
+    typos fail loudly instead of silently never applying.
+    """
+    unknown = set(updates) - set(MODEL_MAP_ROLES)
+    if unknown:
+        raise ValueError(
+            f"unknown effort roles {sorted(unknown)}; valid roles: {list(MODEL_MAP_ROLES)}"
+        )
+    merged = _clean_effort_map(existing)
+    for role, value in updates.items():
+        value = str(value or "").strip().lower()
+        if not value or value == "default":
+            merged.pop(role, None)
+        elif value in VALID_EFFORT_LEVELS:
+            merged[role] = value
+        else:
+            raise ValueError(
+                f"invalid effort level {value!r}; valid levels: {list(VALID_EFFORT_LEVELS)}"
+            )
+    return merged
+
+
+def _global_effort_map() -> dict[str, str]:
+    """The ``kanban.models_effort`` map from config.yaml — machine-wide default."""
+    try:
+        from hermes_cli.config import load_config
+        kanban_cfg = (load_config() or {}).get("kanban") or {}
+    except Exception:
+        return {}
+    return _clean_effort_map(kanban_cfg.get("models_effort"))
+
+
+def resolve_effort_map(board: Optional[str] = None,
+                       project_effort: Any = None) -> dict[str, str]:
+    """Effective effort map: config.yaml ← board ← project (symmetric to
+    :func:`resolve_model_map`). Resolved live at dispatch so board edits apply
+    to already-queued tasks."""
+    merged = _global_effort_map()
+    merged.update(_clean_effort_map(
+        read_board_metadata(board if board else get_current_board()).get("models_effort")))
+    merged.update(_clean_effort_map(project_effort))
+    return merged
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -713,6 +783,9 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         # the decomposer assigns to mechanical / balanced / frontier chunks
         # (worker is the implicit "standard" default). Empty = executor default.
         "models": {},
+        # Reasoning-effort defaults per role, same keys as ``models``. Empty =
+        # the executor's own default effort. A task's ``effort_override`` wins.
+        "models_effort": {},
         "created_at": None,
         "archived": False,
     }
@@ -743,13 +816,15 @@ def write_board_metadata(
     agent_limit: Optional[int] = None,
     executor: Optional[str] = None,
     models: Optional[dict] = None,
+    models_effort: Optional[dict] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
     ``models`` merges role-by-role into the existing map; an empty-string
-    value clears that role.
+    value clears that role. ``models_effort`` merges the same way with an
+    empty / ``default`` value clearing the role.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -783,6 +858,8 @@ def write_board_metadata(
         meta["executor"] = normalized_executor
     if models is not None:
         meta["models"] = _merge_model_map(meta.get("models"), models)
+    if models_effort is not None:
+        meta["models_effort"] = _merge_effort_map(meta.get("models_effort"), models_effort)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -806,6 +883,7 @@ def create_board(
     agent_limit: Optional[int] = None,
     executor: Optional[str] = None,
     models: Optional[dict] = None,
+    models_effort: Optional[dict] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -826,6 +904,7 @@ def create_board(
         agent_limit=agent_limit,
         executor=executor,
         models=models,
+        models_effort=models_effort,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -973,6 +1052,11 @@ class Task:
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
     model_override: Optional[str] = None
+    # Per-task reasoning-effort override (one of VALID_EFFORT_LEVELS). When
+    # set, the dispatcher exports it so the ACP executor pins the session's
+    # effort. NULL falls through to the board / global ``models_effort`` map,
+    # then the executor default. Frozen at create time like ``model_override``.
+    effort_override: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1072,6 +1156,7 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            effort_override=row["effort_override"] if "effort_override" in keys and row["effort_override"] else None,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1236,6 +1321,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
+    -- Per-task reasoning-effort override (one of VALID_EFFORT_LEVELS). When
+    -- set, the dispatcher exports HERMES_KANBAN_EFFORT so the ACP executor
+    -- pins the session effort. NULL = fall through to the board / global
+    -- models_effort map, then the executor default.
+    effort_override      TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2044,6 +2134,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
+    if "effort_override" not in cols:
+        # Per-task reasoning-effort override. Existing rows get NULL, which
+        # falls through to the board / global default (prior behaviour).
+        conn.execute("ALTER TABLE tasks ADD COLUMN effort_override TEXT")
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2506,6 +2601,7 @@ def create_task(
     project_id: Optional[str] = None,
     executor: Optional[str] = None,
     model_override: Optional[str] = None,
+    effort_override: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2600,6 +2696,18 @@ def create_task(
     if model_override is None and project_obj is not None:
         model_override = _clean_model_map(
             getattr(project_obj, "models", None)).get("worker")
+    # Reasoning-effort override: validate against the canonical levels; else
+    # freeze the project's worker effort. Board / global defaults stay live.
+    effort_override = str(effort_override or "").strip().lower() or None
+    if effort_override in ("", "default"):
+        effort_override = None
+    if effort_override is not None and effort_override not in VALID_EFFORT_LEVELS:
+        raise ValueError(
+            f"invalid effort level {effort_override!r}; valid levels: {list(VALID_EFFORT_LEVELS)}"
+        )
+    if effort_override is None and project_obj is not None:
+        effort_override = _clean_effort_map(
+            getattr(project_obj, "models_effort", None)).get("worker")
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2744,10 +2852,11 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, executor, model_override,
+                        effort_override,
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2764,6 +2873,7 @@ def create_task(
                         project_id,
                         executor,
                         model_override,
+                        effort_override,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -5954,6 +6064,32 @@ def set_branch_name(
         )
 
 
+def set_task_effort_override(
+    conn: sqlite3.Connection, task_id: str, effort: Optional[str]
+) -> Optional[str]:
+    """Set / clear a task's reasoning-effort override.
+
+    ``effort`` of ``None``, ``""`` or ``"default"`` clears the override (the
+    task falls back to the board / global ``models_effort`` map). Any other
+    value must be one of :data:`VALID_EFFORT_LEVELS`. Returns the stored value
+    (or ``None`` when cleared). Applies on the task's next dispatch, not the
+    run already in flight.
+    """
+    normalized = str(effort or "").strip().lower() or None
+    if normalized in ("", "default"):
+        normalized = None
+    if normalized is not None and normalized not in VALID_EFFORT_LEVELS:
+        raise ValueError(
+            f"invalid effort level {normalized!r}; valid levels: {list(VALID_EFFORT_LEVELS)}"
+        )
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET effort_override = ? WHERE id = ?",
+            (normalized, task_id),
+        )
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 def schedule_task(
     conn: sqlite3.Connection,
@@ -8554,6 +8690,11 @@ def _default_spawn(
     effective_model = task.model_override or resolve_model_map(board).get("worker")
     if effective_model:
         cmd.extend(["-m", effective_model])
+    # Effective reasoning effort: same precedence as the model (task override
+    # wins, else board / global ``models_effort`` for the worker role resolves
+    # live). Exported for the ACP executor below; the hermes-worker path keeps
+    # its own effort resolution.
+    effective_effort = task.effort_override or resolve_effort_map(board).get("worker")
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -8575,6 +8716,8 @@ def _default_spawn(
         env["HERMES_KANBAN_EXECUTOR"] = task.executor
         if effective_model:
             env["HERMES_KANBAN_MODEL"] = effective_model
+        if effective_effort:
+            env["HERMES_KANBAN_EFFORT"] = effective_effort
         cmd = [sys.executable, "-m", "agent.acp_task_executor"]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
