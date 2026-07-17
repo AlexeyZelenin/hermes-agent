@@ -10700,6 +10700,33 @@ async def get_engine_room(board: str = ""):
     return await _run_cron_dashboard_io(_engine_room_sync, board)
 
 
+def _zeus_pacing_sync(board: str = ""):
+    """Per-pocket pacing/limit snapshot for the token panel (task t_7d6b2cdc).
+
+    The statusline-in-the-UI view: for each subscription pocket on ``board``,
+    how much of the window's budget is spent vs the pacing target and elapsed
+    time, the throttle/burndown mode, agent limit, burn rate, time to reset,
+    and the tokens burned in the current window. Read live from the external
+    zeus pacing state; degrades to an empty snapshot when the ledger is absent.
+    """
+    import time as _time
+
+    from hermes_cli import kanban_db, zeus_pacing
+
+    slug = (board or "").strip() or kanban_db.get_current_board()
+    conn = zeus_pacing.connect()
+    try:
+        return zeus_pacing.pacing_snapshot(conn, slug, now=_time.time())
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@app.get("/api/zeus/pacing")
+async def get_zeus_pacing(board: str = ""):
+    return await _run_cron_dashboard_io(_zeus_pacing_sync, board)
+
+
 def _create_cron_job_sync(body: CronJobCreate, profile: str = "default"):
     try:
         profile_name, profile_home = _cron_profile_home(profile)

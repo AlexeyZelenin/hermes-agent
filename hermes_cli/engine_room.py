@@ -156,10 +156,10 @@ _SURFACES: tuple[dict[str, str], ...] = (
     },
     {
         "key": "token_panel",
-        "title": "Панель токенов",
-        "route": "/api/kanban/tokens",
+        "title": "Токены / Лимиты",
+        "route": "/api/zeus/pacing",
         "owner_task": "t_7d6b2cdc",
-        "purpose": "Расход токенов и стоимости по задачам из леджера zeus.",
+        "purpose": "Пейсинг подписок как статуслайн: по кармашкам — выбрано/цель/до сброса + расход за окно.",
     },
     {
         "key": "roi",

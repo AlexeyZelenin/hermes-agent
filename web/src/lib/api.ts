@@ -603,6 +603,12 @@ export const api = {
       { method: "POST" },
     ),
 
+  // Token/limit panel — per-pocket pacing state + windowed token spend
+  getZeusPacing: (board = "") =>
+    fetchJSON<ZeusPacing>(
+      `/api/zeus/pacing?board=${encodeURIComponent(board)}`,
+    ),
+
   // Automation Blueprints — parameterized automation blueprints
   getAutomationBlueprints: () =>
     fetchJSON<{ blueprints: AutomationBlueprint[] }>("/api/cron/blueprints"),
@@ -2280,6 +2286,44 @@ export interface CronRegistryFinding {
   kind: string;
   title: string;
   severity: string;
+}
+
+export interface ZeusPacingWindowTokens {
+  total_tokens: number;
+  turns: number;
+  last_ts: number | null;
+}
+
+export interface ZeusPacingPocket {
+  subscription: string;
+  display_name: string;
+  enabled: boolean | null;
+  window_label: string;
+  spent_percent: number | null;
+  target_percent: number | null;
+  elapsed_percent: number | null;
+  pace_delta: number | null;
+  on_track: boolean | null;
+  mode: string;
+  agent_limit: number | null;
+  burn_rate_per_min: number | null;
+  reset_at: number | null;
+  seconds_to_reset: number | null;
+  reason: string;
+  updated_at: number | null;
+  staleness_seconds: number | null;
+  cooling_until: number | null;
+  cooling: boolean;
+  last_limited_at: number | null;
+  window_start: number | null;
+  window_tokens: ZeusPacingWindowTokens | null;
+}
+
+export interface ZeusPacing {
+  board: string;
+  now: number;
+  pockets: ZeusPacingPocket[];
+  window_total_tokens: number;
 }
 
 export interface AutomationBlueprintField {
