@@ -2498,3 +2498,69 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
+
+
+# ---------------------------------------------------------------------------
+# Board model map + executor + global agent limit (models-per-board feature)
+# ---------------------------------------------------------------------------
+
+
+def test_board_patch_models_executor_agent_limit(client):
+    r = client.post("/api/plugins/kanban/boards", json={"slug": "modeled"})
+    assert r.status_code == 200
+
+    r = client.patch("/api/plugins/kanban/boards/modeled", json={
+        "agent_limit": 4,
+        "executor": "claude-code",
+        "models": {"worker": "m-worker", "cheap": "m-cheap"},
+    })
+    assert r.status_code == 200
+    board = r.json()["board"]
+    assert board["agent_limit"] == 4
+    assert board["executor"] == "claude-code"
+    assert board["models"] == {"worker": "m-worker", "cheap": "m-cheap"}
+
+    # Role-by-role merge; empty value clears a role.
+    r = client.patch("/api/plugins/kanban/boards/modeled", json={
+        "models": {"cheap": "", "strong": "m-strong"},
+    })
+    assert r.status_code == 200
+    assert r.json()["board"]["models"] == {
+        "worker": "m-worker", "strong": "m-strong"}
+
+    # Unknown roles / executors are 400s, not 500s.
+    r = client.patch("/api/plugins/kanban/boards/modeled",
+                     json={"models": {"bogus": "x"}})
+    assert r.status_code == 400
+    r = client.patch("/api/plugins/kanban/boards/modeled",
+                     json={"executor": "warp-drive"})
+    assert r.status_code == 400
+
+    # The board list exposes the map for the settings dialog.
+    r = client.get("/api/plugins/kanban/boards")
+    entry = next(b for b in r.json()["boards"] if b["slug"] == "modeled")
+    assert entry["models"] == {"worker": "m-worker", "strong": "m-strong"}
+
+
+def test_orchestration_global_agent_limit_round_trip(client, kanban_home):
+    (kanban_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    r = client.get("/api/plugins/kanban/orchestration")
+    assert r.status_code == 200
+    assert r.json()["max_in_progress"] is None
+
+    r = client.put("/api/plugins/kanban/orchestration",
+                   json={"max_in_progress": 7})
+    assert r.status_code == 200
+    assert r.json()["max_in_progress"] == 7
+    assert client.get(
+        "/api/plugins/kanban/orchestration").json()["max_in_progress"] == 7
+
+    # 0 clears the cap; negatives are rejected.
+    r = client.put("/api/plugins/kanban/orchestration",
+                   json={"max_in_progress": 0})
+    assert r.status_code == 200
+    assert r.json()["max_in_progress"] is None
+    r = client.put("/api/plugins/kanban/orchestration",
+                   json={"max_in_progress": -1})
+    assert r.status_code == 400

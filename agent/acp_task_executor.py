@@ -33,7 +33,8 @@ def run_task(*, executor, task_id, workspace, board=None):
     prompt=("You are the sole native external coding-harness session for this already-scoped task. Work only in the supplied cwd; do not orchestrate child tasks. Follow project rules and return a concise factual handoff with tests run.\n\n"+context)
     try:
         timeout=float(os.getenv("HERMES_ACP_TIMEOUT_SECONDS", "3600"))
-        client=CopilotACPClient(acp_command=command,acp_args=args,acp_cwd=workspace,allow_permissions=True)
+        model=os.getenv("HERMES_KANBAN_MODEL","").strip() or None
+        client=CopilotACPClient(acp_command=command,acp_args=args,acp_cwd=workspace,allow_permissions=True,session_model=model)
         text,_=client._run_prompt(prompt,timeout_seconds=timeout)
         _report_usage(client,executor,task_id)
     except Exception as exc:

@@ -632,6 +632,62 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+MODEL_MAP_ROLES = ("worker", "aux", "cheap", "strong")
+
+
+def _clean_model_map(raw: Any) -> dict[str, str]:
+    """Normalise a model map to known roles with non-empty string values."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        role: str(raw[role]).strip()
+        for role in MODEL_MAP_ROLES
+        if isinstance(raw.get(role), str) and str(raw[role]).strip()
+    }
+
+
+def _merge_model_map(existing: Any, updates: dict) -> dict[str, str]:
+    """Merge ``updates`` into ``existing`` role-by-role.
+
+    An empty-string / None value in ``updates`` clears the role. Unknown
+    roles are rejected so config typos fail loudly instead of silently
+    never matching.
+    """
+    unknown = set(updates) - set(MODEL_MAP_ROLES)
+    if unknown:
+        raise ValueError(
+            f"unknown model roles {sorted(unknown)}; valid roles: {list(MODEL_MAP_ROLES)}"
+        )
+    merged = _clean_model_map(existing)
+    for role, value in updates.items():
+        value = str(value or "").strip()
+        if value:
+            merged[role] = value
+        else:
+            merged.pop(role, None)
+    return merged
+
+
+def _global_model_map() -> dict[str, str]:
+    """The ``kanban.models`` map from config.yaml — the machine-wide default."""
+    try:
+        from hermes_cli.config import load_config
+        kanban_cfg = (load_config() or {}).get("kanban") or {}
+    except Exception:
+        return {}
+    return _clean_model_map(kanban_cfg.get("models"))
+
+
+def resolve_model_map(board: Optional[str] = None,
+                      project_models: Any = None) -> dict[str, str]:
+    """Effective model map: config.yaml ``kanban.models`` ← board ← project."""
+    merged = _global_model_map()
+    merged.update(_clean_model_map(
+        read_board_metadata(board if board else get_current_board()).get("models")))
+    merged.update(_clean_model_map(project_models))
+    return merged
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -652,6 +708,10 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         # a separately persisted pool entity.
         "agent_limit": 10,
         "executor": "hermes-worker",
+        # Model map: worker = default model for task workers, aux = auxiliary
+        # roles (decomposer / batch planner), cheap / strong = the tiers Take
+        # v2 assigns to mechanical vs. complex chunks. Empty = executor default.
+        "models": {},
         "created_at": None,
         "archived": False,
     }
@@ -681,11 +741,14 @@ def write_board_metadata(
     default_workdir: Optional[str] = None,
     agent_limit: Optional[int] = None,
     executor: Optional[str] = None,
+    models: Optional[dict] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
+    ``models`` merges role-by-role into the existing map; an empty-string
+    value clears that role.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -717,6 +780,8 @@ def write_board_metadata(
         if normalized_executor not in {"hermes-worker", "claude-code", "codex"}:
             raise ValueError("executor must be hermes-worker, claude-code, or codex")
         meta["executor"] = normalized_executor
+    if models is not None:
+        meta["models"] = _merge_model_map(meta.get("models"), models)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -738,6 +803,8 @@ def create_board(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
     agent_limit: Optional[int] = None,
+    executor: Optional[str] = None,
+    models: Optional[dict] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -756,6 +823,8 @@ def create_board(
         color=color,
         default_workdir=default_workdir,
         agent_limit=agent_limit,
+        executor=executor,
+        models=models,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -2435,6 +2504,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     executor: Optional[str] = None,
+    model_override: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2521,6 +2591,14 @@ def create_task(
     executor = str(executor or (project_obj.executor if project_obj else None) or read_board_metadata(board if board else get_current_board()).get("executor") or "hermes-worker").strip().lower()
     if executor not in {"hermes-worker", "claude-code", "codex"}:
         raise ValueError("executor must be hermes-worker, claude-code, or codex")
+    # Explicit override wins; else freeze the project's worker model (project
+    # config is per-profile, unreachable at dispatch time). Board / global
+    # defaults deliberately stay unfrozen — the dispatcher resolves them live
+    # so config changes apply to already-queued tasks.
+    model_override = str(model_override or "").strip() or None
+    if model_override is None and project_obj is not None:
+        model_override = _clean_model_map(
+            getattr(project_obj, "models", None)).get("worker")
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2664,10 +2742,11 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, executor, tenant, idempotency_key,
+                        branch_name, project_id, executor, model_override,
+                        tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2683,6 +2762,7 @@ def create_task(
                         branch_name,
                         project_id,
                         executor,
+                        model_override,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -5257,7 +5337,12 @@ def decompose_triage_task(
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional; normally None until take
             "parents": [0, 2],                 # indices into this same children list
+            "model_override": "model-id",      # optional; tier model from the decomposer
         }
+
+    Children inherit the root's executor, project link, and — when the
+    child dict has no ``model_override`` of its own — the root's model
+    override.
 
     Returns the list of created child task ids (in input order) on
     success. Returns ``None`` when:
@@ -5327,7 +5412,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "       executor, model_override, project_id "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5342,6 +5428,12 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        # Children also inherit the root's executor and (absent a per-child
+        # tier model from the decomposer) its model override — the root
+        # already froze the project/board resolution at create time.
+        root_executor = root_row["executor"] or "hermes-worker"
+        root_model = root_row["model_override"]
+        root_project_id = root_row["project_id"]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -5364,11 +5456,13 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            child_model = str(child.get("model_override") or "").strip() or root_model
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " executor, model_override, project_id) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5379,6 +5473,9 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    root_executor,
+                    child_model,
+                    root_project_id,
                 ),
             )
             _append_event(
@@ -8257,8 +8354,12 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
+    # Effective worker model: the task's frozen override (explicit or
+    # project-level) wins; otherwise the board / global default resolves
+    # LIVE here, so model-map edits apply to queued tasks without churn.
+    effective_model = task.model_override or resolve_model_map(board).get("worker")
+    if effective_model:
+        cmd.extend(["-m", effective_model])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -8278,6 +8379,8 @@ def _default_spawn(
     # ordinary Kanban completion/block transition itself.
     if task.executor in {"claude-code", "codex"}:
         env["HERMES_KANBAN_EXECUTOR"] = task.executor
+        if effective_model:
+            env["HERMES_KANBAN_MODEL"] = effective_model
         cmd = [sys.executable, "-m", "agent.acp_task_executor"]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so

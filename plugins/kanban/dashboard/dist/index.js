@@ -509,6 +509,7 @@
     const [board, setBoard] = useState(() => readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
+    const [showBoardSettings, setShowBoardSettings] = useState(false);
 
     const [kanbanBoard, setKanbanBoard] = useState(null);  // the grid data
     // Alias so the rest of the function can keep using `board` semantically
@@ -995,6 +996,17 @@
       });
     }, [loadBoardList, switchBoard, board]);
 
+    const updateBoard = useCallback(function (slug, payload) {
+      return SDK.fetchJSON(`${API}/boards/${encodeURIComponent(slug)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(function (res) {
+        loadBoardList();
+        return res;
+      });
+    }, [loadBoardList]);
+
     const deleteBoard = useCallback(function (slug) {
       if (!slug || slug === "default") return Promise.resolve();
       return SDK.fetchJSON(`${API}/boards/${encodeURIComponent(slug)}`, {
@@ -1058,8 +1070,16 @@
           boardList: boardList,
           onSwitch: switchBoard,
           onNewClick: function () { setShowNewBoard(true); },
+          onSettingsClick: function () { setShowBoardSettings(true); },
           onDeleteBoard: deleteBoard,
         }),
+        showBoardSettings ? h(BoardSettingsDialog, {
+          board: boardList.find(function (b) { return b.slug === board; }) || { slug: board },
+          onCancel: function () { setShowBoardSettings(false); },
+          onSave: function (payload) {
+            return updateBoard(board, payload).then(function () { setShowBoardSettings(false); });
+          },
+        }) : null,
         showNewBoard ? h(NewBoardDialog, {
           onCancel: function () { setShowNewBoard(false); },
           onCreate: function (payload) {
@@ -1759,6 +1779,19 @@
                 ? "The dispatcher decomposes new triage tasks automatically."
                 : "Triage tasks stay in triage until you click ⚗ Decompose."),
           ),
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, { className: "text-xs text-muted-foreground" },
+              "Global agent limit"),
+            h(GlobalLimitField, {
+              value: settings.max_in_progress,
+              onSave: function (n) { return saveSettings({ max_in_progress: n }); },
+            }),
+            h("div", { className: "text-[10px] text-muted-foreground" },
+              "Machine-wide cap on concurrently running workers "
+              + "(kanban.max_in_progress; the effective cap per board is "
+              + "min(this, board agent limit)). Empty = no cap. Applies on "
+              + "the next dispatcher tick — no gateway restart."),
+          ),
         ) : h("div", { className: "text-xs text-muted-foreground" },
           "Loading…"),
 
@@ -1831,6 +1864,145 @@
     );
   }
 
+  function GlobalLimitField(props) {
+    const [draft, setDraft] = useState(
+      props.value != null ? String(props.value) : "");
+    useEffect(function () {
+      setDraft(props.value != null ? String(props.value) : "");
+    }, [props.value]);
+    const dirty = draft !== (props.value != null ? String(props.value) : "");
+    return h("div", { className: "flex items-center gap-2" },
+      h(Input, {
+        value: draft,
+        onChange: function (e) { setDraft(e.target.value.replace(/[^0-9]/g, "")); },
+        inputMode: "numeric",
+        placeholder: "(no cap)",
+        className: "h-8 w-24",
+      }),
+      h(Button, {
+        onClick: function () { props.onSave(draft === "" ? 0 : parseInt(draft, 10)); },
+        size: "sm",
+        type: "button",
+        disabled: !dirty,
+      }, "Save"),
+    );
+  }
+
+  function BoardSettingsDialog(props) {
+    const { t } = useI18n();
+    const meta = props.board || {};
+    const models = meta.models || {};
+    const [agentLimit, setAgentLimit] = useState(
+      meta.agent_limit != null ? String(meta.agent_limit) : "10");
+    const [executor, setExecutor] = useState(meta.executor || "hermes-worker");
+    const [modelDraft, setModelDraft] = useState({
+      worker: models.worker || "",
+      aux: models.aux || "",
+      cheap: models.cheap || "",
+      strong: models.strong || "",
+    });
+    const [submitting, setSubmitting] = useState(false);
+    const [err, setErr] = useState(null);
+
+    function onSubmit(ev) {
+      if (ev) ev.preventDefault();
+      const limit = parseInt(agentLimit, 10);
+      if (!limit || limit < 1) { setErr("agent limit must be a positive integer"); return; }
+      setSubmitting(true);
+      setErr(null);
+      props.onSave({
+        agent_limit: limit,
+        executor: executor,
+        // Empty strings clear the role server-side.
+        models: {
+          worker: modelDraft.worker.trim(),
+          aux: modelDraft.aux.trim(),
+          cheap: modelDraft.cheap.trim(),
+          strong: modelDraft.strong.trim(),
+        },
+      }).catch(function (e) {
+        setErr(String(e && e.message ? e.message : e));
+        setSubmitting(false);
+      });
+    }
+
+    function modelField(role, label, hint) {
+      return h("div", { className: "flex flex-col gap-1" },
+        h(Label, { className: "text-xs" }, label, " ",
+          h("span", { className: "text-muted-foreground" }, hint)),
+        h(Input, {
+          value: modelDraft[role],
+          onChange: function (e) {
+            const v = e.target.value;
+            setModelDraft(function (d) {
+              const next = Object.assign({}, d); next[role] = v; return next;
+            });
+          },
+          placeholder: tx(t, "modelDefaultPlaceholder", "(executor default)"),
+          className: "h-8",
+        }),
+      );
+    }
+
+    return h("div", {
+      className: "hermes-kanban-dialog-backdrop",
+      onClick: function (e) { if (e.target === e.currentTarget) props.onCancel(); },
+    },
+      h("form", { className: "hermes-kanban-dialog", onSubmit: onSubmit },
+        h("div", { className: "hermes-kanban-dialog-title" },
+          tx(t, "boardSettingsTitle", "Board settings"), " — ", meta.name || meta.slug),
+        h("div", { className: "text-xs text-muted-foreground mb-2" },
+          tx(t, "boardSettingsDescription",
+            "Concurrency and model routing for this board. Changes apply on the next dispatcher tick — no gateway restart needed.")),
+        h("div", { className: "flex flex-col gap-3" },
+          h("div", { className: "grid gap-3 sm:grid-cols-2" },
+            h("div", { className: "flex flex-col gap-1" },
+              h(Label, { className: "text-xs" }, tx(t, "agentLimit", "Agent limit"), " ",
+                h("span", { className: "text-muted-foreground" },
+                  tx(t, "agentLimitHint", "— max workers running at once on this board"))),
+              h(Input, {
+                value: agentLimit,
+                onChange: function (e) { setAgentLimit(e.target.value.replace(/[^0-9]/g, "")); },
+                inputMode: "numeric",
+                className: "h-8",
+              }),
+            ),
+            h("div", { className: "flex flex-col gap-1" },
+              h(Label, { className: "text-xs" }, tx(t, "executor", "Executor"), " ",
+                h("span", { className: "text-muted-foreground" },
+                  tx(t, "executorHint", "— what runs the workers"))),
+              h(Select, Object.assign({
+                value: executor,
+                className: "h-8",
+              }, selectChangeHandler(function (v) { if (v) setExecutor(v); })),
+                h(SelectOption, { value: "hermes-worker" }, "hermes-worker"),
+                h(SelectOption, { value: "claude-code" }, "claude-code"),
+                h(SelectOption, { value: "codex" }, "codex"),
+              ),
+            ),
+          ),
+          h("div", { className: "grid gap-3 sm:grid-cols-2" },
+            modelField("worker", tx(t, "modelWorker", "Worker model"),
+              tx(t, "modelWorkerHint", "— default for tasks")),
+            modelField("aux", tx(t, "modelAux", "Aux model"),
+              tx(t, "modelAuxHint", "— decomposer / planner")),
+            modelField("cheap", tx(t, "modelCheap", "Cheap model"),
+              tx(t, "modelCheapHint", "— mechanical chunks")),
+            modelField("strong", tx(t, "modelStrong", "Strong model"),
+              tx(t, "modelStrongHint", "— complex chunks")),
+          ),
+          err ? h("div", { className: "hermes-kanban-msg-err" }, err) : null,
+          h("div", { className: "flex justify-end gap-2" },
+            h(Button, { type: "button", onClick: props.onCancel, size: "sm" },
+              tx(t, "cancel", "Cancel")),
+            h(Button, { type: "submit", size: "sm", disabled: submitting },
+              submitting ? tx(t, "saving", "Saving…") : tx(t, "save", "Save")),
+          ),
+        ),
+      ),
+    );
+  }
+
   function BoardSwitcher(props) {
     const { t } = useI18n();
     const list = props.boardList || [];
@@ -1885,6 +2057,12 @@
         ),
         h("div", { className: "flex-1" }),
         h(DocsLink, null),
+        h(Button, {
+          onClick: props.onSettingsClick,
+          size: "sm",
+          className: "h-8",
+          title: "Board settings: agent limit, executor, and the model map (worker/aux/cheap/strong).",
+        }, "⚙ ", tx(t, "boardSettings", "Settings")),
         h(Button, {
           onClick: props.onNewClick,
           size: "sm",
@@ -2783,6 +2961,11 @@
                             title: `${t.link_counts.parents} parent${t.link_counts.parents === 1 ? "" : "s"}, ${t.link_counts.children} child${t.link_counts.children === 1 ? "" : "ren"}. Children stay blocked until their parent is done.` },
                   "↔ ", t.link_counts.parents + t.link_counts.children)
               : null,
+            t.model_override
+              ? h("span", { className: "hermes-kanban-count hermes-kanban-model",
+                            title: `Model: ${t.model_override}` },
+                  "⚙ ", t.model_override)
+              : null,
             h("span", { className: "hermes-kanban-ago",
                         title: t.created_at ? `Created ${t.created_at}` : "" },
               timeAgo ? timeAgo(t.created_at) : ""),
@@ -3424,6 +3607,14 @@
         (t.skills && t.skills.length > 0) ? h(MetaRow, {
           label: tx(i18n, "skills", "Skills"),
           value: t.skills.join(", "),
+        }) : null,
+        t.model_override ? h(MetaRow, {
+          label: tx(i18n, "model", "Model"),
+          value: t.model_override,
+        }) : null,
+        (t.executor && t.executor !== "hermes-worker") ? h(MetaRow, {
+          label: tx(i18n, "executor", "Executor"),
+          value: t.executor,
         }) : null,
         t.goal_mode ? h(MetaRow, {
           label: tx(i18n, "goalMode", "Goal mode"),

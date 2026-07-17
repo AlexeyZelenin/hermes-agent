@@ -73,7 +73,8 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "parents": [<int>, ...],
-        "estimated_context_tokens": <rough integer estimate>
+        "estimated_context_tokens": <rough integer estimate>,
+        "model_tier": "cheap" | "standard" | "strong"
       },
       ...
     ]
@@ -107,6 +108,17 @@ Rules:
     clearly over-budget work into 1 task.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - "model_tier" picks how capable (and expensive) a model the chunk needs:
+      * "cheap"    — mechanical, low-ambiguity work with a clear recipe:
+        translations, templated/repetitive edits, renames, status checks,
+        formatting, config value changes, boilerplate from an exact spec.
+      * "strong"   — high-ambiguity or high-blast-radius work: architecture
+        and API design, debugging of unknown depth, cross-cutting refactors,
+        security-sensitive changes, work whose spec must be interpreted.
+      * "standard" — everything else; use it when unsure.
+    Judge by the nature of the work, not its size: a long translation is
+    still "cheap"; a one-line fix in an unfamiliar concurrency path is
+    "strong".
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -133,6 +145,20 @@ Body:
 
 Maximum rough context budget per fresh worker: {context_budget_tokens:,} tokens
 {calibration_context}"""
+
+
+def _task_model_map(task) -> dict:
+    """Effective model map for this task's chunks: global ← board ← project."""
+    project_models = None
+    if getattr(task, "project_id", None):
+        try:
+            from hermes_cli import projects_db as pdb
+            with pdb.connect_closing() as pconn:
+                proj = pdb.get_project(pconn, task.project_id)
+            project_models = proj.models if proj else None
+        except Exception as exc:
+            logger.debug("decompose: project model map unavailable: %s", exc)
+    return kb.resolve_model_map(None, project_models)
 
 
 def _calibration_context(task_id: str, title: str, body: str,
@@ -268,6 +294,7 @@ def decompose_task(
 
     cfg = _load_config()
     context_budget_tokens = _resolve_context_budget_tokens(cfg)
+    model_map = _task_model_map(task)
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
@@ -295,6 +322,9 @@ def decompose_task(
         # path dropped auxiliary.<task>.extra_body entirely (#35566).
         resp = call_llm(
             task="kanban_decomposer",
+            # Board/project "aux" model (if configured) overrides the
+            # auxiliary.kanban_decomposer.* model from config.yaml.
+            model=model_map.get("aux"),
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -379,11 +409,16 @@ def decompose_task(
             parents = []
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        # Tier → model via the board/project map. "standard" (or an
+        # unmapped tier) leaves the child on the default model chain.
+        tier = str(entry.get("model_tier") or "").strip().lower()
+        tier_model = model_map.get(tier) if tier in ("cheap", "strong") else None
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": None,
             "parents": clean_parents,
+            "model_override": tier_model,
         })
 
     try:
