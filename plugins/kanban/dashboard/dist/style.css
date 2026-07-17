@@ -1523,6 +1523,45 @@
               0 0 8px color-mix(in srgb, var(--color-destructive, #d14a4a) 30%, transparent);
 }
 
+/* ---- Paused (first-class hold flag) ---------------------------------- */
+/* Paused cards read as muted/greyed so a held task is visually distinct
+   from an active one without leaving its column. The dispatcher skips them;
+   the toggle button lifts the hold. */
+.hermes-kanban-card--paused :where(.hermes-kanban-card-content) {
+  opacity: 0.55;
+  filter: grayscale(0.5);
+}
+.hermes-kanban-card--paused :where(.hermes-kanban-pause-toggle),
+.hermes-kanban-card--paused :where(.hermes-kanban-paused-badge) {
+  opacity: 1;
+  filter: none;
+}
+.hermes-kanban-paused-badge {
+  font-size: 0.6rem !important;
+  padding: 0.05rem 0.3rem !important;
+  background: color-mix(in srgb, var(--color-ring) 14%, transparent);
+  border-color: color-mix(in srgb, var(--color-ring) 40%, var(--color-border));
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-pause-toggle {
+  margin-left: 0.15rem;
+  padding: 0 0.2rem;
+  font-size: 0.7rem;
+  line-height: 1;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--color-muted-foreground);
+  border-radius: 0.2rem;
+}
+.hermes-kanban-pause-toggle:hover {
+  color: var(--color-foreground);
+  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+}
+.hermes-kanban-pause-toggle--paused {
+  color: var(--color-warning, #d4b348);
+}
+
 /* ---- Larger checkbox hit target -------------------------------------- */
 .hermes-kanban-card-check-wrap {
   display: inline-flex;

@@ -512,6 +512,46 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     assert child_after["status"] == "ready"
 
 
+def test_patch_pause_and_resume(client):
+    """PATCH {paused: true/false} toggles the flag, preserves status, and is
+    surfaced on the task dict."""
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "hold me", "assignee": "alice"}
+    ).json()["task"]
+    assert task["status"] == "ready"
+    assert task["paused"] is False
+
+    # Pause — status preserved, flag set.
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"paused": True}
+    )
+    assert r.status_code == 200
+    paused = r.json()["task"]
+    assert paused["paused"] is True
+    assert paused["status"] == "ready"
+
+    # Resume — flag cleared.
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"paused": False}
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["paused"] is False
+
+
+def test_patch_pause_rejected_for_running(client):
+    """A running task can't be paused via the API (409)."""
+    from hermes_cli import kanban_db as kb
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "busy", "assignee": "alice"}
+    ).json()["task"]
+    with kb.connect_closing() as conn:
+        kb.claim_task(conn, task["id"])  # ready -> running
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"paused": True}
+    )
+    assert r.status_code == 409
+
+
 def test_patch_ready_ignores_archived_historical_parent(client):
     parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
     assert client.patch(

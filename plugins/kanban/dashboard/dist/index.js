@@ -88,6 +88,9 @@
 
   // Order matches BOARD_COLUMNS in plugin_api.py.
   const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  // Statuses from which a task may be PAUSED — mirrors VALID_PAUSE_STATUSES in
+  // kanban_db.py. Pause is a pre-run hold, so only the queued statuses qualify.
+  const PAUSEABLE_STATUSES = new Set(["triage", "todo", "ready"]);
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
@@ -747,6 +750,32 @@
       });
     }, [loadBoard, board, t]);
 
+    // Pause/resume toggle. Orthogonal to status: the card stays in its column,
+    // we only flip the `paused` flag so the dispatcher skips (or resumes) it.
+    const togglePause = useCallback(function (taskId, nextPaused) {
+      setBoardData(function (b) {
+        if (!b) return b;
+        const columns = b.columns.map(function (col) {
+          return Object.assign({}, col, {
+            tasks: col.tasks.map(function (tk) {
+              return tk.id === taskId ? Object.assign({}, tk, { paused: nextPaused }) : tk;
+            }),
+          });
+        });
+        return Object.assign({}, b, { columns });
+      });
+      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paused: nextPaused }),
+      }).catch(function (err) {
+        setError((nextPaused
+          ? tx(t, "pauseFailed", "Pause failed: ")
+          : tx(t, "resumeFailed", "Resume failed: ")) + parseApiErrorMessage(err));
+        loadBoard();
+      });
+    }, [loadBoard, board, t]);
+
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
       setLastSelectedId(null);
@@ -1129,6 +1158,7 @@
           selectAllInColumn,
           onMove: moveTask,
           onMoveSelected: moveSelected,
+          onTogglePause: togglePause,
           onDelete: deleteTask,
           onOpen: setSelectedTaskId,
           onCreate: createTask,
@@ -2627,6 +2657,7 @@
           selectAllInColumn: props.selectAllInColumn,
           onMove: props.onMove,
           onMoveSelected: props.onMoveSelected,
+          onTogglePause: props.onTogglePause,
           onOpen: props.onOpen,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
@@ -2765,6 +2796,7 @@
                       toggleSelected: props.toggleSelected,
                       toggleRange: props.toggleRange,
                       onOpen: props.onOpen,
+                      onTogglePause: props.onTogglePause,
                     });
                   }),
                 );
@@ -2779,6 +2811,7 @@
                   toggleSelected: props.toggleSelected,
                   toggleRange: props.toggleRange,
                   onOpen: props.onOpen,
+                  onTogglePause: props.onTogglePause,
                 });
               }),
       ),
@@ -2906,6 +2939,7 @@
         "hermes-kanban-card",
         props.selected ? "hermes-kanban-card--selected" : "",
         props.failed ? "hermes-kanban-card--failed" : "",
+        t.paused ? "hermes-kanban-card--paused" : "",
         props.draggingSource ? "hermes-kanban-card--dragging-source" : "",
         stalenessClass(t),
       ),
@@ -2973,6 +3007,33 @@
                   className: "hermes-kanban-needs-assignee",
                   title: tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile."),
                 }, tx(i18n, "needsAssignee", "Needs assignee"))
+              : null,
+            t.paused
+              ? h(Badge, {
+                  variant: "outline",
+                  className: "hermes-kanban-paused-badge",
+                  title: tx(i18n, "pausedHint", "Paused — the dispatcher skips this task. Its status is preserved; resume to re-enable."),
+                }, tx(i18n, "paused", "⏸ Paused"))
+              : null,
+            // Pause/resume toggle — only where a hold makes sense (pre-run
+            // statuses) or to lift an existing hold.
+            (t.paused || PAUSEABLE_STATUSES.has(t.status)) && props.onTogglePause
+              ? h("button", {
+                  type: "button",
+                  className: cn(
+                    "hermes-kanban-pause-toggle",
+                    t.paused ? "hermes-kanban-pause-toggle--paused" : "",
+                  ),
+                  title: t.paused
+                    ? tx(i18n, "resumeTask", "Resume — clear the pause flag")
+                    : tx(i18n, "pauseTask", "Pause — hold this task; the dispatcher skips it (status preserved)"),
+                  "aria-label": t.paused ? `Resume task ${t.id}` : `Pause task ${t.id}`,
+                  onClick: function (e) {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    props.onTogglePause(t.id, !t.paused);
+                  },
+                }, t.paused ? "▶" : "⏸")
               : null,
           ),
           h("div", { className: "hermes-kanban-card-title" },

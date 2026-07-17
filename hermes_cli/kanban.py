@@ -1653,7 +1653,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Task {task.id}: {task.title}")
-    print(f"  status:    {task.status}")
+    status_line = f"{task.status}  ⏸ PAUSED (dispatcher skips)" if task.paused else task.status
+    print(f"  status:    {status_line}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")

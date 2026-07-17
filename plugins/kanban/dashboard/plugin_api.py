@@ -901,6 +901,9 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    # First-class pause toggle. True pauses (dispatcher skips, status
+    # preserved), False resumes. None leaves the flag untouched.
+    paused: Optional[bool] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -984,6 +987,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=409,
                     detail=f"status transition to {s!r} not valid from current state",
                 )
+
+        # --- pause / resume ----------------------------------------------
+        # Orthogonal to status: pausing preserves the underlying status and
+        # only tells the dispatcher to skip the task. Resume clears the flag.
+        if payload.paused is not None:
+            if payload.paused:
+                ok, err = kanban_db.pause_task(conn, task_id, actor="dashboard")
+            else:
+                ok, err = kanban_db.resume_task(conn, task_id, actor="dashboard")
+            if not ok:
+                raise HTTPException(status_code=409, detail=err or "pause toggle failed")
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
