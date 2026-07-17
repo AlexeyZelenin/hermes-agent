@@ -10670,6 +10670,36 @@ async def scan_cron_registry(profile: str = "all", period_days: int = 30, board:
     return await _run_cron_dashboard_io(_cron_registry_scan_sync, profile, period_days, board)
 
 
+def _engine_room_sync(board: str = ""):
+    """The engine room ("под капотом") home: role prompts + surface index + substrate.
+
+    Grounded model the native dashboard renders (task t_dece1fa5). Role system
+    prompts are read live from source; substrate presence is probed against the
+    real zeus/kanban stores so the panel tells the truth about what data exists.
+    Every store is optional — a missing one degrades that pillar, never the call.
+    """
+    from hermes_cli import engine_room, kanban_db, zeus_tokens
+
+    zeus_conn = zeus_tokens.connect()
+    try:
+        try:
+            with kanban_db.connect_closing(board=board or None) as kanban_conn:
+                return engine_room.engine_room_model(
+                    zeus_conn=zeus_conn, kanban_conn=kanban_conn
+                )
+        except Exception:
+            # Board store unavailable — still serve roles/surfaces + zeus substrate.
+            return engine_room.engine_room_model(zeus_conn=zeus_conn)
+    finally:
+        if zeus_conn is not None:
+            zeus_conn.close()
+
+
+@app.get("/api/engine-room")
+async def get_engine_room(board: str = ""):
+    return await _run_cron_dashboard_io(_engine_room_sync, board)
+
+
 def _create_cron_job_sync(body: CronJobCreate, profile: str = "default"):
     try:
         profile_name, profile_home = _cron_profile_home(profile)
