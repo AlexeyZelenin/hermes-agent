@@ -146,6 +146,53 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    async def _notify_engine_redeploy(
+        self, boot_rev: Optional[str], disk_rev: Optional[str], mode: str
+    ) -> None:
+        """Best-effort operator push: engine code changed, restart pending.
+
+        Fans out to each connected platform's home channel like
+        ``_send_home_channel_startup_notifications``, but carries the code-skew
+        finding. Non-conversational (no reply expected) and never raises into
+        the dispatcher tick.
+        """
+        verb = (
+            "restarting the gateway now"
+            if mode == "safe-restart"
+            else "restart the gateway to load it"
+        )
+        message = (
+            f"⚠️ Engine changed, restart pending — Hermes booted from "
+            f"`{boot_rev}` but code on disk is now `{disk_rev}`. Merged code "
+            f"won't run until restart; {verb} (auto_redeploy={mode})."
+        )
+        adapters = getattr(self, "adapters", None) or {}
+        config = getattr(self, "config", None)
+        try:
+            from gateway.run import _non_conversational_metadata
+        except Exception:
+            _non_conversational_metadata = None
+        for platform, adapter in adapters.items():
+            try:
+                home = config.get_home_channel(platform) if config else None
+                if not home or not home.chat_id:
+                    continue
+                meta = (
+                    _non_conversational_metadata(platform=platform)
+                    if _non_conversational_metadata
+                    else None
+                )
+                if meta:
+                    await adapter.send(str(home.chat_id), message, metadata=meta)
+                else:
+                    await adapter.send(str(home.chat_id), message)
+            except Exception as exc:
+                logger.debug(
+                    "self-redeploy: home-channel push failed for %s: %s",
+                    getattr(platform, "value", platform),
+                    exc,
+                )
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -1263,6 +1310,31 @@ class GatewayKanbanWatchersMixin:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
+        # Self-redeploy watcher (task t_42950fee): once per tick, notice when
+        # engine code on disk drifted past the boot snapshot (a merge landed
+        # while this gateway was running) and react per kanban.auto_redeploy —
+        # re-read live each tick so off/notify/safe-restart flips take effect
+        # without a restart. Detached workers survive a restart; the quiet gate
+        # is in-gateway agent/cron/API work (`_active_work_count`).
+        from gateway import self_redeploy as _sr
+        from gateway.code_skew import detect_code_skew as _detect_code_skew
+
+        _under_service = bool(os.environ.get("INVOCATION_ID")) or os.environ.get(
+            "XPC_SERVICE_NAME", "0"
+        ) not in ("", "0")
+        _in_container = os.path.exists("/.dockerenv") or os.path.exists(
+            "/run/.containerenv"
+        )
+        _restart_via_service = _under_service or _in_container
+        _redeploy = _sr.RedeployController(
+            detect_skew=_detect_code_skew,
+            count_active_work=self._active_work_count,
+            request_restart=lambda: self.request_restart(
+                detached=not _restart_via_service, via_service=_restart_via_service
+            ),
+            logger=logger,
+        )
+
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
@@ -1279,6 +1351,19 @@ class GatewayKanbanWatchersMixin:
                     )
             except Exception:
                 logger.exception("kanban dispatcher: zombie reaper failed")
+
+            # Self-redeploy check — independent try so a skew-read failure never
+            # wedges dispatch. The finding is pushed to the operator once per
+            # merge (decision.first_time), not every tick.
+            try:
+                _redeploy_mode = _sr.resolve_redeploy_mode(_load_config)
+                _decision = _redeploy.evaluate(_redeploy_mode)
+                if _decision.first_time:
+                    await self._notify_engine_redeploy(
+                        _decision.boot_rev, _decision.disk_rev, _redeploy_mode
+                    )
+            except Exception:
+                logger.exception("kanban dispatcher: self-redeploy check failed")
 
             try:
                 # Re-read the auto-decompose toggle live each tick so a user
