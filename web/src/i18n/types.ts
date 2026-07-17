@@ -824,6 +824,11 @@ export interface Translations {
       done: string;
       archived: string;
     };
+    dateGroups?: {
+      today: string;
+      yesterday: string;
+      earlier: string;
+    };
     confirmDone: string;
     confirmArchive: string;
     confirmBlocked: string;

@@ -359,6 +359,25 @@ def test_dashboard_initial_board_uses_backend_current_when_unpinned():
     assert 'readSelectedBoard() || "default"' not in js
 
 
+def test_dashboard_done_column_is_date_grouped_newest_first():
+    """The Done column ("Log") groups finished tasks under date headers,
+    newest completion first, so the operator sees the last thing done at the
+    top without a date on every card (t_9ba1f2a9)."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    # Only the Done column is date-grouped.
+    assert 'const DATE_GROUPED_COLUMNS = new Set(["done"]);' in js
+    # Sort is reverse-chronological by completion time.
+    assert "dated.sort(function (a, b) { return b.completed_at - a.completed_at; });" in js
+    # Light date-separator markup + localized Today/Yesterday labels.
+    assert "hermes-kanban-dategroup-head" in js
+    assert 'tx(t, "dateGroups.today", "Today")' in js
+    assert 'tx(t, "dateGroups.yesterday", "Yesterday")' in js
+
+
 def test_dashboard_markdown_html_is_sanitized_before_render():
     """Markdown rendering must sanitize HTML before dangerouslySetInnerHTML."""
 

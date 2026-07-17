@@ -278,6 +278,36 @@
   margin-left: auto;
   font-variant-numeric: tabular-nums;
 }
+/* Done column ("Log") date separators — lighter than category headers: no
+ * icon, sentence-case date label, thin dashed rule. Keeps the finished-work
+ * feed scannable without a date on every card. */
+.hermes-kanban-dategroup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.25rem 0 0.35rem;
+  border-top: 1px dashed color-mix(in srgb, var(--color-border) 70%, transparent);
+}
+.hermes-kanban-dategroup:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.hermes-kanban-dategroup-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.65rem;
+  letter-spacing: 0.02em;
+  color: var(--color-muted-foreground);
+  padding: 0 0.1rem;
+}
+.hermes-kanban-dategroup-label {
+  font-weight: 600;
+}
+.hermes-kanban-dategroup-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
 /* Per-card category badge (icon + name) on the card meta row. */
 .hermes-kanban-category-badge {
   font-size: 0.62rem;

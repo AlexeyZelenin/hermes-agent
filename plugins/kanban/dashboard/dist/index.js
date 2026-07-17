@@ -97,6 +97,11 @@
   // Icon for the trailing Uncategorized bucket — mirrors UNCATEGORIZED_ICON in
   // kanban_db.py.
   const UNCATEGORIZED_ICON = "📥";
+  // The Done column doubles as the operator's "Log" — a record of finished
+  // work. Show it newest-completed-first under light date headers (Today /
+  // Yesterday / explicit date) so the last thing done sits at the top, with no
+  // date on every card. Mirrors the category-section pattern above.
+  const DATE_GROUPED_COLUMNS = new Set(["done"]);
 
   // Build a {key: {name, icon}} lookup from the board's category catalog.
   function categoryMap(categories) {
@@ -137,6 +142,66 @@
     if (paused.length) {
       groups.push({ key: "__paused__", name: "Paused", icon: "⏸",
                     paused: true, tasks: paused });
+    }
+    return groups;
+  }
+
+  // Local midnight (ms) for the day containing `ms` — the bucket boundary for
+  // the date grouping below.
+  function startOfLocalDay(ms) {
+    const d = new Date(ms);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+
+  // Compact localized date for a group header, e.g. "18 Jul" / "18 июл.".
+  function formatDateHeader(dayStartMs, locale) {
+    try {
+      return new Date(dayStartMs).toLocaleDateString(locale || undefined,
+        { day: "numeric", month: "short" });
+    } catch (_e) {
+      return new Date(dayStartMs).toISOString().slice(0, 10);
+    }
+  }
+
+  // Bucket completed tasks under date headers, newest first. Tasks are sorted
+  // by completion time descending, then split into Today / Yesterday / older
+  // day groups (each already newest-first). Tasks with no completion time sink
+  // to a trailing "earlier" bucket so the log never hides them. Returns
+  // [{key, label, tasks}].
+  function groupTasksByDate(tasks, t, locale) {
+    const dated = [];
+    const undated = [];
+    for (const tk of tasks) {
+      const secs = tk.completed_at;
+      if (typeof secs === "number" && secs > 0) dated.push(tk);
+      else undated.push(tk);
+    }
+    dated.sort(function (a, b) { return b.completed_at - a.completed_at; });
+    const todayStart = startOfLocalDay(Date.now());
+    // Step back 12h from local midnight and re-snap: lands on yesterday's
+    // midnight even across DST shifts (which move the clock by ≤1h).
+    const yesterdayStart = startOfLocalDay(todayStart - 43200000);
+    const groups = [];
+    const byKey = {};
+    for (const tk of dated) {
+      const dayStart = startOfLocalDay(tk.completed_at * 1000);
+      let key, label;
+      if (dayStart === todayStart) {
+        key = "today"; label = tx(t, "dateGroups.today", "Today");
+      } else if (dayStart === yesterdayStart) {
+        key = "yesterday"; label = tx(t, "dateGroups.yesterday", "Yesterday");
+      } else {
+        key = "d" + dayStart; label = formatDateHeader(dayStart, locale);
+      }
+      let g = byKey[key];
+      if (!g) { g = byKey[key] = { key: key, label: label, tasks: [] }; groups.push(g); }
+      g.tasks.push(tk);
+    }
+    if (undated.length) {
+      groups.push({ key: "earlier",
+                    label: tx(t, "dateGroups.earlier", "Earlier"),
+                    tasks: undated });
     }
     return groups;
   }
@@ -2907,7 +2972,7 @@
   }
 
   function Column(props) {
-    const { t } = useI18n();
+    const { t, locale } = useI18n();
     const [dragOver, setDragOver] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
     const colRef = useRef(null);
@@ -2976,6 +3041,14 @@
       if (groups.length <= 1 && !anyPaused) return null;
       return groups;
     }, [props.column, props.categories]);
+
+    // The Done column ("Log") is grouped by completion date, newest first, so
+    // the operator sees the last thing done at the top without a per-card date.
+    const dateGroups = useMemo(function () {
+      if (!DATE_GROUPED_COLUMNS.has(props.column.name)) return null;
+      if (!props.column.tasks.length) return null;
+      return groupTasksByDate(props.column.tasks, t, locale);
+    }, [props.column, t, locale]);
 
     const renderCard = function (tk) {
       return h(TaskCard, {
@@ -3075,7 +3148,17 @@
                     grp.tasks.map(renderCard),
                   );
                 })
-              : props.column.tasks.map(renderCard),
+              : dateGroups
+                ? dateGroups.map(function (grp) {
+                    return h("div", { key: grp.key, className: "hermes-kanban-dategroup" },
+                      h("div", { className: "hermes-kanban-dategroup-head" },
+                        h("span", { className: "hermes-kanban-dategroup-label" }, grp.label),
+                        h("span", { className: "hermes-kanban-dategroup-count" }, grp.tasks.length),
+                      ),
+                      grp.tasks.map(renderCard),
+                    );
+                  })
+                : props.column.tasks.map(renderCard),
       ),
     );
   }

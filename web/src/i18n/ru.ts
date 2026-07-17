@@ -745,6 +745,11 @@ export const ru: Translations = {
       done: "Завершено",
       archived: "В архиве",
     },
+    dateGroups: {
+      today: "Сегодня",
+      yesterday: "Вчера",
+      earlier: "Ранее",
+    },
     confirmDone:
       "Отметить эту задачу как выполненную? Захват воркера будет освобождён, а зависимые потомки станут готовыми.",
     confirmArchive:
