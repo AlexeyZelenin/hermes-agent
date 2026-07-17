@@ -70,7 +70,27 @@ Drive it with the same xterm.js setup `ChatPage.tsx` uses (send
 falls back to creating the session if it does not exist; the default is strict
 attach, because variant A wants the operator's *existing* session.
 
+### Reachable through the app (task t_acd93597)
+
+`ChatPage.tsx` now reads a `?zellij=<session>` search param and forwards it to
+`/api/pty` via the pure `buildPtyConnectParams` helper
+(`web/src/lib/pty-connect.ts`, unit-tested). Opening the dashboard at
+`/chat?zellij=<session>` — or the right chat dock on any page carrying that
+param — makes the **existing terminal chat panel** mirror the live session
+instead of spawning a fresh TUI. No new chrome: attach mode is URL-driven.
+
+Because zellij owns session persistence, attach mode is **terminal-only** —
+the gateway model-picker sidebar and session switcher (which act on gateway
+`channel` sessions that don't exist here) are hidden, and the keep-alive
+attach token is not computed/rotated. Everything else (resize, copy-last,
+reconnect-on-drop) is the shared `ChatPage` path unchanged. Security is
+entirely the backend gate above (localhost + token + `_ZELLIJ_SESSION_RE`);
+the frontend only passes the name through.
+
 ## Deliberately deferred: the three-pane layout
+
+Note: t_acd93597 wired the *single-pane* live attach into the chat panel (above).
+The multi-pane layout below is still deferred.
 
 The task also asks for terminal + kanban board + card visible **at once**, next
 to each other. That is a product-design decision about the operator's dashboard

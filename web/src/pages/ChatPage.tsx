@@ -36,6 +36,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { normalizeSessionTitle } from "@/lib/chat-title";
+import { buildPtyConnectParams } from "@/lib/pty-connect";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
   PTY_RECONNECT_INPUT_MESSAGE,
@@ -293,6 +294,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
   const resumeParam = searchParams.get("resume");
+  // Live zellij-session attach ("variant A", task t_d2259745): when set, the
+  // terminal mirrors the operator's existing named zellij session instead of
+  // spawning a fresh hermes TUI. zellij owns the session, so the gateway
+  // channel / keep-alive / model-picker sidebar don't apply — the view is
+  // terminal-only (see the side-rail guards in render).
+  const zellijSession = (searchParams.get("zellij") ?? "").trim() || null;
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
@@ -402,7 +409,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       setEnd(null);
       return;
     }
-    if (!narrow) {
+    // Live zellij attach is terminal-only: the model-picker / session
+    // switcher operate on gateway sessions that don't exist here.
+    if (!narrow || zellijSession) {
       setEnd(null);
       return;
     }
@@ -425,7 +434,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       </Button>,
     );
     return () => setEnd(null);
-  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
+  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd, zellijSession]);
 
   const handleCopyLast = () => {
     const ws = wsRef.current;
@@ -901,17 +910,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
     void (async () => {
       if (unmounting) return;
-      const params: Record<string, string> = { channel };
-      if (resumeParam) params.resume = resumeParam;
-      if (forceFresh) params.fresh = "1";
-      // Keep-alive identity: reattach to this tab's living PTY across
-      // refresh/transient drops. A forced-fresh start rotates the token so
-      // the previous keep-alive PTY is not reattached (registry reaps it).
-      params.attach = ptyAttachToken(forceFresh);
-      // Profile-scoped chat: the PTY child gets HERMES_HOME pointed at the
-      // selected profile, so the conversation runs with that profile's model,
-      // skills, memory, and sessions (see web_server._resolve_chat_argv).
-      if (scopedProfile) params.profile = scopedProfile;
+      // Keep-alive identity (gateway mode only): reattach to this tab's
+      // living PTY across refresh/transient drops. A forced-fresh start
+      // rotates the token so the previous keep-alive PTY is not reattached
+      // (registry reaps it). In zellij-attach mode the token is not computed
+      // — zellij owns persistence — so we don't rotate it as a side effect.
+      const params = buildPtyConnectParams({
+        zellij: zellijSession,
+        channel,
+        resume: resumeParam,
+        // Profile-scoped chat: the PTY child gets HERMES_HOME pointed at the
+        // selected profile, so the conversation runs with that profile's
+        // model, skills, memory, and sessions (see _resolve_chat_argv).
+        profile: scopedProfile,
+        forceFresh,
+        attachToken: zellijSession ? null : ptyAttachToken(forceFresh),
+      });
       const url = await api.buildWsUrl("/api/pty", params);
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
@@ -1165,7 +1179,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         reconnectTimerRef.current = null;
       }
     };
-  }, [channel, clearReconnectTimer, resumeParam, scopedProfile, reconnectNonce]);
+  }, [
+    channel,
+    clearReconnectTimer,
+    resumeParam,
+    scopedProfile,
+    zellijSession,
+    reconnectNonce,
+  ]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
@@ -1472,7 +1493,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           </Button>
         </div>
 
-        {!narrow && (
+        {!narrow && !zellijSession && (
           <div
             id="chat-side-panel"
             role="complementary"
