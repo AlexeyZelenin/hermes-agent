@@ -27,7 +27,7 @@ import os
 import sqlite3
 from typing import Optional
 
-from hermes_cli import zeus_tokens
+from hermes_cli import zeus_circuit_breaker, zeus_tokens
 
 # Fallback window length when the true window can't be pinned from the pacing
 # row (Claude subscription limits reset weekly, so 7 days is the right default).
@@ -74,17 +74,23 @@ def _window_tokens(
     conn: sqlite3.Connection,
     subscription: str,
     since_ts: Optional[float],
+    until_ts: Optional[float] = None,
 ) -> Optional[dict]:
     """``{total_tokens, turns, last_ts}`` burned by ``subscription`` in-window.
 
     Sums ``token_usage`` rows tagged with this subscription since
-    ``since_ts`` (the window start). ``None`` when the ledger table is absent.
+    ``since_ts`` (the window start). ``until_ts`` optionally caps the upper
+    bound (used by the v2 circuit-breaker to read spend *as of* the controller's
+    last snapshot). ``None`` when the ledger table is absent.
     """
     clause = "subscription = ?"
     params: list = [subscription]
     if since_ts is not None:
         clause += " AND ts >= ?"
         params.append(since_ts)
+    if until_ts is not None:
+        clause += " AND ts <= ?"
+        params.append(until_ts)
     try:
         row = conn.execute(
             "SELECT COALESCE(SUM(total_tokens), 0) AS t, COUNT(*) AS n, MAX(ts) AS last "
@@ -143,6 +149,20 @@ def _pocket(
     cooling_until = meta.get("cooling_until")
     pace_delta = spent - target if spent is not None and target is not None else None
     window_start = _window_start(reset_at, row["elapsed_percent"], updated_at)
+    cooling = cooling_until is not None and cooling_until > now
+    live = _window_tokens(conn, row["subscription"], window_start)
+    # v2 real-time circuit-breaker: re-derive spend from the live ledger, using
+    # tokens burned up to ``updated_at`` as the controller's calibration point.
+    snapshot = _window_tokens(conn, row["subscription"], window_start, until_ts=updated_at)
+    breaker = zeus_circuit_breaker.evaluate(
+        spent_percent=spent,
+        live_tokens=live["total_tokens"] if live is not None else None,
+        snapshot_tokens=snapshot["total_tokens"] if snapshot is not None else None,
+        window_start=window_start,
+        reset_at=reset_at,
+        now=now,
+        cooling=cooling,
+    )
     return {
         "subscription": row["subscription"],
         "display_name": meta.get("display_name") or row["subscription"],
@@ -166,10 +186,11 @@ def _pocket(
             max(0.0, now - updated_at) if updated_at is not None else None
         ),
         "cooling_until": cooling_until,
-        "cooling": cooling_until is not None and cooling_until > now,
+        "cooling": cooling,
         "last_limited_at": meta.get("last_limited_at"),
         "window_start": window_start,
-        "window_tokens": _window_tokens(conn, row["subscription"], window_start),
+        "window_tokens": live,
+        "circuit_breaker": breaker,
     }
 
 
@@ -183,8 +204,10 @@ def pacing_snapshot(
 
     Returns ``{"board", "now", "pockets": [...], "window_total_tokens"}``. Each
     pocket carries its pacing state (spent/target/elapsed %, mode, agent limit,
-    burn rate, time to reset), cool-down state, and the tokens it burned in the
-    current window. ``conn is None`` or a missing ``pacing_state`` table yields
+    burn rate, time to reset), cool-down state, the tokens it burned in the
+    current window, and a ``circuit_breaker`` verdict (pacing v2 — the real-time
+    spend cutoff, see :mod:`hermes_cli.zeus_circuit_breaker`). ``conn is None``
+    or a missing ``pacing_state`` table yields
     an empty ``pockets`` list rather than raising, so the panel degrades to a
     "no pacing data" state instead of a 500.
     """
