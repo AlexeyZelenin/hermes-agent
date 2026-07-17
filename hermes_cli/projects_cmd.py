@@ -117,6 +117,29 @@ def build_parser(
         "board", nargs="?", default="", help="Board slug (omit to unbind)"
     )
 
+    p_secret_set = sub.add_parser(
+        "set-secret",
+        help="Store a project-scoped secret (provider key / credential)",
+        description=(
+            "Store a secret only this project's tasks can use. The value is read "
+            "from a masked prompt (TTY) or the first line of stdin (non-TTY); it "
+            "is never echoed, logged, or accepted on the command line."
+        ),
+    )
+    p_secret_set.add_argument("project", help="Project id or slug")
+    p_secret_set.add_argument("name", help="Env-var name, e.g. ANTHROPIC_API_KEY")
+
+    p_secret_list = sub.add_parser(
+        "list-secrets", help="List a project's secret NAMES (never values)"
+    )
+    p_secret_list.add_argument("project", help="Project id or slug")
+
+    p_secret_rm = sub.add_parser(
+        "remove-secret", help="Remove a project-scoped secret"
+    )
+    p_secret_rm.add_argument("project", help="Project id or slug")
+    p_secret_rm.add_argument("name", help="Env-var name to remove")
+
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -150,6 +173,9 @@ def projects_command(args: argparse.Namespace) -> int:
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
         "set-model": _cmd_set_model,
+        "set-secret": _cmd_set_secret,
+        "list-secrets": _cmd_list_secrets,
+        "remove-secret": _cmd_remove_secret,
     }
     handler = handlers.get(action)
     if handler is None:
@@ -360,6 +386,50 @@ def _cmd_set_model(args, conn, proj) -> int:
     pdb.update_project(conn, proj.id, models=merged)
     refreshed = pdb.get_project(conn, proj.id)
     _print_project(refreshed)
+    return 0
+
+
+@_with_project
+def _cmd_set_secret(args, conn, proj) -> int:
+    from hermes_cli import project_secrets as psec
+    from hermes_cli.secret_prompt import masked_secret_prompt
+
+    name = psec.validate_secret_name(args.name)  # fail fast on a bad name
+    if sys.stdin.isatty():
+        value = masked_secret_prompt(f"  Value for {name}: ")
+    else:
+        value = sys.stdin.readline().rstrip("\n")
+    if not value:
+        print("project: empty value, nothing stored", file=sys.stderr)
+        return 1
+    psec.get_default_store().set(proj.id, name, value)
+    print(f"Stored {name} for {proj.slug} ({psec.redact(value)})")
+    return 0
+
+
+@_with_project
+def _cmd_list_secrets(args, conn, proj) -> int:
+    from hermes_cli import project_secrets as psec
+
+    names = psec.get_default_store().names(proj.id)
+    if not names:
+        print(f"No secrets stored for {proj.slug}.")
+        return 0
+    print(f"Secrets for {proj.slug} (names only):")
+    for name in names:
+        print(f"  {name}")
+    return 0
+
+
+@_with_project
+def _cmd_remove_secret(args, conn, proj) -> int:
+    from hermes_cli import project_secrets as psec
+
+    if not psec.get_default_store().delete(proj.id, args.name):
+        print(f"project: no secret named {args.name} for {proj.slug}",
+              file=sys.stderr)
+        return 1
+    print(f"Removed {args.name} from {proj.slug}")
     return 0
 
 

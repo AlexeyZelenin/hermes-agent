@@ -8601,6 +8601,37 @@ def _resolve_worker_cli_toolsets(
         return ceiling or None
 
 
+def _apply_project_secret_env(env: dict, task: Task) -> None:
+    """Layer the task's project-scoped secrets over ``env`` in place.
+
+    Resolves the secrets of the task's linked project (``task.project_id``) and
+    writes them into the child's environment. A project key shadows the global
+    default for that project's worker only; another project's keys are never
+    present to leak (see :mod:`hermes_cli.project_secrets`).
+
+    Fail-open and value-safe: any resolution error leaves ``env`` untouched (the
+    worker still runs with global credentials) and logs the project id only,
+    never a secret name or value. An unlinked task (no ``project_id``) is a
+    no-op, so behaviour is unchanged for the pre-existing global-secret flow.
+    """
+    project_id = getattr(task, "project_id", None)
+    if not project_id:
+        return
+    try:
+        from hermes_cli.project_secrets import build_project_secret_scope
+
+        secrets = build_project_secret_scope(project_id)
+    except Exception as exc:  # noqa: BLE001 - never block a spawn on secret I/O
+        _log.warning(
+            "kanban worker: project-secret injection skipped for task %s "
+            "(project %s): %s",
+            getattr(task, "id", "?"), project_id, type(exc).__name__,
+        )
+        return
+    for name, value in secrets.items():
+        env[name] = value
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8629,6 +8660,17 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+
+    # Project-scoped secret isolation: layer THIS task's project secrets over
+    # the inherited env BEFORE the Hermes control-plane pins below, so a
+    # project secret can never clobber a runtime pin (belt-and-braces with the
+    # global-name rejection in project_secrets.validate_secret_name). Because
+    # project secrets live in per-project files and are NEVER unioned into the
+    # dispatcher's os.environ, `env` can only ever carry this task's own
+    # project's keys - another project's secrets are physically absent. Covers
+    # both the hermes-worker and the ACP (claude-code/codex) executors: both
+    # spawn through this one chokepoint.
+    _apply_project_secret_env(env, task)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
