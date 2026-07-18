@@ -21,10 +21,12 @@ import {
 } from "react-router-dom";
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   BookOpen,
   Clock,
   Code,
+  Cog,
   Cpu,
   Database,
   Download,
@@ -60,6 +62,7 @@ import {
   Zap,
 } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
+import { Segmented } from "@nous-research/ui/ui/components/segmented";
 import { SelectionSwitcher } from "@nous-research/ui/ui/components/selection-switcher";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
@@ -88,7 +91,9 @@ import AnalyticsPage from "@/pages/AnalyticsPage";
 import ModelsPage from "@/pages/ModelsPage";
 import CronPage from "@/pages/CronPage";
 import RegularPage from "@/pages/RegularPage";
+import ProblemsPage from "@/pages/ProblemsPage";
 import PacingPage from "@/pages/PacingPage";
+import EngineRoomPage from "@/pages/EngineRoomPage";
 import ProfilesPage from "@/pages/ProfilesPage";
 import ProfileBuilderPage from "@/pages/ProfileBuilderPage";
 import SkillsPage from "@/pages/SkillsPage";
@@ -117,6 +122,15 @@ import {
 } from "@/lib/chat-dock";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
+import {
+  APP_SIDE_HOME,
+  loadLastPaths,
+  otherSide,
+  partitionNavBySide,
+  persistLastPaths,
+  sideForPath,
+  type AppSide,
+} from "@/lib/app-side";
 
 function RootRedirect() {
   return <Navigate to="/sessions" replace />;
@@ -149,12 +163,14 @@ const CHAT_NAV_ITEM: NavItem = {
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
+  "/engine-room": EngineRoomPage,
   "/files": FilesPage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
   "/logs": LogsPage,
   "/cron": CronPage,
   "/regular": RegularPage,
+  "/problems": ProblemsPage,
   "/pacing": PacingPage,
   "/skills": SkillsPage,
   "/plugins": PluginsPage,
@@ -185,6 +201,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
+  { path: "/engine-room", label: "Под капотом", icon: Cog },
   { path: "/files", label: "Files", icon: FolderOpen },
   {
     path: "/analytics",
@@ -201,7 +218,8 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
   { path: "/regular", label: "Регулярные", icon: Repeat },
-  { path: "/pacing", label: "Лимиты", icon: Gauge },
+  { path: "/problems", label: "Проблемы", icon: AlertTriangle },
+  { path: "/pacing", label: "Подписки", icon: Gauge },
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
   { path: "/mcp", label: "MCP", icon: Plug },
@@ -509,6 +527,36 @@ export default function App() {
     () => partitionSidebarNav(builtinNav, manifests),
     [builtinNav, manifests],
   );
+
+  // ── Two sides of the app: user vs engine room ("под капотом") ──────────
+  // The active side is *derived* from the current route, so the toggle and the
+  // URL can never disagree — a deep-link into a meta page shows the engine side.
+  const appSide = sideForPath(pathname);
+  // Remember the last route visited on each side so flipping the toggle restores
+  // the context you left rather than always dumping you on the side's home.
+  const lastPathBySideRef = useRef<Record<AppSide, string>>(loadLastPaths());
+  useEffect(() => {
+    lastPathBySideRef.current[appSide] = pathname;
+    persistLastPaths(lastPathBySideRef.current);
+  }, [appSide, pathname]);
+  const navigate = useNavigate();
+  const switchSide = useCallback(
+    (next: AppSide) => {
+      if (next === appSide) return;
+      navigate(lastPathBySideRef.current[next] || APP_SIDE_HOME[next]);
+    },
+    [appSide, navigate],
+  );
+  // Show only the current side's surfaces. Plugin tabs (e.g. the board) are
+  // user-facing, so they drop off the engine side, keeping the meta uncluttered.
+  const visibleNav = useMemo(
+    () => ({
+      coreItems: partitionNavBySide(sidebarNav.coreItems, appSide),
+      pluginItems: partitionNavBySide(sidebarNav.pluginItems, appSide),
+    }),
+    [sidebarNav, appSide],
+  );
+
   const routes = useMemo(
     () => buildRoutes(builtinRoutes, manifests),
     [builtinRoutes, manifests],
@@ -685,12 +733,51 @@ export default function App() {
 
             <ProfileSwitcher collapsed={isDesktopCollapsed} />
 
+            <div
+              className={cn(
+                "border-t border-current/10 px-3 py-2",
+                isDesktopCollapsed && "lg:px-2",
+              )}
+            >
+              {isDesktopCollapsed ? (
+                <SidebarIconWithTooltip
+                  collapsed={isDesktopCollapsed}
+                  label={appSide === "user" ? "Под капотом" : "Пользователь"}
+                  tooltipWarmRef={tooltipWarmRef}
+                >
+                  <Button
+                    ghost
+                    size="icon"
+                    className="text-text-secondary hover:text-foreground"
+                    onClick={() => switchSide(otherSide(appSide))}
+                    aria-label={appSide === "user" ? "Под капотом" : "Пользователь"}
+                  >
+                    {appSide === "user" ? (
+                      <Cog className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </Button>
+                </SidebarIconWithTooltip>
+              ) : (
+                <Segmented
+                  value={appSide}
+                  onChange={switchSide}
+                  size="sm"
+                  options={[
+                    { value: "user", label: "Пользователь" },
+                    { value: "engine", label: "Под капотом" },
+                  ]}
+                />
+              )}
+            </div>
+
             <nav
               className="min-h-0 w-full flex-1 overflow-y-auto overflow-x-hidden border-t border-current/10 py-2"
               aria-label={t.app.navigation}
             >
               <ul className="flex flex-col">
-                {sidebarNav.coreItems.map((item) => (
+                {visibleNav.coreItems.map((item) => (
                   <SidebarNavLink
                     closeMobile={closeMobile}
                     collapsed={isDesktopCollapsed}
@@ -702,7 +789,7 @@ export default function App() {
                 ))}
               </ul>
 
-              {sidebarNav.pluginItems.length > 0 && (
+              {visibleNav.pluginItems.length > 0 && (
                 <div
                   aria-labelledby="hermes-sidebar-plugin-nav-heading"
                   className="flex flex-col border-t border-current/10 pb-2"
@@ -720,7 +807,7 @@ export default function App() {
                   </span>
 
                   <ul className="flex flex-col">
-                    {sidebarNav.pluginItems.map((item) => (
+                    {visibleNav.pluginItems.map((item) => (
                       <SidebarNavLink
                         closeMobile={closeMobile}
                         collapsed={isDesktopCollapsed}

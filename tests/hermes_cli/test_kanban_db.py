@@ -3366,6 +3366,66 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
 
+class TestLiveBoardGuard:
+    """The kanban core must make it *impossible* for a pytest run to touch
+    the real shared board without an isolation override (task t_ecacc87b).
+
+    ``PYTEST_CURRENT_TEST`` is already set by pytest while these run, so the
+    guard is armed. The guard keys on the *real* ``HOME`` env (not the
+    monkeypatched ``Path.home``), so these tests point ``HOME`` at a tempdir
+    and treat ``<HOME>/.hermes`` as the stand-in "live" board.
+    """
+
+    def _point_home_at(self, monkeypatch, tmp_path):
+        real_home = tmp_path / "realhome"
+        (real_home / ".hermes").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setattr(Path, "home", lambda: real_home)
+        monkeypatch.setenv("HERMES_HOME", str(real_home / ".hermes"))
+        return real_home / ".hermes"
+
+    def test_unisolated_live_board_access_hard_fails(self, tmp_path, monkeypatch):
+        live = self._point_home_at(monkeypatch, tmp_path)
+        monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+
+        # Sanity: without the guard this would resolve straight to the live db.
+        with pytest.raises(RuntimeError, match="live-board guard"):
+            kb.kanban_db_path()
+        assert (live / "kanban.db").parent == live  # documents the blocked path
+
+    def test_kanban_home_override_bypasses_guard(self, tmp_path, monkeypatch):
+        self._point_home_at(monkeypatch, tmp_path)
+        isolated = tmp_path / "isolated-board"
+        isolated.mkdir()
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(isolated))
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+
+        assert kb.kanban_db_path() == isolated / "kanban.db"
+
+    def test_kanban_db_pin_bypasses_guard(self, tmp_path, monkeypatch):
+        self._point_home_at(monkeypatch, tmp_path)
+        pinned = tmp_path / "pinned" / "board.db"
+        pinned.parent.mkdir(parents=True)
+        monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
+
+        assert kb.kanban_db_path() == pinned
+
+    def test_isolated_tempdir_home_does_not_trip_guard(self, tmp_path, monkeypatch):
+        # The common case: HERMES_HOME is an isolated tempdir that is NOT
+        # under the real ~/.hermes. Derivation resolves there and the guard
+        # stays silent.
+        self._point_home_at(monkeypatch, tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(elsewhere))
+        monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+
+        assert kb.kanban_db_path() == elsewhere / "kanban.db"
+
+
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------
@@ -5221,3 +5281,63 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# updated_at — last-meaningful-change tracking (task t_3f79b87d)
+# ---------------------------------------------------------------------------
+
+def test_updated_at_seeded_to_created_at_on_insert(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="fresh")
+        t = kb.get_task(conn, tid)
+    assert t.updated_at is not None
+    assert t.updated_at == t.created_at
+
+
+def test_updated_at_bumps_on_meaningful_edit(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="before")
+        # Pin created_at/updated_at into the past (created_at is NOT watched by the
+        # trigger, so this write does not itself bump updated_at).
+        conn.execute(
+            "UPDATE tasks SET created_at = 1000, updated_at = 1000 WHERE id = ?", (tid,)
+        )
+        conn.commit()
+        # A content edit fires the trigger → updated_at jumps to ~now.
+        conn.execute("UPDATE tasks SET title = 'after' WHERE id = ?", (tid,))
+        conn.commit()
+        t = kb.get_task(conn, tid)
+    assert t.updated_at > 1000
+
+
+def test_updated_at_not_bumped_by_liveness_churn(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="running task")
+        conn.execute("UPDATE tasks SET updated_at = 1000 WHERE id = ?", (tid,))
+        conn.commit()
+        # Heartbeat / claim / pid churn must NOT count as a meaningful update.
+        conn.execute("UPDATE tasks SET last_heartbeat_at = 99999 WHERE id = ?", (tid,))
+        conn.execute("UPDATE tasks SET worker_pid = 4242 WHERE id = ?", (tid,))
+        conn.execute("UPDATE tasks SET claim_expires = 88888 WHERE id = ?", (tid,))
+        conn.commit()
+        t = kb.get_task(conn, tid)
+    assert t.updated_at == 1000
+
+
+def test_updated_at_migration_backfills_from_created_at(kanban_home):
+    """A legacy row without updated_at back-fills to created_at, not NULL/now."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="legacy")
+        conn.execute("UPDATE tasks SET created_at = 500 WHERE id = ?", (tid,))
+        # Simulate a pre-migration row: drop the value so the backfill has work.
+        conn.execute("UPDATE tasks SET updated_at = NULL WHERE id = ?", (tid,))
+        conn.commit()
+    # Re-run the additive migration pass; it should backfill updated_at.
+    with kb.connect() as conn:
+        kb._migrate_add_optional_columns(conn)
+        conn.commit()
+        row = conn.execute(
+            "SELECT created_at, updated_at FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+    assert row["updated_at"] == row["created_at"] == 500

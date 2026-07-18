@@ -10,6 +10,7 @@
     "agent/acp_task_executor.py",
     "agent/claude_subscriptions.py",
     "hermes_cli/zeus_pacing.py",
+    "hermes_cli/pocket_accounting.py",
     "hermes_cli/kanban_db.py"
   ],
 

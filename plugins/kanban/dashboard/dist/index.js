@@ -715,6 +715,9 @@
     const [config, setConfig] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    // Проблемы for THIS board (task t_e9b93153): open findings surfaced as
+    // draft cards in a section after the trash zone, hidden when empty.
+    const [problems, setProblems] = useState([]);
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
@@ -724,6 +727,16 @@
     const [configApplied, setConfigApplied] = useState(false);
 
     const [selectedTaskId, setSelectedTaskId] = useState(() => readViewFromUrl().task);
+    // View-only detail popup (task t_3f79b87d). Distinct from the editable
+    // drawer above: opening a card shows this max-info, read-only modal that
+    // hides the board; the drawer (edit/actions) is reached via the card's
+    // right-click "Open details". Opening the popup closes the drawer so the
+    // two surfaces never stack.
+    const [detailTaskId, setDetailTaskId] = useState(null);
+    const openDetail = useCallback(function (taskId) {
+      setSelectedTaskId(null);
+      setDetailTaskId(taskId);
+    }, []);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
@@ -781,6 +794,29 @@
         })
         .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived, board]);
+
+    // --- Проблемы for this board (task t_e9b93153) -------------------------
+    const loadProblems = useCallback(function () {
+      return SDK.fetchJSON(withBoard(`${API}/problems`, board))
+        .then(function (data) { setProblems((data && data.problems) || []); })
+        .catch(function () { setProblems([]); });  // no store / no table → empty
+    }, [board]);
+
+    useEffect(function () { loadProblems(); }, [loadProblems]);
+
+    const acceptProblem = useCallback(function (id) {
+      return SDK.fetchJSON(withBoard(`${API}/problems/${id}/accept`, board),
+                           { method: "POST" })
+        .then(function () { loadProblems(); loadBoard(); })  // new triage card appears
+        .catch(function (e) { setError(String(e && e.message ? e.message : e)); });
+    }, [board, loadProblems, loadBoard]);
+
+    const dismissProblem = useCallback(function (id) {
+      return SDK.fetchJSON(withBoard(`${API}/problems/${id}/dismiss`, board),
+                           { method: "POST" })
+        .then(function () { loadProblems(); })
+        .catch(function (e) { setError(String(e && e.message ? e.message : e)); });
+    }, [board, loadProblems]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -1392,9 +1428,13 @@
           onTogglePause: togglePause,
           onDelete: deleteTask,
           onOpen: setSelectedTaskId,
+          onOpenDetail: openDetail,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks.filter(isPersistentTask)); }, []),
           categories: (boardData && boardData.categories) || [],
+          problems: problems,
+          onAcceptProblem: acceptProblem,
+          onDismissProblem: dismissProblem,
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
@@ -1407,6 +1447,19 @@
           assignees: (boardData && boardData.assignees) || [],
           categories: (boardData && boardData.categories) || [],
           eventTick: taskEventTick[selectedTaskId] || 0,
+        }) : null,
+        detailTaskId ? h(TaskViewModal, {
+          taskId: detailTaskId,
+          boardSlug: board,
+          onClose: function () { setDetailTaskId(null); },
+          onOpenTask: openDetail,
+          onOpenDrawer: function (taskId) {
+            setDetailTaskId(null);
+            setSelectedTaskId(taskId);
+          },
+          renderMarkdown: renderMd,
+          categories: (boardData && boardData.categories) || [],
+          eventTick: taskEventTick[detailTaskId] || 0,
         }) : null,
       ),
     );
@@ -2765,6 +2818,88 @@
   }
 
   // -------------------------------------------------------------------------
+  // Проблемы — per-board findings as draft cards (task t_e9b93153)
+  //
+  // Rendered as the last section after the trash zone, hidden when empty.
+  // Each card explains a finding + its proposed fix; "В бэклог" converts it
+  // into a real triage task on this board, "Отклонить" puts it to rest.
+  // System/global findings (board='') are NOT shown here — they live in the
+  // top-level Проблемы menu so they're never buried in a project.
+  // -------------------------------------------------------------------------
+
+  const PROBLEM_TONE_COLOR = {
+    info: "#8a94a6", warning: "#ff9e3b", error: "#ff6b3d", critical: "#ff4d4d",
+  };
+  const PROBLEM_TONE_LABEL = {
+    info: "инфо", warning: "внимание", error: "ошибка", critical: "критично",
+  };
+
+  function ProblemCard(props) {
+    const p = props.problem;
+    const [busy, setBusy] = useState(false);
+    const color = PROBLEM_TONE_COLOR[p.tone] || PROBLEM_TONE_COLOR.info;
+    const act = function (fn) {
+      setBusy(true);
+      Promise.resolve(fn(p.id)).finally(function () { setBusy(false); });
+    };
+    return h("div", {
+      className: "hermes-kanban-card hermes-kanban-problem-card",
+      style: { borderLeft: `3px solid ${color}` },
+    },
+      h("div", { className: "hermes-kanban-problem-head" },
+        h("span", { className: "hermes-kanban-problem-title" }, p.title || "Проблема"),
+        h(Badge, { variant: "outline", style: { color: color, borderColor: color } },
+          PROBLEM_TONE_LABEL[p.tone] || p.tone),
+        p.source ? h(Badge, { variant: "outline" }, p.source) : null,
+        p.category ? h(Badge, { variant: "outline" }, p.category) : null,
+      ),
+      p.explanation
+        ? h("div", { className: "hermes-kanban-problem-body" }, p.explanation)
+        : null,
+      p.proposed
+        ? h("div", { className: "hermes-kanban-problem-fix" },
+            h("div", { className: "hermes-kanban-problem-fix-label" },
+              "Предложенное решение"),
+            h("div", null, p.proposed),
+          )
+        : null,
+      h("div", { className: "hermes-kanban-problem-actions" },
+        h(Button, {
+          size: "sm", variant: "outline", disabled: busy,
+          onClick: function () { act(props.onDismiss); },
+        }, "Отклонить"),
+        h(Button, {
+          size: "sm", disabled: busy,
+          onClick: function () { act(props.onAccept); },
+        }, "В бэклог"),
+      ),
+    );
+  }
+
+  function ProblemsColumn(props) {
+    return h("div", {
+      "data-kanban-column": "__problems__",
+      className: "hermes-kanban-column hermes-kanban-problems-column",
+    },
+      h("div", { className: "hermes-kanban-column-header" },
+        h("span", { className: "hermes-kanban-dot hermes-kanban-problems-dot" }),
+        h("span", { className: "hermes-kanban-column-label" }, "Проблемы"),
+        h("span", { className: "hermes-kanban-column-count",
+                    title: `${props.problems.length} problem(s)` },
+          props.problems.length),
+      ),
+      h("div", { className: "hermes-kanban-column-body" },
+        props.problems.map(function (p) {
+          return h(ProblemCard, {
+            key: p.id, problem: p,
+            onAccept: props.onAccept, onDismiss: props.onDismiss,
+          });
+        }),
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // Columns
   // -------------------------------------------------------------------------
 
@@ -2893,6 +3028,7 @@
           onTogglePause: props.onTogglePause,
           onDelete: props.onDelete,
           onOpen: props.onOpen,
+          onOpenDetail: props.onOpenDetail,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
           categories: props.categories,
@@ -2903,6 +3039,14 @@
         selectedIds: props.selectedIds,
         onDelete: props.onDelete,
       }),
+      // Проблемы section — last, after the trash zone; hidden when empty.
+      (props.problems && props.problems.length)
+        ? h(ProblemsColumn, {
+            problems: props.problems,
+            onAccept: props.onAcceptProblem,
+            onDismiss: props.onDismissProblem,
+          })
+        : null,
     );
   }
 
@@ -2988,6 +3132,7 @@
         toggleSelected: props.toggleSelected,
         toggleRange: props.toggleRange,
         onOpen: props.onOpen,
+        onOpenDetail: props.onOpenDetail,
         onTogglePause: props.onTogglePause,
         onDelete: props.onDelete,
       });
@@ -3118,6 +3263,63 @@
     return parts.join(" ");
   }
 
+  // Human-readable model name from a raw ledger id. Strips the [1m] context
+  // suffix, maps known families to brand names, and turns the historical
+  // 'default'/'' leak into an honest "unknown" (task t_3f79b87d). Unknown ids
+  // pass through cleaned so a new model still reads reasonably.
+  function humanizeModel(id) {
+    if (id == null) return "unknown";
+    let s = String(id).trim();
+    if (!s) return "unknown";
+    const low = s.toLowerCase();
+    if (low === "default" || low === "inherit" || low === "auto" || low === "none") {
+      return "unknown";
+    }
+    s = s.replace(/\[1m\]$/i, "");            // drop the 1M-context marker
+    const low2 = s.toLowerCase();
+    const KNOWN = [
+      [/^claude-fable-5/, "Fable 5"],
+      [/^claude-opus-4-8/, "Opus 4.8"],
+      [/^claude-opus-4-7/, "Opus 4.7"],
+      [/^claude-opus/, "Opus"],
+      [/^claude-sonnet-5/, "Sonnet 5"],
+      [/^claude-sonnet/, "Sonnet"],
+      [/^claude-haiku-4-5/, "Haiku 4.5"],
+      [/^claude-haiku/, "Haiku"],
+      [/^gpt-5\.6-terra/, "GPT-5.6 Terra"],
+      [/^gpt-5\.6-soul/, "GPT-5.6 Soul"],
+      [/^gpt-5\.6/, "GPT-5.6"],
+      [/^gpt-5/, "GPT-5"],
+    ];
+    for (let i = 0; i < KNOWN.length; i++) {
+      if (KNOWN[i][0].test(low2)) return KNOWN[i][1];
+    }
+    return s;
+  }
+
+  // Compact "A — 70% · B — 30%" string for a model_split.models list. A single
+  // model drops the percentage (there's nothing to split). Empty → "".
+  function modelSplitLabel(models) {
+    if (!models || !models.length) return "";
+    if (models.length === 1) return humanizeModel(models[0].model);
+    return models
+      .map(function (m) { return humanizeModel(m.model) + " — " + m.pct + "%"; })
+      .join(" · ");
+  }
+
+  // Absolute local time for a unix-epoch-seconds value, e.g. "2026-07-18 04:10".
+  function fmtAbsTime(epochSeconds) {
+    if (!epochSeconds) return "";
+    try {
+      const d = new Date(epochSeconds * 1000);
+      const pad = function (n) { return (n < 10 ? "0" : "") + n; };
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+        " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+    } catch (e) {
+      return "";
+    }
+  }
+
   // Staleness tiers — amber after a grace window, red when clearly stuck.
   // Values below are seconds.
   const STALENESS = {
@@ -3163,6 +3365,11 @@
         });
       }
     };
+    // Open the VIEW-ONLY detail popup (task t_3f79b87d). Falls back to the
+    // editable drawer on an older host that didn't wire onOpenDetail through.
+    const openDetail = function () {
+      (props.onOpenDetail || props.onOpen)(t.id);
+    };
     const handleClick = function (e) {
       if (e.shiftKey) {
         e.preventDefault();
@@ -3176,12 +3383,15 @@
         props.toggleSelected(t.id, true);
         return;
       }
-      props.onOpen(t.id);
+      // Single or double click opens the detail popup — the "смотреть" path.
+      // Selection lives on the checkbox + ctrl/shift-click (handled above); the
+      // edit/actions drawer is reached via the right-click context menu.
+      openDetail();
     };
     const handleKeyDown = function (e) {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        props.onOpen(t.id);
+        openDetail();
       }
       if (e.key === "Escape") {
         if (props.toggleSelected) props.toggleSelected(t.id, false);
@@ -3238,6 +3448,7 @@
       "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,
       onDragStart: handleDragStart,
       onClick: handleClick,
+      onDoubleClick: function (e) { e.preventDefault(); e.stopPropagation(); openDetail(); },
       onKeyDown: handleKeyDown,
       onContextMenu: handleContextMenu,
     },
@@ -3378,6 +3589,16 @@
                 title: tokenCostTitle(tc),
               }, label);
             })(),
+            (function () {
+              // Compact model line: which model(s) actually ran this card, split
+              // by token share when more than one (task t_3f79b87d).
+              const ms = t.model_split && t.model_split.models;
+              if (!ms || !ms.length) return null;
+              return h("span", {
+                className: "hermes-kanban-count hermes-kanban-model",
+                title: "Model(s) that ran this card, by token share: " + modelSplitLabel(ms),
+              }, "🧠 ", modelSplitLabel(ms));
+            })(),
             h("span", { className: "hermes-kanban-ago",
                         title: t.created_at ? `Created ${t.created_at}` : "" },
               timeAgo ? timeAgo(t.created_at) : ""),
@@ -3400,8 +3621,13 @@
             h("button", {
               type: "button",
               className: "hermes-kanban-context-menu-item",
+              onClick: function () { closeMenu(); openDetail(); },
+            }, "🔍 " + tx(i18n, "viewDetails", "View details")),
+            h("button", {
+              type: "button",
+              className: "hermes-kanban-context-menu-item",
               onClick: function () { closeMenu(); props.onOpen(t.id); },
-            }, "🔍 " + tx(i18n, "openDetails", "Open details")),
+            }, "✎ " + tx(i18n, "editActions", "Edit / actions")),
             canPause
               ? h("button", {
                   type: "button",
@@ -3914,6 +4140,235 @@
           }, tx(t, "comment", "Comment")),
         ) : null,
       ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // View-only detail popup (task t_3f79b87d).
+  //
+  // Opened by clicking / double-clicking a card. A full-screen modal that HIDES
+  // the board (so the reader focuses on one card) and shows the MAXIMUM
+  // structured info — context intro, all properties, token/model/ROI facts,
+  // created + last-updated times, related decisions, links, and run history.
+  // Deliberately READ-ONLY: editing happens via chat or the separate drawer
+  // (reached from the header's "Edit / actions" link), never inline here.
+  // -------------------------------------------------------------------------
+  function TaskViewModal(props) {
+    const { t } = useI18n();
+    const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [err, setErr] = useState(null);
+    const boardSlug = props.boardSlug;
+
+    const load = useCallback(function () {
+      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug))
+        .then(function (d) { setData(d); setErr(null); })
+        .catch(function (e) { setErr(String(e.message || e)); })
+        .finally(function () { setLoading(false); });
+    }, [props.taskId, boardSlug]);
+
+    useEffect(function () { load(); }, [load, props.eventTick]);
+    useEffect(function () {
+      function onKey(e) { if (e.key === "Escape") props.onClose(); }
+      window.addEventListener("keydown", onKey);
+      return function () { window.removeEventListener("keydown", onKey); };
+    }, [props.onClose]);
+
+    const task = data && data.task;
+    return h("div", { className: "hermes-kanban-view-shade", onClick: props.onClose },
+      h("div", {
+        className: "hermes-kanban-view-modal",
+        role: "dialog",
+        "aria-modal": "true",
+        onClick: function (e) { e.stopPropagation(); },
+      },
+        h("div", { className: "hermes-kanban-view-head" },
+          h("span", { className: "hermes-kanban-view-id" }, props.taskId),
+          task ? h(Badge, { variant: "outline", className: "hermes-kanban-view-status" }, task.status) : null,
+          h("div", { className: "hermes-kanban-view-head-spacer" }),
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-view-editlink",
+            title: tx(t, "editActionsHint", "Open the editable drawer (status actions, comments, links)"),
+            onClick: function () { if (props.onOpenDrawer) props.onOpenDrawer(props.taskId); },
+          }, "✎ " + tx(t, "editActions", "Edit / actions")),
+          h("button", {
+            type: "button",
+            onClick: props.onClose,
+            className: "hermes-kanban-view-close",
+            title: tx(t, "close", "Close (Esc)"),
+          }, "×"),
+        ),
+        loading ? h("div", { className: "p-4 text-sm text-muted-foreground" }, tx(t, "loadingDetail", "Loading…")) :
+        err ? h("div", { className: "p-4 text-sm text-destructive" }, err) :
+        task ? h(TaskViewBody, {
+          data: data,
+          renderMarkdown: props.renderMarkdown,
+          categories: props.categories,
+          onOpenTask: props.onOpenTask,
+        }) : null,
+      ),
+    );
+  }
+
+  // Body of the view popup — the scrollable max-info column.
+  function TaskViewBody(props) {
+    const { t } = useI18n();
+    const data = props.data;
+    const task = data.task;
+    return h("div", { className: "hermes-kanban-view-scroll" },
+      // Uncut title — wraps fully, never truncated.
+      h("h2", { className: "hermes-kanban-view-title" }, task.title || tx(t, "untitled", "(untitled)")),
+      // Context intro — introduces the reader to what this card is about. Shown
+      // first, above everything, because the board holds many unrelated cards.
+      task.context
+        ? h("div", { className: "hermes-kanban-view-intro" },
+            h("div", { className: "hermes-kanban-view-intro-label" }, tx(t, "context", "Context")),
+            h(MarkdownBlock, { source: task.context, enabled: props.renderMarkdown }))
+        : null,
+      h(TaskViewProps, { task: task, categories: props.categories }),
+      // Self-describing body.
+      task.body
+        ? h("div", { className: "hermes-kanban-section" },
+            h("div", { className: "hermes-kanban-section-head" }, tx(t, "description", "Description")),
+            h(MarkdownBlock, { source: task.body, enabled: props.renderMarkdown }))
+        : null,
+      task.latest_summary
+        ? h("div", { className: "hermes-kanban-section" },
+            h("div", { className: "hermes-kanban-section-head" }, tx(t, "latestSummary", "Latest worker summary")),
+            h(MarkdownBlock, { source: task.latest_summary, enabled: props.renderMarkdown }))
+        : null,
+      h(RelatedDecisions, { decisions: data.decisions }),
+      h(TaskViewLinks, { data: data, onOpenTask: props.onOpenTask }),
+      h(RunHistoryView, { runs: data.runs }),
+    );
+  }
+
+  // A single self-describing property row (label + value). Skipped when empty.
+  function vField(label, value, opts) {
+    if (value == null || value === "") return null;
+    return h("div", { className: "hermes-kanban-view-field", key: label },
+      h("span", { className: "hermes-kanban-view-field-label" }, label),
+      h("span", { className: "hermes-kanban-view-field-value", title: (opts && opts.title) || undefined }, value),
+    );
+  }
+
+  // Properties grid — ALL the facts about the card, each labelled so it reads
+  // without prior knowledge.
+  function TaskViewProps(props) {
+    const { t } = useI18n();
+    const task = props.task;
+    const ms = task.model_split;
+    const tc = task.token_cost;
+    const cm = categoryMap(props.categories);
+    const catMeta = task.category && cm[task.category];
+
+    var modelValue = null;
+    if (ms && ms.models && ms.models.length) {
+      modelValue = modelSplitLabel(ms.models);
+    } else if (task.model_override) {
+      modelValue = humanizeModel(task.model_override) + " " + tx(t, "requested", "(requested)");
+    }
+
+    var costValue = null;
+    if (tc && tc.own) {
+      costValue = "🔥 " + formatTokens(tc.own.total_tokens) + " " + tx(t, "tokens", "tokens");
+      if (tc.own.cost_usd != null) costValue += " (~$" + tc.own.cost_usd.toFixed(2) + ")";
+      if (tc.rollup) {
+        costValue += " · " + tx(t, "epic", "epic") + " " + formatTokens(tc.rollup.total_tokens) +
+          " (" + tc.rollup.task_count + " " + tx(t, "cards", "cards") + ")";
+      }
+    }
+
+    return h("div", { className: "hermes-kanban-view-props" },
+      vField(tx(t, "status", "Status"), task.status),
+      vField(tx(t, "assignee", "Assignee"), task.assignee ? "@" + task.assignee : tx(t, "unassigned", "unassigned")),
+      task.priority > 0 ? vField(tx(t, "priority", "Priority"), "P" + task.priority) : null,
+      catMeta ? vField(tx(t, "category", "Category"), catMeta.icon + " " + catMeta.name) : null,
+      vField(tx(t, "tenant", "Tenant"), task.tenant),
+      vField(tx(t, "executor", "Executor"), task.executor),
+      vField(tx(t, "model", "Model"), modelValue,
+        { title: ms && ms.models ? "By token share across all runs of this task" : "Requested model override" }),
+      vField(tx(t, "effort", "Effort"),
+        (ms && ms.efforts && ms.efforts.length ? ms.efforts.join(", ") : task.effort_override)),
+      vField(tx(t, "subscription", "Subscription"),
+        (ms && ms.subscriptions && ms.subscriptions.length ? ms.subscriptions.join(", ") : null)),
+      vField(tx(t, "buildCost", "Build cost (ROI)"), costValue, { title: tokenCostTitle(tc) }),
+      vField(tx(t, "created", "Created"),
+        task.created_at ? fmtAbsTime(task.created_at) + (timeAgo ? " (" + timeAgo(task.created_at) + ")" : "") : null),
+      vField(tx(t, "updated", "Last updated"),
+        task.updated_at ? fmtAbsTime(task.updated_at) + (timeAgo ? " (" + timeAgo(task.updated_at) + ")" : "") : null),
+      // Per-model token breakdown when the card spanned more than one model.
+      ms && ms.models && ms.models.length > 1
+        ? h("div", { className: "hermes-kanban-view-field hermes-kanban-view-field--wide" },
+            h("span", { className: "hermes-kanban-view-field-label" }, tx(t, "modelSplit", "Model split (by tokens)")),
+            h("div", { className: "hermes-kanban-view-field-value" },
+              ms.models.map(function (m) {
+                return h("div", { key: m.model, className: "hermes-kanban-view-model-row" },
+                  humanizeModel(m.model) + " — " + m.pct + "% (" + formatTokens(m.total_tokens) + ")");
+              })))
+        : null,
+    );
+  }
+
+  // Read-only parent/child links. Parents are bare ids; children carry title +
+  // status from ``child_results``. Both open that task's own view popup.
+  function TaskViewLinks(props) {
+    const { t } = useI18n();
+    const links = (props.data && props.data.links) || { parents: [], children: [] };
+    const parents = links.parents || [];
+    const childResults = props.data.child_results || [];
+    if (!parents.length && !childResults.length) return null;
+    const openTask = function (id) { if (props.onOpenTask) props.onOpenTask(id); };
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, tx(t, "links", "Links")),
+      parents.length
+        ? h("div", { className: "hermes-kanban-view-links-row" },
+            h("span", { className: "hermes-kanban-view-links-label" }, tx(t, "parents", "Parents") + ": "),
+            parents.map(function (id) {
+              return h("button", { key: id, type: "button", className: "hermes-kanban-link-chip",
+                onClick: function () { openTask(id); } }, id);
+            }))
+        : null,
+      childResults.length
+        ? h("div", { className: "hermes-kanban-view-links-row" },
+            h("span", { className: "hermes-kanban-view-links-label" }, tx(t, "children", "Children") + ": "),
+            childResults.map(function (c) {
+              return h("button", { key: c.id, type: "button",
+                className: "hermes-kanban-link-chip", title: c.title || c.id,
+                onClick: function () { openTask(c.id); } },
+                c.id + " · " + (c.status || "") + (c.title ? " — " + c.title : ""));
+            }))
+        : null,
+    );
+  }
+
+  // Run history — one row per attempt, surfacing the model/effort/subscription
+  // that run actually used (parsed from the run's metadata blob).
+  function RunHistoryView(props) {
+    const { t } = useI18n();
+    const runs = props.runs || [];
+    if (!runs.length) return null;
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" },
+        tx(t, "runHistory", "Run history") + " (" + runs.length + ")"),
+      runs.slice().reverse().map(function (r) {
+        var meta = {};
+        try { meta = r.metadata ? JSON.parse(r.metadata) : {}; } catch (e) { meta = {}; }
+        const facts = [];
+        if (meta.model) facts.push(humanizeModel(meta.model));
+        if (meta.effort || meta.effort_requested) facts.push(tx(t, "effort", "Effort") + ": " + (meta.effort || meta.effort_requested));
+        if (meta.subscription) facts.push(meta.subscription);
+        if (r.profile) facts.push("@" + r.profile);
+        const state = r.outcome || r.status || "";
+        const when = r.started_at && timeAgo ? timeAgo(r.started_at) : "";
+        return h("div", { key: r.id, className: "hermes-kanban-view-run" },
+          h("div", { className: "hermes-kanban-view-run-head" },
+            h("span", { className: "hermes-kanban-view-run-state" }, state),
+            facts.length ? h("span", { className: "hermes-kanban-view-run-facts" }, facts.join(" · ")) : null,
+            when ? h("span", { className: "hermes-kanban-view-run-when" }, when) : null),
+          r.summary ? h("div", { className: "hermes-kanban-view-run-summary" }, r.summary) : null);
+      }),
     );
   }
 

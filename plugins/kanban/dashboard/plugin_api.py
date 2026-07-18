@@ -209,6 +209,21 @@ def _board_token_costs(
     return out
 
 
+def _board_model_splits(task_ids: list[str]) -> dict[str, list[dict]]:
+    """Map each task id to its per-model token split (own spend only — no epic
+    rollup) for the card's compact "model" line. One batched ledger read across
+    the visible cards; degrades to ``{}`` when the ledger is absent.
+    """
+    if not task_ids:
+        return {}
+    zeus_conn = zeus_tokens.connect()
+    try:
+        return zeus_tokens.model_breakdown_by_task(zeus_conn, task_ids)
+    finally:
+        if zeus_conn is not None:
+            zeus_conn.close()
+
+
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
     return {
         "id": event.id,
@@ -500,6 +515,8 @@ def get_board(
         # batched read across every card on the board; degrades to {} when
         # the ledger is absent so the cards simply carry no cost badge.
         token_costs = _board_token_costs([t.id for t in tasks], children_map)
+        # Per-card model split (own spend) for the compact card model line.
+        model_splits = _board_model_splits([t.id for t in tasks])
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -513,6 +530,9 @@ def get_board(
             tc = token_costs.get(t.id)
             if tc:
                 d["token_cost"] = tc  # omitted when the card burned no tokens
+            ms = model_splits.get(t.id)
+            if ms:
+                d["model_split"] = {"models": ms}  # omitted when no ledger rows
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
@@ -560,6 +580,69 @@ def get_board(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Проблемы — per-board findings as draft cards (task t_e9b93153)
+# ---------------------------------------------------------------------------
+
+@router.get("/problems")
+def get_problems(board: Optional[str] = Query(default=None)):
+    """Open findings scoped to this board, worst-severity first.
+
+    Powers the per-project "Проблемы" section (hidden when empty, rendered last
+    after the trash zone). Global/system findings (``board=''``) are excluded
+    here — they live in the top-level Проблемы menu — so a board only ever shows
+    its own problems. Degrades to an empty list when the store is absent.
+    """
+    from hermes_cli import problems
+
+    slug = _resolve_board(board) or kanban_db.DEFAULT_BOARD
+    conn = problems.open_store()
+    try:
+        items = problems.list_problems(conn, board=slug)
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"problems": items, "board": slug, "count": len(items)}
+
+
+@router.post("/problems/{finding_id}/accept")
+def accept_problem(finding_id: int, board: Optional[str] = Query(default=None)):
+    """Materialise a finding as a triage backlog card on its own board."""
+    from hermes_cli import problems
+
+    conn = problems.open_store()
+    if conn is None:
+        raise HTTPException(status_code=503, detail="findings store unavailable")
+    try:
+        result = problems.accept_problem(conn, finding_id)
+    finally:
+        conn.close()
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail="problem not found or already resolved"
+        )
+    return {"ok": True, **result}
+
+
+@router.post("/problems/{finding_id}/dismiss")
+def dismiss_problem(finding_id: int, board: Optional[str] = Query(default=None)):
+    """Mark a finding resolved-by-human so re-scans don't resurface it."""
+    from hermes_cli import problems
+
+    conn = problems.open_store()
+    if conn is None:
+        raise HTTPException(status_code=503, detail="findings store unavailable")
+    try:
+        ok = problems.dismiss_problem(conn, finding_id)
+    finally:
+        conn.close()
+    if not ok:
+        raise HTTPException(
+            status_code=404, detail="problem not found or already resolved"
+        )
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -632,12 +715,18 @@ def get_task(
         zeus_conn = zeus_tokens.connect()
         try:
             per_task = zeus_tokens.aggregate_by_task(zeus_conn, {task_id, *subtree})
+            # Per-model token split (the REAL model tag from the ledger) plus the
+            # provider/effort/subscription facts, for the detail popup's model
+            # line. A task that spanned models renders as "A — 70% · B — 30%".
+            model_split = zeus_tokens.model_split(zeus_conn, task_id)
         finally:
             if zeus_conn is not None:
                 zeus_conn.close()
         tc = zeus_tokens.token_cost(task_id, per_task, subtree)
         if tc:
             task_d["token_cost"] = tc
+        if model_split:
+            task_d["model_split"] = model_split
         return {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -2302,6 +2391,8 @@ class CreateBoardBody(BaseModel):
     icon: Optional[str] = None
     color: Optional[str] = None
     default_workdir: Optional[str] = None
+    # Deprecated: ignored. Concurrency is owned by the pacing controller, not
+    # set per-board. Kept for backward-compatible payloads.
     agent_limit: Optional[int] = None
     executor: Optional[str] = None
     models: Optional[dict] = None
@@ -2314,6 +2405,8 @@ class RenameBoardBody(BaseModel):
     description: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
+    # Deprecated: ignored. Concurrency is owned by the pacing controller, not
+    # set per-board. Kept for backward-compatible payloads.
     agent_limit: Optional[int] = None
     executor: Optional[str] = None
     models: Optional[dict] = None
@@ -2387,7 +2480,10 @@ def create_board_endpoint(payload: CreateBoardBody):
             icon=payload.icon,
             color=payload.color,
             default_workdir=default_workdir,
-            agent_limit=payload.agent_limit,
+            # agent_limit is deliberately not forwarded: concurrency is owned by
+            # the pacing controller, not set per-board by the operator. New
+            # boards get the default safety cap; the field is accepted but
+            # ignored for backward compatibility.
             executor=payload.executor,
             models=payload.models,
             models_effort=payload.models_effort,
@@ -2419,7 +2515,9 @@ def rename_board(slug: str, payload: RenameBoardBody):
             description=payload.description,
             icon=payload.icon,
             color=payload.color,
-            agent_limit=payload.agent_limit,
+            # agent_limit is deliberately not forwarded: it is a pacing-owned
+            # safety cap, not an operator setting. Accepted but ignored so old
+            # clients don't 422.
             executor=payload.executor,
             models=payload.models,
             models_effort=payload.models_effort,

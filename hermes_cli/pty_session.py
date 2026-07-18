@@ -144,26 +144,35 @@ class PtySessionRegistry:
         self._buffer_cap = buffer_cap
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
+        # Serialises the check-and-spawn below. Without it two simultaneous
+        # reconnects on the same token (dashboard auto-reconnect fires two
+        # upgrades in one tick) both see ``existing is None``, both spawn, and
+        # the second overwrites ``_sessions[key]`` — orphaning the first PTY's
+        # bridge/drain task and leaking its fds (the fd-exhaustion class #54028
+        # fights). The lock spans the ``await`` in spawn, so the whole
+        # test-then-set is atomic across coroutines.
+        self._spawn_lock = asyncio.Lock()
 
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
                               ) -> Tuple[PtySession, bool]:
-        await self.reap_idle()
-        existing = self._sessions.get(key)
-        if existing is not None and existing.alive:
-            return existing, False
-        if existing is not None:                       # dead remnant
-            await existing.close()
-            self._sessions.pop(key, None)
-        if len(self._sessions) >= self._max:
-            self._reap_one_idle_or_raise()
-        # PTY spawn does blocking fork/exec work — keep it off the event
-        # loop (#53227).
-        bridge = await asyncio.to_thread(spawn)
-        session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
-                             read_timeout=self._read_timeout)
-        await session.start()
-        self._sessions[key] = session
-        return session, True
+        async with self._spawn_lock:
+            await self.reap_idle()
+            existing = self._sessions.get(key)
+            if existing is not None and existing.alive:
+                return existing, False
+            if existing is not None:                   # dead remnant
+                await existing.close()
+                self._sessions.pop(key, None)
+            if len(self._sessions) >= self._max:
+                self._reap_one_idle_or_raise()
+            # PTY spawn does blocking fork/exec work — keep it off the event
+            # loop (#53227).
+            bridge = await asyncio.to_thread(spawn)
+            session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
+                                 read_timeout=self._read_timeout)
+            await session.start()
+            self._sessions[key] = session
+            return session, True
 
     def detach(self, key: str, ws) -> None:
         s = self._sessions.get(key)

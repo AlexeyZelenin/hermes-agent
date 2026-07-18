@@ -980,6 +980,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- sub --- (Claude Code subscription pool management)
+    p_sub = sub.add_parser(
+        "sub",
+        help="Manage the Claude Code subscription pool (reserve a pocket so "
+             "workers never lease it; list pool status)",
+    )
+    sub_sub = p_sub.add_subparsers(dest="sub_action")
+    p_sub_reserve = sub_sub.add_parser(
+        "reserve",
+        help="Reserve (on) / unreserve (off) a subscription. A reserved pocket "
+             "is never leased to workers, independent of cooling/rotation.",
+    )
+    p_sub_reserve.add_argument("name", help="Subscription name (e.g. personal)")
+    p_sub_reserve.add_argument(
+        "state", choices=["on", "off"], help="on = reserve, off = release",
+    )
+    p_sub_list = sub_sub.add_parser("list", help="List the subscription pool")
+    p_sub_list.add_argument("--json", action="store_true")
+    p_sub.set_defaults(_sub_parser=p_sub)
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -1109,6 +1129,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
+            "sub":      _cmd_sub,
             "gc":       _cmd_gc,
         }
         handler = handlers.get(action)
@@ -2858,6 +2879,50 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
         print("(no such subscription)", file=sys.stderr)
         return 1
     print(f"Unsubscribed from {args.task_id}")
+    return 0
+
+
+def _cmd_sub(args: argparse.Namespace) -> int:
+    """`hermes kanban sub <reserve|list>` — Claude Code subscription pool."""
+    from agent import claude_subscriptions as subs
+    action = getattr(args, "sub_action", None)
+    if action == "reserve":
+        reserved = args.state == "on"
+        # Register discovered pockets first so a fresh name resolves.
+        subs.sync_registry()
+        if not subs.update_subscription(args.name, reserved=reserved):
+            print(f"kanban sub: no such subscription {args.name!r}", file=sys.stderr)
+            return 1
+        verb = "reserved (workers will not lease it)" if reserved else "released to the worker pool"
+        print(f"Subscription {args.name} {verb}.")
+        return 0
+    if action == "list":
+        status = subs.pool_status()
+        if getattr(args, "json", False):
+            print(json.dumps(status, indent=2, ensure_ascii=False))
+            return 0
+        if not status:
+            print("(no subscriptions registered)")
+            return 0
+        for s in status:
+            flags = []
+            if not s["enabled"]:
+                flags.append("disabled")
+            if s["reserved"]:
+                flags.append("reserved")
+            if s["cooling"]:
+                flags.append("cooling")
+            if not s["logged_in"]:
+                flags.append("logged-out")
+            tail = f"  [{', '.join(flags)}]" if flags else ""
+            print(f"  {s['name']:12s}  {s['active_sessions']}/{s['max_concurrency']}"
+                  f" active{tail}")
+        return 0
+    parser = getattr(args, "_sub_parser", None)
+    if parser is not None:
+        parser.print_help()
+    else:
+        print("usage: hermes kanban sub <reserve|list> ...", file=sys.stderr)
     return 0
 
 

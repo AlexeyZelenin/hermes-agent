@@ -48,10 +48,11 @@ class _connection_context:
 
 
 class _FakeLease:
-    def __init__(self, name):
+    def __init__(self, name, provider="claude"):
         self.id = 1
         self.name = name
         self.config_dir = f"/cfg/{name}"
+        self.provider = provider
 
 
 def _hook_stub(returns):
@@ -81,8 +82,8 @@ def test_contributed_env_merges_into_pool_worker_extra_env(monkeypatch, kanban_c
     task_id = kb.create_task(kanban_conn, title="OTel task", assignee="external")
     assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
-    monkeypatch.setattr(subs, "pool_size", lambda: 1)
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": _FakeLease("p1"))
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 1)
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: _FakeLease("p1"))
     monkeypatch.setattr(subs, "release", lambda lease: None)
 
     hook = _hook_stub([FAKE_OTEL_ENV])
@@ -124,8 +125,8 @@ def test_core_config_dir_wins_over_contributed_collision(monkeypatch, kanban_con
     task_id = kb.create_task(kanban_conn, title="Collision", assignee="external")
     assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
-    monkeypatch.setattr(subs, "pool_size", lambda: 1)
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": _FakeLease("p9"))
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 1)
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: _FakeLease("p9"))
     monkeypatch.setattr(subs, "release", lambda lease: None)
     _patch_plugins(monkeypatch, _hook_stub([{"CLAUDE_CONFIG_DIR": "/evil", "OTEL_TRACES_EXPORTER": "otlp"}]))
 
@@ -159,7 +160,7 @@ def test_contributed_env_in_pool0_fallback_path(monkeypatch, kanban_conn, tmp_pa
     task_id = kb.create_task(kanban_conn, title="Pool0 OTel", assignee="external")
     assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
-    monkeypatch.setattr(subs, "pool_size", lambda: 0)
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 0)
     _patch_plugins(monkeypatch, _hook_stub([FAKE_OTEL_ENV]))
 
     captured = {}
@@ -191,8 +192,8 @@ def test_fail_open_when_no_plugin_contributes(monkeypatch, kanban_conn, tmp_path
     task_id = kb.create_task(kanban_conn, title="Plain", assignee="external")
     assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
-    monkeypatch.setattr(subs, "pool_size", lambda: 1)
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": _FakeLease("p1"))
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 1)
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: _FakeLease("p1"))
     monkeypatch.setattr(subs, "release", lambda lease: None)
     _patch_plugins(monkeypatch, _hook_stub([]))
 
@@ -226,8 +227,8 @@ def test_hook_error_is_swallowed_and_spawn_proceeds(monkeypatch, kanban_conn, tm
     task_id = kb.create_task(kanban_conn, title="Boom", assignee="external")
     assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
-    monkeypatch.setattr(subs, "pool_size", lambda: 1)
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": _FakeLease("p1"))
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 1)
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: _FakeLease("p1"))
     monkeypatch.setattr(subs, "release", lambda lease: None)
 
     def boom(force=False):

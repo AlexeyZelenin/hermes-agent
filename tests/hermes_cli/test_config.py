@@ -1,5 +1,6 @@
 """Tests for hermes_cli configuration management."""
 
+import ast
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +8,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from hermes_cli import config as config_module
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     check_config_version,
@@ -2034,5 +2036,44 @@ class TestCodexAppServerAutoConfig:
 
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert raw["compression"]["codex_app_server_auto"] == "hermes"
+
+
+class TestDefaultConfigNoDuplicateKeys:
+    """Regression for t_eac81bd5: DEFAULT_CONFIG had two ``kanban`` blocks;
+    the second silently overrode the first, dropping ``auto_subscribe_on_create``.
+    Python dedupes duplicate dict-literal keys at parse time, so a runtime dict
+    check can't catch a reintroduced duplicate — walk the source AST instead."""
+
+    def _default_config_ast(self):
+        source = Path(config_module.__file__).read_text()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "DEFAULT_CONFIG"
+                for t in node.targets
+            ):
+                assert isinstance(node.value, ast.Dict)
+                return node.value
+        raise AssertionError("DEFAULT_CONFIG assignment not found in source")
+
+    def test_no_duplicate_top_level_keys(self):
+        dict_node = self._default_config_ast()
+        keys = [k.value for k in dict_node.keys if isinstance(k, ast.Constant)]
+        dupes = {k for k in keys if keys.count(k) > 1}
+        assert not dupes, f"duplicate top-level keys in DEFAULT_CONFIG: {dupes}"
+
+    def test_kanban_block_keeps_both_merged_blocks_keys(self):
+        kanban = DEFAULT_CONFIG["kanban"]
+        # From the notification block that used to be shadowed away.
+        assert kanban["auto_subscribe_on_create"] is True
+        # From the dispatcher block that used to win the collision.
+        for key in (
+            "dispatch_in_gateway",
+            "dispatch_interval_seconds",
+            "failure_limit",
+            "auto_redeploy",
+            "toolset_selection",
+        ):
+            assert key in kanban, f"missing dispatcher key {key!r} after merge"
 
 

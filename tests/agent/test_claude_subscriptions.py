@@ -18,7 +18,9 @@ clock-parsing tests pin ``TZ=UTC`` + ``time.tzset()`` for determinism, since
 ``_parse_clock_reset`` builds candidates via naive ``datetime.fromtimestamp``.
 """
 
+import json
 import os
+import sqlite3
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -319,15 +321,16 @@ class TestIsAuthError:
 
 
 def _insert_sub(conn, name, config_dir, *, enabled=1, max_concurrency=4,
-                cooling_until=None, last_limited_at=None):
+                cooling_until=None, last_limited_at=None, reserved=0,
+                provider="claude"):
     now = time.time()
     conn.execute(
         "INSERT INTO claude_subscriptions"
-        " (name, config_dir, max_concurrency, enabled, cooling_until,"
-        "  last_limited_at, created_at, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, config_dir, max_concurrency, enabled, cooling_until,
-         last_limited_at, now, now),
+        " (name, config_dir, provider, max_concurrency, enabled, reserved,"
+        "  cooling_until, last_limited_at, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, config_dir, provider, max_concurrency, enabled, reserved,
+         cooling_until, last_limited_at, now, now),
     )
     conn.commit()
 
@@ -390,7 +393,10 @@ class TestMarkLimited:
 def _logged_in(monkeypatch):
     """Treat every config dir as logged-in unless explicitly excluded."""
     excluded = set()
-    monkeypatch.setattr(subs, "is_logged_in", lambda cd: cd not in excluded)
+    monkeypatch.setattr(
+        subs, "is_logged_in",
+        lambda cd, provider=subs.PROVIDER_CLAUDE: cd not in excluded,
+    )
     return excluded
 
 
@@ -467,6 +473,37 @@ class TestSelectableRows:
         finally:
             conn.close()
 
+    def test_reserved_is_never_selectable_for_workers(self, tmp_path, _logged_in):
+        # A reserved pocket is excluded even when it is enabled, logged-in and
+        # not cooling — the contract that keeps personal out of the worker pool.
+        conn = subs.connect()
+        try:
+            now = time.time()
+            for name in ("personal", "work"):
+                d = tmp_path / name
+                d.mkdir()
+                _insert_sub(conn, name, str(d), reserved=1 if name == "personal" else 0)
+            names = [r["name"] for r in subs._selectable_rows(conn, now)]
+            assert names == ["work"]
+        finally:
+            conn.close()
+
+    def test_reserved_selectable_only_with_explicit_override(self, tmp_path, _logged_in):
+        conn = subs.connect()
+        try:
+            now = time.time()
+            d = tmp_path / "personal"
+            d.mkdir()
+            _insert_sub(conn, "personal", str(d), reserved=1)
+            assert subs._selectable_rows(conn, now) == []
+            names = [
+                r["name"]
+                for r in subs._selectable_rows(conn, now, allow_reserved=True)
+            ]
+            assert names == ["personal"]
+        finally:
+            conn.close()
+
 
 class TestAutoResumeEta:
     """auto_resume_eta: is a subscription-exhausted block armed to self-heal?"""
@@ -501,6 +538,19 @@ class TestAutoResumeEta:
             d = tmp_path / "off"
             d.mkdir()
             _insert_sub(conn, "off", str(d), enabled=0, cooling_until=now + 500)
+        finally:
+            conn.close()
+        assert subs.auto_resume_eta(now) is None
+
+    def test_reserved_cooling_pocket_is_not_a_revival_path(self, tmp_path, _logged_in):
+        # A reserved pocket's cooldown lapsing never frees WORKER capacity, so a
+        # worker-exhausted block must not treat it as an auto-resume horizon.
+        now = time.time()
+        conn = subs.connect()
+        try:
+            d = tmp_path / "personal"
+            d.mkdir()
+            _insert_sub(conn, "personal", str(d), reserved=1, cooling_until=now + 500)
         finally:
             conn.close()
         assert subs.auto_resume_eta(now) is None
@@ -617,6 +667,30 @@ class TestAcquire:
         # Earliest recovery is the soonest cooling_until across the pool.
         assert exc.value.earliest_recovery == pytest.approx(now + 300, abs=2)
 
+    def test_only_reserved_pocket_raises_exhausted(self, tmp_path, _logged_in):
+        # The incident root: a reserved personal pocket is the only login. The
+        # worker must NOT sit on it — acquire refuses rather than leasing it.
+        conn = subs.connect()
+        try:
+            d = tmp_path / "personal"
+            d.mkdir()
+            _insert_sub(conn, "personal", str(d), reserved=1)
+        finally:
+            conn.close()
+        with pytest.raises(subs.NoSubscriptionAvailable):
+            subs.acquire("t", wait_seconds=0)
+
+    def test_reserved_pocket_leasable_with_allow_reserved(self, tmp_path, _logged_in):
+        conn = subs.connect()
+        try:
+            d = tmp_path / "personal"
+            d.mkdir()
+            _insert_sub(conn, "personal", str(d), reserved=1)
+        finally:
+            conn.close()
+        lease = subs.acquire("t", wait_seconds=0, allow_reserved=True)
+        assert lease.name == "personal"
+
     def test_at_capacity_raises_after_wait_without_recovery(self, tmp_path, _logged_in):
         # Not cooling, just fully leased: distinct from exhaustion — no
         # earliest_recovery, and the message names capacity, not cooling.
@@ -642,3 +716,314 @@ class TestNoSubscriptionAvailable:
 
     def test_defaults_recovery_to_none(self):
         assert subs.NoSubscriptionAvailable("boom").earliest_recovery is None
+
+
+class TestReservedFlag:
+    """The reserved column: toggle via update_subscription, surface in status."""
+
+    def test_update_subscription_toggles_reserved(self, tmp_path):
+        conn = subs.connect()
+        try:
+            d = tmp_path / "personal"
+            d.mkdir()
+            _insert_sub(conn, "personal", str(d))
+        finally:
+            conn.close()
+        assert subs.update_subscription("personal", reserved=True) is True
+        conn = subs.connect()
+        try:
+            row = conn.execute(
+                "SELECT reserved FROM claude_subscriptions WHERE name = 'personal'"
+            ).fetchone()
+            assert row["reserved"] == 1
+        finally:
+            conn.close()
+        assert subs.update_subscription("personal", reserved=False) is True
+        conn = subs.connect()
+        try:
+            row = conn.execute(
+                "SELECT reserved FROM claude_subscriptions WHERE name = 'personal'"
+            ).fetchone()
+            assert row["reserved"] == 0
+        finally:
+            conn.close()
+
+    def test_pool_status_reports_reserved(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(subs, "_discover_config_dirs", lambda: {})
+        monkeypatch.setattr(
+            subs, "is_logged_in", lambda cd, provider=subs.PROVIDER_CLAUDE: True
+        )
+        conn = subs.connect()
+        try:
+            d = tmp_path / "personal"
+            d.mkdir()
+            _insert_sub(conn, "personal", str(d), reserved=1)
+        finally:
+            conn.close()
+        status = {s["name"]: s for s in subs.pool_status()}
+        assert status["personal"]["reserved"] is True
+
+
+class TestMigration:
+    """A pool DB created before ``reserved`` existed gains the column."""
+
+    def test_migrate_adds_reserved_column_to_legacy_table(self):
+        path = subs.db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = sqlite3.connect(path)
+        try:
+            legacy.executescript(
+                "CREATE TABLE claude_subscriptions ("
+                " name TEXT PRIMARY KEY, config_dir TEXT NOT NULL,"
+                " enabled INTEGER NOT NULL DEFAULT 1,"
+                " max_concurrency INTEGER NOT NULL DEFAULT 4,"
+                " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+            )
+            legacy.execute(
+                "INSERT INTO claude_subscriptions"
+                " (name, config_dir, created_at, updated_at) VALUES ('old', '/x', 0, 0)"
+            )
+            legacy.commit()
+        finally:
+            legacy.close()
+        conn = subs.connect()  # runs _migrate
+        try:
+            cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(claude_subscriptions)"
+            )}
+            assert "reserved" in cols
+            row = conn.execute(
+                "SELECT reserved FROM claude_subscriptions WHERE name = 'old'"
+            ).fetchone()
+            assert row["reserved"] == 0
+        finally:
+            conn.close()
+
+
+class TestCodexLoginDetection:
+    """Codex pockets log in via <CODEX_HOME>/auth.json, not Claude's OAuth file."""
+
+    def test_missing_auth_json_is_logged_out(self, tmp_path):
+        assert subs._codex_logged_in(str(tmp_path)) is False
+
+    def test_oauth_tokens_count_as_logged_in(self, tmp_path):
+        (tmp_path / "auth.json").write_text(
+            json.dumps({"tokens": {"access_token": "tok", "refresh_token": "r"}}),
+            encoding="utf-8",
+        )
+        assert subs._codex_logged_in(str(tmp_path)) is True
+
+    def test_bare_api_key_counts_as_logged_in(self, tmp_path):
+        (tmp_path / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-xxx"}), encoding="utf-8"
+        )
+        assert subs._codex_logged_in(str(tmp_path)) is True
+
+    def test_empty_tokens_is_logged_out(self, tmp_path):
+        (tmp_path / "auth.json").write_text(
+            json.dumps({"tokens": {}}), encoding="utf-8"
+        )
+        assert subs._codex_logged_in(str(tmp_path)) is False
+
+    def test_malformed_json_is_logged_out(self, tmp_path):
+        (tmp_path / "auth.json").write_text("{not json", encoding="utf-8")
+        assert subs._codex_logged_in(str(tmp_path)) is False
+
+    def test_is_logged_in_routes_by_provider(self, tmp_path, monkeypatch):
+        # Codex dir has an auth.json; the Claude credential reader must NOT be
+        # consulted for it, and vice-versa. Fresh cache each call via distinct dirs.
+        (tmp_path / "auth.json").write_text(
+            json.dumps({"tokens": {"access_token": "t"}}), encoding="utf-8"
+        )
+        subs._login_cache.clear()
+        assert subs.is_logged_in(str(tmp_path), subs.PROVIDER_CODEX) is True
+        # Same dir, asked as a Claude pocket: no .credentials.json / keychain hit.
+        monkeypatch.setattr(subs, "read_subscription_credentials", lambda cd: None)
+        subs._login_cache.clear()
+        assert subs.is_logged_in(str(tmp_path), subs.PROVIDER_CLAUDE) is False
+
+
+class TestCodexDiscovery:
+    """_discover_config_dirs surfaces Codex pockets tagged provider=codex."""
+
+    def test_codex_home_discovered_as_codex_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(subs.Path, "home", classmethod(lambda cls: tmp_path))
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".codex").mkdir()
+        (tmp_path / ".codex-sub-work").mkdir()
+        found = subs._discover_config_dirs()
+        assert found["default"] == (str(tmp_path / ".claude"), "claude")
+        assert found["codex"] == (str(tmp_path / ".codex"), "codex")
+        assert found["work"] == (str(tmp_path / ".codex-sub-work"), "codex")
+
+    def test_sync_registry_persists_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(subs.Path, "home", classmethod(lambda cls: tmp_path))
+        (tmp_path / ".codex").mkdir()
+        conn = subs.connect()
+        try:
+            subs.sync_registry(conn)
+            row = conn.execute(
+                "SELECT provider FROM claude_subscriptions WHERE name = 'codex'"
+            ).fetchone()
+            assert row["provider"] == "codex"
+        finally:
+            conn.close()
+
+
+class TestProviderFilteredLeasing:
+    """The one pool leases per-vendor; None spreads across vendors (fallover)."""
+
+    def test_provider_filter_restricts_selection(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            subs, "is_logged_in", lambda cd, provider=subs.PROVIDER_CLAUDE: True
+        )
+        cl = tmp_path / "cl"; cl.mkdir()
+        cx = tmp_path / "cx"; cx.mkdir()
+        conn = subs.connect()
+        try:
+            _insert_sub(conn, "claude1", str(cl), provider="claude")
+            _insert_sub(conn, "codex1", str(cx), provider="codex")
+            now = time.time()
+            claude_only = subs._selectable_rows(conn, now, provider="claude")
+            codex_only = subs._selectable_rows(conn, now, provider="codex")
+            both = subs._selectable_rows(conn, now)
+            assert [r["name"] for r in claude_only] == ["claude1"]
+            assert [r["name"] for r in codex_only] == ["codex1"]
+            assert {r["name"] for r in both} == {"claude1", "codex1"}
+        finally:
+            conn.close()
+
+    def test_lease_carries_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            subs, "is_logged_in", lambda cd, provider=subs.PROVIDER_CLAUDE: True
+        )
+        cx = tmp_path / "cx"; cx.mkdir()
+        conn = subs.connect()
+        try:
+            _insert_sub(conn, "codex1", str(cx), provider="codex")
+            lease = subs._try_acquire(conn, "task", time.time(), provider="codex")
+            assert lease is not None
+            assert lease.provider == "codex"
+            assert lease.config_dir == str(cx)
+        finally:
+            conn.close()
+
+    def test_codex_selectable_when_claude_cooling(self, tmp_path, monkeypatch):
+        # Deliverable 4: every Claude pocket cooling, a Codex pocket still leases
+        # under the cross-vendor (provider=None) spread.
+        monkeypatch.setattr(
+            subs, "is_logged_in", lambda cd, provider=subs.PROVIDER_CLAUDE: True
+        )
+        cl = tmp_path / "cl"; cl.mkdir()
+        cx = tmp_path / "cx"; cx.mkdir()
+        conn = subs.connect()
+        try:
+            _insert_sub(conn, "claude1", str(cl), provider="claude",
+                        cooling_until=time.time() + 3600)
+            _insert_sub(conn, "codex1", str(cx), provider="codex")
+            lease = subs._try_acquire(conn, "task", time.time(), provider=None)
+            assert lease is not None and lease.name == "codex1"
+        finally:
+            conn.close()
+
+    def test_pool_status_reports_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(subs, "_discover_config_dirs", lambda: {})
+        monkeypatch.setattr(
+            subs, "is_logged_in", lambda cd, provider=subs.PROVIDER_CLAUDE: True
+        )
+        cx = tmp_path / "cx"; cx.mkdir()
+        conn = subs.connect()
+        try:
+            _insert_sub(conn, "codex1", str(cx), provider="codex")
+        finally:
+            conn.close()
+        status = {s["name"]: s for s in subs.pool_status()}
+        assert status["codex1"]["provider"] == "codex"
+
+
+class TestProviderMigration:
+    """A pre-vendor pool DB (no provider column) backfills to 'claude'."""
+
+    def test_migration_adds_provider_defaulting_claude(self):
+        conn = subs.connect()
+        try:
+            conn.execute("DROP TABLE claude_subscriptions")
+            conn.execute(
+                "CREATE TABLE claude_subscriptions ("
+                " name TEXT PRIMARY KEY, config_dir TEXT NOT NULL,"
+                " display_name TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',"
+                " enabled INTEGER NOT NULL DEFAULT 1, max_concurrency INTEGER NOT NULL DEFAULT 4,"
+                " cooling_until REAL, last_limited_at REAL,"
+                " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO claude_subscriptions (name, config_dir, created_at, updated_at)"
+                " VALUES ('old', '/tmp/old', 0, 0)"
+            )
+            conn.commit()
+            subs._migrate(conn)
+            row = conn.execute(
+                "SELECT provider FROM claude_subscriptions WHERE name = 'old'"
+            ).fetchone()
+            assert row["provider"] == "claude"
+        finally:
+            conn.close()
+
+
+class TestConfigDirAttribution:
+    """config_dir -> pocket inverse lookup (task t_5580f23b): attributing an
+    interactive session to its real pocket by the login dir it ran under."""
+
+    def _pool(self):
+        conn = subs.connect()
+        now = time.time()
+        for name, cdir, prov in (
+            ("personal", "/Users/x/.claude-sub-personal", "claude"),
+            ("work2", "/Users/x/.claude-sub-work2", "claude"),
+            ("codex", "/Users/x/.codex", "codex"),
+        ):
+            conn.execute(
+                "INSERT INTO claude_subscriptions"
+                " (name, config_dir, provider, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (name, cdir, prov, now, now),
+            )
+        conn.commit()
+        return conn
+
+    def test_exact_match(self):
+        conn = self._pool()
+        try:
+            assert subs.subscription_for_config_dir(
+                conn, "/Users/x/.claude-sub-work2") == "work2"
+            assert subs.subscription_for_config_dir(
+                conn, "/Users/x/.codex") == "codex"
+        finally:
+            conn.close()
+
+    def test_normalises_trailing_slash_and_dotdot(self):
+        conn = self._pool()
+        try:
+            assert subs.subscription_for_config_dir(
+                conn, "/Users/x/.claude-sub-work2/") == "work2"
+            assert subs.subscription_for_config_dir(
+                conn, "/Users/x/foo/../.claude-sub-personal") == "personal"
+        finally:
+            conn.close()
+
+    def test_unknown_dir_and_empty_are_none(self):
+        conn = self._pool()
+        try:
+            assert subs.subscription_for_config_dir(conn, "/Users/x/.claude") is None
+            assert subs.subscription_for_config_dir(conn, "") is None
+        finally:
+            conn.close()
+
+    def test_index_inverts_the_column(self):
+        conn = self._pool()
+        try:
+            idx = subs.config_dir_index(conn)
+            assert idx[os.path.normpath("/Users/x/.claude-sub-work2")] == "work2"
+            assert len(idx) == 3
+        finally:
+            conn.close()

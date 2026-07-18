@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 SUB_DIR_PREFIX = ".claude-sub-"
 DEFAULT_SUB_NAME = "default"
 
+# Vendor-agnostic pool: a subscription pocket belongs to a provider. Claude Code
+# pockets pin ``CLAUDE_CONFIG_DIR``; Codex pockets pin ``CODEX_HOME`` (its login
+# lives in ``<home>/auth.json``). The pool, leases, cooldown and pacing logic are
+# provider-blind — only discovery, the login check, and the env var the executor
+# pins differ per provider (doctrine: Grok/Gemini/Codex managed as one pool).
+PROVIDER_CLAUDE = "claude"
+PROVIDER_CODEX = "codex"
+CODEX_DEFAULT_SUB_NAME = "codex"
+CODEX_HOME_DIR = ".codex"
+CODEX_SUB_DIR_PREFIX = ".codex-sub-"
+
 # Marker embedded in kanban block reasons so the dispatcher can recognise
 # "blocked because every subscription is cooling" and auto-unblock the task
 # the moment any subscription recovers.
@@ -48,9 +59,11 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS claude_subscriptions (
     name TEXT PRIMARY KEY,
     config_dir TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'claude',
     display_name TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
+    reserved INTEGER NOT NULL DEFAULT 0,
     max_concurrency INTEGER NOT NULL DEFAULT 4,
     cooling_until REAL,
     last_limited_at REAL,
@@ -92,6 +105,7 @@ class Lease:
     id: int
     name: str
     config_dir: str
+    provider: str = PROVIDER_CLAUDE
 
 
 def db_path() -> Path:
@@ -106,7 +120,34 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the table's first release.
+
+    ``CREATE TABLE IF NOT EXISTS`` never alters an existing table, so a pool DB
+    created before ``reserved`` existed keeps its old shape until this runs.
+    Idempotent: it only adds a column the table is missing.
+    """
+    cols = {row["name"] for row in conn.execute(
+        "PRAGMA table_info(claude_subscriptions)"
+    )}
+    if "reserved" not in cols:
+        with conn:
+            conn.execute(
+                "ALTER TABLE claude_subscriptions"
+                " ADD COLUMN reserved INTEGER NOT NULL DEFAULT 0"
+            )
+    if "provider" not in cols:
+        # Pre-vendor-agnostic pools held only Claude pockets, so backfilling the
+        # new column to 'claude' preserves their meaning exactly.
+        with conn:
+            conn.execute(
+                "ALTER TABLE claude_subscriptions"
+                " ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -206,13 +247,40 @@ def _credentials_live(oauth: Optional[Dict[str, Any]]) -> bool:
     return bool(oauth.get("refreshToken"))
 
 
-def is_logged_in(config_dir: str) -> bool:
-    cached = _login_cache.get(config_dir)
+def _codex_logged_in(config_dir: str) -> bool:
+    """Whether a Codex pocket (``CODEX_HOME`` dir) carries a usable login.
+
+    The Codex CLI stores its login in ``<CODEX_HOME>/auth.json`` as either an
+    OAuth payload (``tokens.access_token`` + a refresh token) or a raw
+    ``OPENAI_API_KEY``. Either counts as logged in; Codex refreshes the OAuth
+    token lazily on session start, and the executor's ``is_auth_error`` rotation
+    is the backstop for a refresh token that has itself been revoked.
+    """
+    auth_path = Path(config_dir).expanduser() / "auth.json"
+    if not auth_path.exists():
+        return False
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    raw_tokens = data.get("tokens")
+    tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
+    return bool(tokens.get("access_token") or data.get("OPENAI_API_KEY"))
+
+
+def is_logged_in(config_dir: str, provider: str = PROVIDER_CLAUDE) -> bool:
+    cache_key = f"{provider}:{config_dir}"
+    cached = _login_cache.get(cache_key)
     now = time.monotonic()
     if cached and now - cached[0] < _LOGIN_CACHE_TTL_SECONDS:
         return cached[1]
-    result = _credentials_live(read_subscription_credentials(config_dir))
-    _login_cache[config_dir] = (now, result)
+    if provider == PROVIDER_CODEX:
+        result = _codex_logged_in(config_dir)
+    else:
+        result = _credentials_live(read_subscription_credentials(config_dir))
+    _login_cache[cache_key] = (now, result)
     return result
 
 
@@ -220,18 +288,73 @@ def is_logged_in(config_dir: str) -> bool:
 # Registry
 # ---------------------------------------------------------------------------
 
-def _discover_config_dirs() -> Dict[str, str]:
-    """Map subscription name -> config dir for every login dir on disk."""
+def _discover_config_dirs() -> Dict[str, tuple]:
+    """Map subscription name -> ``(config_dir, provider)`` for every login dir.
+
+    Claude pockets: ``~/.claude`` (``default``) and ``~/.claude-sub-<name>``.
+    Codex pockets: ``~/.codex`` (``codex``) and ``~/.codex-sub-<name>`` — the
+    ``CODEX_HOME`` dirs the operator logged the Codex CLI into. Provider is
+    carried so the executor knows which env var to pin and which ACP command to
+    spawn, and so the login check reads the right credential shape.
+    """
     home = Path.home()
-    dirs: Dict[str, str] = {}
+    dirs: Dict[str, tuple] = {}
     default_dir = home / ".claude"
     if default_dir.is_dir():
-        dirs[DEFAULT_SUB_NAME] = str(default_dir)
+        dirs[DEFAULT_SUB_NAME] = (str(default_dir), PROVIDER_CLAUDE)
     for entry in sorted(home.glob(f"{SUB_DIR_PREFIX}*")):
         name = entry.name[len(SUB_DIR_PREFIX):].strip()
         if entry.is_dir() and name and name != DEFAULT_SUB_NAME:
-            dirs[name] = str(entry)
+            dirs[name] = (str(entry), PROVIDER_CLAUDE)
+    codex_default = home / CODEX_HOME_DIR
+    if codex_default.is_dir():
+        dirs[CODEX_DEFAULT_SUB_NAME] = (str(codex_default), PROVIDER_CODEX)
+    for entry in sorted(home.glob(f"{CODEX_SUB_DIR_PREFIX}*")):
+        name = entry.name[len(CODEX_SUB_DIR_PREFIX):].strip()
+        if entry.is_dir() and name and name != CODEX_DEFAULT_SUB_NAME:
+            dirs[name] = (str(entry), PROVIDER_CODEX)
     return dirs
+
+
+def _norm_dir(config_dir: str) -> str:
+    """Canonical string for a config dir so two spellings of one path match.
+
+    Expands ``~`` and collapses ``..``/trailing slashes without touching the
+    filesystem (``os.path.normpath`` — no ``resolve()``, which would need the dir
+    to exist and would follow symlinks a lease deliberately kept distinct).
+    """
+    return os.path.normpath(str(Path(config_dir).expanduser()))
+
+
+def config_dir_index(conn: sqlite3.Connection) -> Dict[str, str]:
+    """``{normalised config_dir: subscription name}`` for every pocket.
+
+    The inverse of the ``config_dir`` column — the attribution primitive
+    (task ``t_5580f23b``): given the ``CLAUDE_CONFIG_DIR``/``CODEX_HOME`` a live
+    session ran under, name the pocket its usage belongs to. Missing table → ``{}``.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT name, config_dir FROM claude_subscriptions"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {_norm_dir(r["config_dir"]): r["name"] for r in rows if r["config_dir"]}
+
+
+def subscription_for_config_dir(
+    conn: sqlite3.Connection, config_dir: str
+) -> Optional[str]:
+    """Pocket name owning ``config_dir``, or ``None`` if none is registered.
+
+    Attributes an *interactive* operator/supervisor session (which holds no
+    lease, so nothing stamps its ledger rows) to its real pocket by the config
+    dir it ran under — the fix for supervision spend being mis-booked to the
+    wrong pocket (incident 18.07). Path spelling is normalised on both sides.
+    """
+    if not config_dir:
+        return None
+    return config_dir_index(conn).get(_norm_dir(config_dir))
 
 
 def default_max_concurrency() -> int:
@@ -255,15 +378,16 @@ def sync_registry(conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, A
     try:
         now = time.time()
         with conn:
-            for name, config_dir in _discover_config_dirs().items():
+            for name, (config_dir, provider) in _discover_config_dirs().items():
                 conn.execute(
                     "INSERT INTO claude_subscriptions"
-                    " (name, config_dir, max_concurrency, created_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?)"
+                    " (name, config_dir, provider, max_concurrency, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(name) DO UPDATE SET"
                     "   config_dir = excluded.config_dir,"
+                    "   provider = excluded.provider,"
                     "   updated_at = excluded.updated_at",
-                    (name, config_dir, default_max_concurrency(), now, now),
+                    (name, config_dir, provider, default_max_concurrency(), now, now),
                 )
         rows = conn.execute(
             "SELECT * FROM claude_subscriptions ORDER BY name"
@@ -275,8 +399,9 @@ def sync_registry(conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, A
 
 
 def update_subscription(name: str, **fields: Any) -> bool:
-    """Update mutable metadata (display_name, notes, enabled, max_concurrency)."""
-    allowed = {"display_name", "notes", "enabled", "max_concurrency"}
+    """Update mutable metadata (display_name, notes, enabled, reserved,
+    max_concurrency)."""
+    allowed = {"display_name", "notes", "enabled", "reserved", "max_concurrency"}
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not updates:
         return False
@@ -284,6 +409,8 @@ def update_subscription(name: str, **fields: Any) -> bool:
         updates["max_concurrency"] = max(1, int(updates["max_concurrency"]))
     if "enabled" in updates:
         updates["enabled"] = 1 if updates["enabled"] else 0
+    if "reserved" in updates:
+        updates["reserved"] = 1 if updates["reserved"] else 0
     conn = connect()
     try:
         assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -453,8 +580,29 @@ def _cleanup_stale_leases(conn: sqlite3.Connection) -> None:
         )
 
 
-def _selectable_rows(conn: sqlite3.Connection, now: float) -> List[sqlite3.Row]:
-    """Enabled, logged-in, non-cooling subscriptions in spread order."""
+def _row_provider(row: sqlite3.Row) -> str:
+    """Provider of a registry row, defaulting to Claude for legacy rows."""
+    keys = row.keys() if hasattr(row, "keys") else []
+    value = row["provider"] if "provider" in keys else None
+    return str(value) if value else PROVIDER_CLAUDE
+
+
+def _selectable_rows(
+    conn: sqlite3.Connection, now: float, *, allow_reserved: bool = False,
+    provider: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    """Enabled, logged-in, non-cooling subscriptions in spread order.
+
+    A ``reserved`` subscription is NEVER leasable to workers, independent of its
+    cooling/rotation state — the reserved flag is the contract that keeps a
+    personal/operator pocket out of the worker pool (task t_83c4b740). Only an
+    explicit operator-driven ``allow_reserved`` lifts it.
+
+    ``provider`` restricts selection to one vendor's pockets (e.g. a Codex task
+    leases only Codex pockets); ``None`` spreads across the whole pool, which is
+    what lets the scheduler fall over to a Codex pocket when every Claude pocket
+    is cooling (task t_2eec7f4a).
+    """
     rows = conn.execute(
         "SELECT s.*, COUNT(l.id) AS active FROM claude_subscriptions s"
         " LEFT JOIN subscription_leases l ON l.subscription = s.name"
@@ -464,30 +612,44 @@ def _selectable_rows(conn: sqlite3.Connection, now: float) -> List[sqlite3.Row]:
     ).fetchall()
     ready = []
     for row in rows:
+        if provider is not None and _row_provider(row) != provider:
+            continue
+        if row["reserved"] and not allow_reserved:
+            continue
         if row["cooling_until"] and float(row["cooling_until"]) > now:
             continue
         if not Path(row["config_dir"]).is_dir():
             continue
-        if not is_logged_in(row["config_dir"]):
+        if not is_logged_in(row["config_dir"], _row_provider(row)):
             continue
         ready.append(row)
     return ready
 
 
-def pool_size() -> int:
-    """Registered, enabled, logged-in subscriptions (ignores cooling state)."""
+def pool_size(provider: Optional[str] = None) -> int:
+    """Registered, enabled, logged-in subscriptions (ignores cooling state).
+
+    ``provider`` counts only that vendor's pockets; ``None`` counts the whole
+    pool across vendors.
+    """
     conn = connect()
     try:
         sync_registry(conn)
         rows = conn.execute(
-            "SELECT config_dir FROM claude_subscriptions WHERE enabled = 1"
+            "SELECT config_dir, provider FROM claude_subscriptions WHERE enabled = 1"
         ).fetchall()
-        return sum(1 for row in rows if is_logged_in(row["config_dir"]))
+        return sum(
+            1 for row in rows
+            if (provider is None or _row_provider(row) == provider)
+            and is_logged_in(row["config_dir"], _row_provider(row))
+        )
     finally:
         conn.close()
 
 
-def pool_has_capacity(now: Optional[float] = None) -> bool:
+def pool_has_capacity(
+    now: Optional[float] = None, *, provider: Optional[str] = None
+) -> bool:
     """True when at least one subscription can take a session right now."""
     now = now if now is not None else time.time()
     conn = connect()
@@ -496,7 +658,7 @@ def pool_has_capacity(now: Optional[float] = None) -> bool:
             _cleanup_stale_leases(conn)
         return any(
             int(row["active"]) < max(1, int(row["max_concurrency"]))
-            for row in _selectable_rows(conn, now)
+            for row in _selectable_rows(conn, now, provider=provider)
         )
     finally:
         conn.close()
@@ -521,23 +683,30 @@ def auto_resume_eta(now: Optional[float] = None) -> Optional[float]:
     conn = connect()
     try:
         rows = conn.execute(
-            "SELECT config_dir, cooling_until FROM claude_subscriptions"
-            " WHERE enabled = 1 AND cooling_until IS NOT NULL AND cooling_until > ?",
+            "SELECT config_dir, provider, cooling_until FROM claude_subscriptions"
+            " WHERE enabled = 1 AND reserved = 0"
+            " AND cooling_until IS NOT NULL AND cooling_until > ?",
             (now,),
         ).fetchall()
     finally:
         conn.close()
     etas = [
         float(row["cooling_until"]) for row in rows
-        if Path(row["config_dir"]).is_dir() and is_logged_in(row["config_dir"])
+        if Path(row["config_dir"]).is_dir()
+        and is_logged_in(row["config_dir"], _row_provider(row))
     ]
     return min(etas) if etas else None
 
 
-def _try_acquire(conn: sqlite3.Connection, task_id: str, now: float) -> Optional[Lease]:
+def _try_acquire(
+    conn: sqlite3.Connection, task_id: str, now: float, *,
+    allow_reserved: bool = False, provider: Optional[str] = None,
+) -> Optional[Lease]:
     # Login checks shell out to the Keychain — resolve candidates BEFORE
     # taking the write lock, then recheck lease counts atomically inside it.
-    candidates = _selectable_rows(conn, now)
+    candidates = _selectable_rows(
+        conn, now, allow_reserved=allow_reserved, provider=provider
+    )
     if not candidates:
         return None
     conn.execute("BEGIN IMMEDIATE")
@@ -562,7 +731,8 @@ def _try_acquire(conn: sqlite3.Connection, task_id: str, now: float) -> Optional
             lease_id = cur.lastrowid  # set after a successful INSERT
             assert lease_id is not None
             return Lease(id=lease_id, name=row["name"],
-                         config_dir=row["config_dir"])
+                         config_dir=row["config_dir"],
+                         provider=_row_provider(row))
         conn.commit()
         return None
     except Exception:
@@ -571,33 +741,52 @@ def _try_acquire(conn: sqlite3.Connection, task_id: str, now: float) -> Optional
 
 
 def _earliest_recovery(conn: sqlite3.Connection) -> Optional[float]:
+    # Reserved pockets are excluded: their cooldown lapsing never frees worker
+    # capacity, so it is not a recovery horizon for an exhausted worker block.
     row = conn.execute(
         "SELECT MIN(cooling_until) AS t FROM claude_subscriptions"
-        " WHERE enabled = 1 AND cooling_until IS NOT NULL"
+        " WHERE enabled = 1 AND reserved = 0 AND cooling_until IS NOT NULL"
     ).fetchone()
     return float(row["t"]) if row and row["t"] else None
 
 
-def acquire(task_id: str = "", wait_seconds: Optional[float] = None) -> Lease:
+def acquire(
+    task_id: str = "",
+    wait_seconds: Optional[float] = None,
+    *,
+    allow_reserved: bool = False,
+    provider: Optional[str] = None,
+) -> Lease:
     """Lease a subscription using the spread strategy.
 
     Blocks (polling) while all subscriptions are merely at their concurrency
     cap; raises :class:`NoSubscriptionAvailable` immediately when every
     subscription is cooling, or after ``wait_seconds`` of no free capacity.
+
+    Reserved subscriptions are excluded from worker leasing; ``allow_reserved``
+    is the explicit operator override (never set by the worker path).
+
+    ``provider`` restricts the lease to one vendor's pockets (Claude vs Codex);
+    ``None`` leases across the whole pool.
     """
     if wait_seconds is None:
         raw = os.getenv("HERMES_CLAUDE_SUB_CAPACITY_WAIT_SECONDS", "").strip()
         wait_seconds = float(raw) if raw else _CAPACITY_WAIT_SECONDS
     deadline = time.monotonic() + max(0.0, wait_seconds)
+    label = f"{provider} " if provider else ""
     while True:
         now = time.time()
         conn = connect()
         try:
             sync_registry(conn)
-            lease = _try_acquire(conn, task_id, now)
+            lease = _try_acquire(
+                conn, task_id, now, allow_reserved=allow_reserved, provider=provider
+            )
             if lease is not None:
                 return lease
-            selectable = _selectable_rows(conn, now)
+            selectable = _selectable_rows(
+                conn, now, allow_reserved=allow_reserved, provider=provider
+            )
             earliest = _earliest_recovery(conn)
         finally:
             conn.close()
@@ -607,13 +796,13 @@ def acquire(task_id: str = "", wait_seconds: Optional[float] = None) -> Lease:
                 if earliest else ""
             )
             raise NoSubscriptionAvailable(
-                f"{SUBSCRIPTIONS_EXHAUSTED_MARKER} all Claude Code subscriptions"
+                f"{SUBSCRIPTIONS_EXHAUSTED_MARKER} all {label}subscriptions"
                 f" are cooling after usage limits{when}",
                 earliest_recovery=earliest,
             )
         if time.monotonic() >= deadline:
             raise NoSubscriptionAvailable(
-                f"{SUBSCRIPTIONS_EXHAUSTED_MARKER} no Claude Code subscription"
+                f"{SUBSCRIPTIONS_EXHAUSTED_MARKER} no {label}subscription"
                 f" capacity freed up within {int(wait_seconds)}s",
                 earliest_recovery=None,
             )
@@ -662,14 +851,17 @@ def pool_status() -> List[Dict[str, Any]]:
         for row in rows:
             cooling_until = row["cooling_until"]
             cooling = bool(cooling_until and float(cooling_until) > now)
+            provider = _row_provider(row)
             status.append({
                 "name": row["name"],
                 "config_dir": row["config_dir"],
+                "provider": provider,
                 "display_name": row["display_name"],
                 "notes": row["notes"],
                 "enabled": bool(row["enabled"]),
+                "reserved": bool(row["reserved"]),
                 "dir_exists": Path(row["config_dir"]).is_dir(),
-                "logged_in": is_logged_in(row["config_dir"]),
+                "logged_in": is_logged_in(row["config_dir"], provider),
                 "active_sessions": int(row["active"]),
                 "max_concurrency": int(row["max_concurrency"]),
                 "cooling": cooling,

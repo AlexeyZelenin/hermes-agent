@@ -603,10 +603,34 @@ export const api = {
       { method: "POST" },
     ),
 
+  // Проблемы — browse the findings store as draft cards. The global page
+  // passes board="" (system-level findings only); accept converts a finding
+  // into a real triage backlog card, dismiss puts it to rest.
+  getProblems: (board = "") =>
+    fetchJSON<ProblemsResponse>(
+      `/api/problems?board=${encodeURIComponent(board)}`,
+    ),
+  acceptProblem: (id: number) =>
+    fetchJSON<ProblemActionResult>(`/api/problems/${id}/accept`, {
+      method: "POST",
+    }),
+  dismissProblem: (id: number) =>
+    fetchJSON<ProblemActionResult>(`/api/problems/${id}/dismiss`, {
+      method: "POST",
+    }),
+
   // Token/limit panel — per-pocket pacing state + windowed token spend
   getZeusPacing: (board = "") =>
     fetchJSON<ZeusPacing>(
       `/api/zeus/pacing?board=${encodeURIComponent(board)}`,
+    ),
+
+  // Engine room ("под капотом") home — role prompts + surface index + probed
+  // telemetry substrate. Grounded model (hermes_cli/engine_room.py); a missing
+  // store just degrades a pillar, never the call.
+  getEngineRoom: (board = "") =>
+    fetchJSON<EngineRoomModel>(
+      `/api/engine-room?board=${encodeURIComponent(board)}`,
     ),
 
   // Automation Blueprints — parameterized automation blueprints
@@ -1648,6 +1672,8 @@ export interface SubscriptionPoolEntry {
   display_name: string;
   notes: string;
   enabled: boolean;
+  /** Held aside for the operator — never leased to the worker pool (t_83c4b740). */
+  reserved: boolean;
   dir_exists: boolean;
   logged_in: boolean;
   active_sessions: number;
@@ -2293,6 +2319,79 @@ export interface CronRegistry {
   period_days: number;
 }
 
+export type ProblemTone = "info" | "warning" | "error" | "critical";
+
+export interface Problem {
+  id: number;
+  board: string;
+  source: string;
+  finding_key: string;
+  title: string;
+  explanation: string;
+  proposed: string;
+  severity: string;
+  severity_rank: number;
+  tone: ProblemTone;
+  category: string;
+  evidence: unknown[];
+  status: string;
+  converted_task_id: string;
+  created_at: number | null;
+  updated_at: number | null;
+}
+
+export interface ProblemsResponse {
+  problems: Problem[];
+  board: string;
+  count: number;
+}
+
+export interface ProblemActionResult {
+  ok: boolean;
+  error?: string;
+  task_id?: string;
+  board?: string;
+}
+
+// Engine room ("под капотом") — the app's under-the-hood side. Shapes mirror
+// hermes_cli/engine_room.py: role prompts read live from source, a static
+// surface index, and telemetry sources with a probed `present` flag.
+export interface EngineRoomRole {
+  key: string;
+  title: string;
+  purpose: string;
+  when: string;
+  model_role: string;
+  module: string;
+  attr: string;
+  available: boolean;
+  system_prompt: string | null;
+  prompt_chars: number;
+}
+
+export interface EngineRoomSurface {
+  key: string;
+  title: string;
+  route: string;
+  owner_task: string;
+  purpose: string;
+}
+
+export interface EngineRoomSubstrate {
+  key: string;
+  title: string;
+  db: string;
+  table: string | null;
+  purpose: string;
+  present: boolean;
+}
+
+export interface EngineRoomModel {
+  roles: EngineRoomRole[];
+  surfaces: EngineRoomSurface[];
+  substrate: EngineRoomSubstrate[];
+}
+
 export interface CronRegistryFinding {
   id: string;
   kind: string;
@@ -2306,10 +2405,39 @@ export interface ZeusPacingWindowTokens {
   last_ts: number | null;
 }
 
+// Real-time circuit-breaker verdict over a single window (weekly or the nested
+// 5h session). ``projected_spent_percent`` is the end-of-window spend at the
+// current burn — the "will it make it to reset" forecast. Mirrors
+// hermes_cli.zeus_circuit_breaker.evaluate / aggregate.
+export interface ZeusCircuitBreaker {
+  state: string;
+  tripped: boolean;
+  throttling: boolean;
+  burning_down: boolean;
+  recommended_agent_limit: number | null;
+  live_derived?: boolean;
+  live_spent_percent: number | null;
+  projected_spent_percent: number | null;
+  pace_delta: number | null;
+  implied_budget_tokens: number | null;
+  elapsed_fraction: number | null;
+  reason: string;
+  windows?: ZeusCircuitBreaker[];
+}
+
+// Nested 5h session window bounds + tokens burned within it.
+export interface ZeusFiveHourWindow {
+  start: number | null;
+  reset: number | null;
+  seconds_to_reset: number | null;
+  tokens: ZeusPacingWindowTokens | null;
+}
+
 export interface ZeusPacingPocket {
   subscription: string;
   display_name: string;
   enabled: boolean | null;
+  reserved: boolean;
   window_label: string;
   spent_percent: number | null;
   target_percent: number | null;
@@ -2329,6 +2457,10 @@ export interface ZeusPacingPocket {
   last_limited_at: number | null;
   window_start: number | null;
   window_tokens: ZeusPacingWindowTokens | null;
+  five_hour_window: ZeusFiveHourWindow | null;
+  circuit_breaker: ZeusCircuitBreaker | null;
+  circuit_breaker_5h: ZeusCircuitBreaker | null;
+  effective_breaker: ZeusCircuitBreaker | null;
 }
 
 export interface ZeusPacing {

@@ -65,5 +65,8 @@ def test_board_agent_limit_caps_dispatch(kanban_home):
 def test_board_metadata_defaults_and_validates_agent_limit(kanban_home):
     assert kb.read_board_metadata("default")["agent_limit"] == 10
     assert kb.write_board_metadata("default", agent_limit=3)["agent_limit"] == 3
+    # agent_limit is a pacing-owned safety cap — values above the ceiling clamp
+    # down rather than being stored verbatim.
+    assert kb.write_board_metadata("default", agent_limit=25)["agent_limit"] == 10
     with pytest.raises(ValueError, match="positive"):
         kb.write_board_metadata("default", agent_limit=0)

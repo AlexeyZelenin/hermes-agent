@@ -163,6 +163,35 @@ async def test_new_key_at_capacity_raises_when_none_reapable():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_attach_same_key_spawns_once():
+    # Two simultaneous reconnects on the same token (dashboard auto-reconnect
+    # firing two upgrades in one tick) must not both spawn: the loser would
+    # orphan the first PTY's bridge/drain task and leak its fds. The
+    # ``await asyncio.to_thread(spawn)`` inside attach_or_spawn yields the loop,
+    # so without the check-and-spawn lock both coroutines pass ``existing is
+    # None`` and spawn — this test reproduces exactly that interleaving.
+    reg = make_registry()
+    spawned = []
+
+    def spawn():
+        b = FakeBridge([b"", b"", b""])
+        spawned.append(b)
+        return b
+
+    (s1, c1), (s2, c2) = await asyncio.gather(
+        reg.attach_or_spawn("tok", spawn=spawn),
+        reg.attach_or_spawn("tok", spawn=spawn),
+    )
+
+    assert len(spawned) == 1                        # only one PTY forked
+    assert s1 is s2                                 # both got the same session
+    assert [c1, c2].count(True) == 1               # exactly one reports created
+    assert not spawned[0].closed                    # the live PTY was not orphaned/closed
+    assert len(reg._sessions) == 1
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
 async def test_reaper_loop_invokes_reap(monkeypatch):
     from hermes_cli.pty_session import run_reaper
     reg = make_registry()

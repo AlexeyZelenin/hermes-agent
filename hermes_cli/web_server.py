@@ -10706,6 +10706,69 @@ async def get_engine_room(board: str = ""):
     return await _run_cron_dashboard_io(_engine_room_sync, board)
 
 
+def _problems_sync(board: str = ""):
+    """Browse the findings store as draft "problem" cards (task t_e9b93153).
+
+    The global "Проблемы" home: system-level findings not tied to a user board
+    (``board=''``) — reflecting agents, engine health, security review — surfaced
+    worst-first so they stay visible instead of buried in the sealed engine
+    project. Read-only; accept/dismiss are separate POSTs. Degrades to an empty
+    list when the zeus findings store is absent.
+    """
+    from hermes_cli import problems
+
+    conn = problems.open_store()
+    try:
+        items = problems.list_problems(conn, board=board)
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"problems": items, "board": board, "count": len(items)}
+
+
+@app.get("/api/problems")
+async def get_problems(board: str = ""):
+    return await _run_cron_dashboard_io(_problems_sync, board)
+
+
+def _accept_problem_sync(finding_id: int):
+    from hermes_cli import problems
+
+    conn = problems.open_store()
+    if conn is None:
+        return {"ok": False, "error": "findings store unavailable"}
+    try:
+        result = problems.accept_problem(conn, finding_id)
+    finally:
+        conn.close()
+    if result is None:
+        return {"ok": False, "error": "problem not found or already resolved"}
+    return {"ok": True, **result}
+
+
+@app.post("/api/problems/{finding_id}/accept")
+async def accept_problem_route(finding_id: int):
+    return await _run_cron_dashboard_io(_accept_problem_sync, finding_id)
+
+
+def _dismiss_problem_sync(finding_id: int):
+    from hermes_cli import problems
+
+    conn = problems.open_store()
+    if conn is None:
+        return {"ok": False, "error": "findings store unavailable"}
+    try:
+        ok = problems.dismiss_problem(conn, finding_id)
+    finally:
+        conn.close()
+    return {"ok": ok}
+
+
+@app.post("/api/problems/{finding_id}/dismiss")
+async def dismiss_problem_route(finding_id: int):
+    return await _run_cron_dashboard_io(_dismiss_problem_sync, finding_id)
+
+
 def _zeus_pacing_sync(board: str = ""):
     """Per-pocket pacing/limit snapshot for the token panel (task t_7d6b2cdc).
 

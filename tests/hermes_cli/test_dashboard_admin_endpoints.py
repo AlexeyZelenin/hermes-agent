@@ -1289,8 +1289,8 @@ class TestSubscriptionPoolEndpoints:
 
         # Pin discovery + login so the host's real subscriptions never leak in.
         self._dirs = {}
-        monkeypatch.setattr(subs, "_discover_config_dirs", lambda: dict(self._dirs))
-        monkeypatch.setattr(subs, "is_logged_in", lambda config_dir: False)
+        monkeypatch.setattr(subs, "_discover_config_dirs", lambda: {n: (d, "claude") for n, d in self._dirs.items()})
+        monkeypatch.setattr(subs, "is_logged_in", lambda config_dir, provider="claude": False)
 
     def _register(self, name, config_dir):
         self._dirs[name] = config_dir
@@ -1319,7 +1319,7 @@ class TestSubscriptionPoolEndpoints:
         from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
 
         self._register("personal", "/tmp/does-not-exist-personal")
-        monkeypatch.setattr(subs, "is_logged_in", lambda config_dir: True)
+        monkeypatch.setattr(subs, "is_logged_in", lambda config_dir, provider="claude": True)
         monkeypatch.setattr(
             subs, "subscription_access_token", lambda config_dir: "oauth-tok"
         )

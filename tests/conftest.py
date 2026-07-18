@@ -203,6 +203,11 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
     # the real ~/.hermes/kanban.db instead of the per-test HERMES_HOME.
+    # HERMES_KANBAN_HOME is deleted so kanban paths derive from the per-test
+    # HERMES_HOME (set below) — many tests pin their own HERMES_HOME and rely
+    # on that derivation. The kanban core additionally hard-fails any pytest
+    # run that resolves the *live* board without an isolation override (task
+    # t_ecacc87b), so a leaked fixture can never write to the real board.
     "HERMES_KANBAN_DB",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_HOME",

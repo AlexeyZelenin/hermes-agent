@@ -95,6 +95,101 @@ def aggregate_by_task(
     return out
 
 
+def model_breakdown_by_task(
+    conn: Optional[sqlite3.Connection],
+    task_ids: Iterable[str],
+) -> dict[str, list[dict]]:
+    """Per-task, per-MODEL token split from the ledger (the real post-hoc model
+    tag, not the intended one stamped at spawn).
+
+    Returns ``{task_id: [{"model", "total_tokens", "prompt_tokens",
+    "completion_tokens", "pct"}, ...]}`` sorted by ``total_tokens`` desc, with
+    ``pct`` the model's share of that task's total rounded to 0.1%. A task that
+    ran on a single model yields a one-element list (``pct`` ~100). Empty/absent
+    model tags coalesce to ``"unknown"`` so honestly-unknown spend is visible
+    rather than mislabelled. Only task ids with ledger rows appear. A missing
+    ``token_usage`` table or ``conn is None`` yields ``{}``.
+    """
+    ids = [tid for tid in dict.fromkeys(task_ids) if tid]  # dedupe, drop empties
+    if conn is None or not ids:
+        return {}
+    grouped: dict[str, list[dict]] = {}
+    for chunk in _chunks(ids, _IN_CHUNK):
+        placeholders = ",".join("?" * len(chunk))
+        try:
+            rows = conn.execute(
+                "SELECT task_id, "
+                "COALESCE(NULLIF(TRIM(model), ''), 'unknown') AS model, "
+                "COALESCE(SUM(total_tokens), 0) AS total, "
+                "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+                "COALESCE(SUM(completion_tokens), 0) AS completion "
+                f"FROM token_usage WHERE task_id IN ({placeholders}) "
+                "GROUP BY task_id, model",
+                tuple(chunk),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}  # ledger table absent (zeus plugin not installed)
+        for r in rows:
+            total = int(r["total"] or 0)
+            if total <= 0:
+                continue
+            grouped.setdefault(r["task_id"], []).append({
+                "model": r["model"],
+                "total_tokens": total,
+                "prompt_tokens": int(r["prompt"] or 0),
+                "completion_tokens": int(r["completion"] or 0),
+            })
+    out: dict[str, list[dict]] = {}
+    for tid, models in grouped.items():
+        grand = sum(m["total_tokens"] for m in models)
+        if grand <= 0:
+            continue
+        models.sort(key=lambda m: m["total_tokens"], reverse=True)
+        for m in models:
+            m["pct"] = round(m["total_tokens"] * 100.0 / grand, 1)
+        out[tid] = models
+    return out
+
+
+def model_split(
+    conn: Optional[sqlite3.Connection],
+    task_id: str,
+) -> Optional[dict]:
+    """Full model split for one ``task_id`` plus the provider/effort/subscription
+    facts observed across its runs.
+
+    ``{"models": [...], "total_tokens": int, "providers": [...], "efforts":
+    [...], "subscriptions": [...]}`` or ``None`` when the task burned no tokens
+    (or the ledger is absent). The ``models`` list matches
+    :func:`model_breakdown_by_task`. The fact lists are best-effort: on an older
+    ledger that lacks the ``provider``/``effort``/``subscription`` columns they
+    come back empty rather than raising.
+    """
+    by_task = model_breakdown_by_task(conn, [task_id])
+    models = by_task.get(task_id)
+    if not models:
+        return None
+    result: dict = {
+        "models": models,
+        "total_tokens": sum(m["total_tokens"] for m in models),
+        "providers": [],
+        "efforts": [],
+        "subscriptions": [],
+    }
+    for col, key in (("provider", "providers"), ("effort", "efforts"),
+                     ("subscription", "subscriptions")):
+        try:
+            rows = conn.execute(
+                f"SELECT DISTINCT {col} AS v FROM token_usage "
+                "WHERE task_id = ? AND TRIM(COALESCE(" + col + ", '')) != ''",
+                (task_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            continue  # column absent on this ledger — skip that fact
+        result[key] = sorted(str(r["v"]).strip() for r in rows if r["v"])
+    return result
+
+
 def _cron_session_like(job_id: str) -> str:
     """LIKE pattern matching a cron job's run sessions.
 

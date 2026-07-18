@@ -410,3 +410,43 @@ def test_session_burndown_lifts_weekly_throttle_end_to_end():
     assert p["circuit_breaker_5h"]["state"] == "burndown"
     assert p["effective_breaker"]["state"] == "burndown"
     assert p["effective_breaker"]["recommended_agent_limit"] is None
+
+
+# ---------------------------------------------------------------------------
+# Interactive-session attribution (task t_5580f23b) — additive fields
+# ---------------------------------------------------------------------------
+
+def _write_operator_session(config_dir, session_id, ts, out_tokens):
+    """Minimal Claude Code session log with one assistant usage turn."""
+    import json
+    from datetime import datetime, timezone
+    proj = config_dir / "projects" / "-Users-x-repo"
+    proj.mkdir(parents=True, exist_ok=True)
+    iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    (proj / f"{session_id}.jsonl").write_text(json.dumps({
+        "type": "assistant", "sessionId": session_id, "timestamp": iso,
+        "message": {"usage": {"output_tokens": out_tokens}},
+    }) + "\n", encoding="utf-8")
+
+
+def test_interactive_tokens_attributed_by_config_dir(tmp_path):
+    conn = _conn()
+    _add_pacing(conn)  # personal, weekly window starts at NOW - WEEK/2
+    cdir = tmp_path / ".claude-sub-personal"
+    conn.execute(
+        "INSERT INTO claude_subscriptions (name, config_dir, enabled) VALUES "
+        "('personal', ?, 1)", (str(cdir),))
+    conn.commit()
+    _write_operator_session(cdir, "operator-sess", NOW - 3600, 4242)
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert p["config_dir"] == str(cdir)
+    assert p["provider"] == "claude"
+    assert p["interactive_week_tokens"] == 4242
+
+
+def test_interactive_tokens_none_without_config_dir():
+    conn = _conn()
+    _add_pacing(conn)  # no claude_subscriptions row -> no config_dir
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert p["interactive_week_tokens"] is None
+    assert p["config_dir"] == ""

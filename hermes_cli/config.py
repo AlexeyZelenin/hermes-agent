@@ -1485,21 +1485,6 @@ DEFAULT_CONFIG = {
                                       # after live validation.
     },
 
-    # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
-    # See tools/kanban_tools.py and hermes_cli/kanban_db.py for the actual
-    # implementations. Per-platform notification opt-out is handled by the
-    # kanban dashboard (see ``hermes dashboard`` -> Notifications).
-    "kanban": {
-        # Auto-subscribe the originating gateway/TUI session to task
-        # completion + block events when ``kanban_create`` is called from
-        # inside a session that has a persistent delivery channel. The
-        # agent that dispatched the task will get notified automatically
-        # instead of having to poll. Disable to mirror pre-feature
-        # behaviour — e.g. for a profile that prefers explicit
-        # ``kanban_notify-subscribe`` calls per task.
-        "auto_subscribe_on_create": True,
-    },
-
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
     "prompt_caching": {
@@ -1581,6 +1566,15 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # Last-resort fallback to the leased Claude Code subscription pool (ACP,
+        # haiku) for the listed aux tasks, tried ONLY after every configured,
+        # paid, and free provider fallback is exhausted. Keeps these critical
+        # functions alive during a total paid-provider outage (payment errors,
+        # revoked OAuth, no local model) without depending on external keys — at
+        # the cost of subscription quota, which is why it is last. No-op on hosts
+        # with no Claude Code subscription pockets logged in. Empty the list to
+        # disable; add task names (e.g. "title_generation") to extend it.
+        "subscription_last_resort": ["triage_specifier", "kanban_decomposer", "compression"],
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
@@ -2774,7 +2768,18 @@ DEFAULT_CONFIG = {
     # todos to ready, and fires `hermes -p <assignee> chat -q ...` for
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
+    #
+    # Per-platform notification opt-out is handled by the kanban dashboard
+    # (see ``hermes dashboard`` -> Notifications).
     "kanban": {
+        # Auto-subscribe the originating gateway/TUI session to task
+        # completion + block events when ``kanban_create`` is called from
+        # inside a session that has a persistent delivery channel. The
+        # agent that dispatched the task will get notified automatically
+        # instead of having to poll. Disable to mirror pre-feature
+        # behaviour — e.g. for a profile that prefers explicit
+        # ``kanban_notify-subscribe`` calls per task.
+        "auto_subscribe_on_create": True,
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

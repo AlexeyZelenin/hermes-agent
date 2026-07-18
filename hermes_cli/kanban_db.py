@@ -318,6 +318,11 @@ _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 
+# board.json ``agent_limit`` is a pacing-owned technical safety cap, not an
+# operator knob: how many agents actually run is decided by the pacing
+# controller. This is the hard fleet ceiling any stored value is clamped to.
+_BOARD_AGENT_LIMIT_CAP = 10
+
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
     """Render the age of an epoch-seconds timestamp as a coarse, human-
@@ -544,6 +549,68 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _real_platform_hermes_home() -> Optional[Path]:
+    """Best-effort *real* (unpatched) platform Hermes home for the pytest
+    live-board guard.
+
+    Deliberately reads ``HOME`` / ``LOCALAPPDATA`` from the environment
+    rather than going through :func:`Path.home` or
+    :func:`_get_platform_default_hermes_home`, because a large number of
+    kanban tests ``monkeypatch.setattr(Path, "home", lambda: tmp_path)`` to
+    exercise path resolution against a tempdir. If the guard used the patched
+    ``Path.home`` it would misclassify those isolated tempdirs as the live
+    board and fire spuriously. The repo conftests never patch ``HOME`` itself,
+    so reading it directly gives the developer's genuine home.
+    """
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA", "").strip()
+            root = Path(base) if base else Path(os.path.expanduser("~")) / "AppData" / "Local"
+            return (root / "hermes").resolve()
+        home = os.environ.get("HOME", "").strip() or os.path.expanduser("~")
+        return (Path(home) / ".hermes").resolve()
+    except Exception:
+        return None
+
+
+def _guard_live_board_under_pytest(path: Path) -> None:
+    """Turn an un-isolated live-board access inside pytest into a hard error.
+
+    Root-cause fix (task t_ecacc87b) for repeated incidents where a leaky
+    worker / dashboard test created junk cards ('Popup детали', 'Hello2',
+    'paused', ...) on the real shared board. The repo conftests pin an
+    isolated ``HERMES_KANBAN_HOME`` for every test; if we still reach here
+    inside a pytest process with **no** ``HERMES_KANBAN_HOME`` /
+    ``HERMES_KANBAN_DB`` override **and** the resolved path lands under the
+    developer's genuine ``~/.hermes``, a fixture leaked — fail loudly instead
+    of silently writing to the live board.
+
+    ``PYTEST_CURRENT_TEST`` is set by pytest per test and is inherited by any
+    subprocess a test spawns, so this also protects subprocess-based leaks.
+    """
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        return
+    if os.environ.get("HERMES_KANBAN_HOME", "").strip():
+        return
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        return
+    real_home = _real_platform_hermes_home()
+    if real_home is None:
+        return
+    try:
+        path.resolve().relative_to(real_home)
+    except (ValueError, OSError):
+        return  # resolved somewhere isolated (a tempdir) — allowed
+    raise RuntimeError(
+        "kanban live-board guard: a pytest run resolved the shared kanban "
+        f"board at {path} (under the real {real_home}) with no "
+        "HERMES_KANBAN_HOME / HERMES_KANBAN_DB isolation override. A test "
+        "fixture leaked and this write would have polluted the LIVE board. "
+        "Pin an isolated board in the test — set HERMES_KANBAN_HOME to a "
+        "tmp_path (the repo conftest does this automatically for every test)."
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -565,8 +632,11 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+        path = kanban_home() / "kanban.db"
+    else:
+        path = board_dir(slug) / "kanban.db"
+    _guard_live_board_under_pytest(path)
+    return path
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -881,7 +951,9 @@ def write_board_metadata(
             raise ValueError("agent_limit must be a positive integer") from exc
         if parsed_limit < 1:
             raise ValueError("agent_limit must be a positive integer")
-        meta["agent_limit"] = parsed_limit
+        # Clamp to the pacing-owned fleet ceiling — this is a safety cap, not
+        # an operator-set concurrency target.
+        meta["agent_limit"] = min(parsed_limit, _BOARD_AGENT_LIMIT_CAP)
     if executor is not None:
         normalized_executor = str(executor).strip().lower()
         if normalized_executor not in {"hermes-worker", "claude-code", "codex"}:
@@ -1139,6 +1211,11 @@ class Task:
     # the dashboard drawer above the description so opening a card gives the
     # reader the why without digging.
     context: Optional[str] = None
+    # Epoch seconds of the last meaningful change to this row (see the SCHEMA_SQL
+    # column note). Seeded to ``created_at`` on insert; bumped by a trigger on
+    # content edits. Falls back to ``created_at`` when read from a pre-migration
+    # row that never had the column.
+    updated_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1311,11 @@ class Task:
             ),
             context=(
                 row["context"] if "context" in keys and row["context"] else None
+            ),
+            updated_at=(
+                row["updated_at"]
+                if "updated_at" in keys and row["updated_at"] is not None
+                else row["created_at"]
             ),
         )
 
@@ -1510,7 +1592,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- (the work description). NULL = none. Human-facing context shown on the
     -- dashboard drawer above the description so a reader gets the why without
     -- digging. Editable via ``set_task_context`` / the dashboard.
-    context              TEXT
+    context              TEXT,
+    -- Wall-clock (epoch seconds) of the last MEANINGFUL change to this task
+    -- row — title, body, context, status, assignee, priority, category, result,
+    -- paused, model/effort override, tenant. Seeded to ``created_at`` on insert
+    -- and bumped by the ``trg_tasks_touch_updated`` trigger. Dispatcher liveness
+    -- churn (heartbeat, claim refresh, worker pid, run pointer, failure counters)
+    -- is deliberately EXCLUDED so "last updated" reflects a real change rather
+    -- than background polling. Powers the detail popup's "last updated" line
+    -- across every task (t_3f79b87d).
+    updated_at           INTEGER
 );
 
 -- Per-board CATALOG of task categories (name + icon). A task's ``category``
@@ -2389,6 +2480,52 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # NULL (no context) — no behaviour change for rows predating the column.
         _add_column_if_missing(conn, "tasks", "context", "context TEXT")
 
+    if "updated_at" not in cols:
+        # Last-meaningful-change timestamp (t_3f79b87d). Bumped by the trigger
+        # below on real edits; seeded to ``created_at`` for existing rows.
+        _add_column_if_missing(conn, "tasks", "updated_at", "updated_at INTEGER")
+    # Heal any NULL ``updated_at`` from ``created_at`` unconditionally (not just
+    # when first adding the column) so the detail popup never shows a blank "last
+    # updated". Cheap + idempotent — only NULL rows match. Guarded on created_at
+    # for the minimal synthetic tables some tests migrate.
+    if "created_at" in cols or "created_at" in {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }:
+        conn.execute(
+            "UPDATE tasks SET updated_at = created_at "
+            "WHERE updated_at IS NULL AND created_at IS NOT NULL"
+        )
+
+    # Bump ``updated_at`` on meaningful content edits. The WHEN clause both
+    # (a) excludes dispatcher liveness churn — heartbeat, claim refresh, worker
+    # pid, run pointer, failure counters — so "last updated" tracks real changes,
+    # and (b) prevents the trigger's own ``updated_at`` write from re-firing it
+    # (that write touches only ``updated_at``, which isn't in the WHEN clause, so
+    # the guard is false the second time — no recursion). ``strftime`` stamps the
+    # same epoch-seconds unit used by ``created_at``. Created after the additive
+    # ALTERs above so every column it references exists on a real board; the
+    # column-presence guard only skips the convenience trigger on the minimal
+    # synthetic ``tasks`` tables some tests migrate.
+    _watched = (
+        "title", "body", "context", "status", "assignee", "priority",
+        "category", "result", "paused", "model_override", "effort_override",
+        "tenant",
+    )
+    live_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "updated_at" in live_cols and all(c in live_cols for c in _watched):
+        when = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in _watched)
+        conn.execute(
+            f"""
+            CREATE TRIGGER IF NOT EXISTS trg_tasks_touch_updated
+            AFTER UPDATE ON tasks FOR EACH ROW
+            WHEN ({when})
+            BEGIN
+                UPDATE tasks SET updated_at = CAST(strftime('%s','now') AS INTEGER)
+                WHERE id = NEW.id;
+            END
+            """
+        )
+
     # Seed the category catalog on first creation only. ``task_categories`` is
     # created by SCHEMA_SQL just above; seed the operator's original icon groups
     # when it is still empty so a fresh board starts curated. A non-empty
@@ -3152,8 +3289,8 @@ def create_task(
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        category, context
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        category, context, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3182,6 +3319,7 @@ def create_task(
                         session_id,
                         category,
                         context,
+                        now,  # updated_at seeded to created_at on insert
                     ),
                 )
                 for pid in parents:
@@ -8652,6 +8790,24 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
+# Placeholder model tokens that must never be stamped as a real model. These
+# leak in when a resolve falls through to the profile/executor default without a
+# concrete id ("default"/"inherit"/"auto"), leaving the card's model line lying.
+# Forbidding them means an unknown model is stamped as *absent*, which the UI can
+# honestly render as "unknown" rather than a fake name (t_3f79b87d).
+_PLACEHOLDER_MODELS = frozenset({"default", "inherit", "auto", "none", ""})
+
+
+def _clean_model_name(value: Optional[str]) -> Optional[str]:
+    """Return a concrete model id, or ``None`` for a falsy/placeholder token."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in _PLACEHOLDER_MODELS:
+        return None
+    return text
+
+
 def _run_start_diagnostics(task: "Task", workspace: str, board: Optional[str]) -> dict:
     """The 'who / where / on what' facts known at spawn, stamped onto the run
     so a worker that dies before reporting still shows them on the card.
@@ -8662,7 +8818,9 @@ def _run_start_diagnostics(task: "Task", workspace: str, board: Optional[str]) -
     the token-usage ledger captures it)."""
     executor = (task.executor or "hermes-worker")
     meta: dict = {"executor": executor, "workspace": workspace}
-    model = task.model_override or resolve_model_map(board).get("worker")
+    model = _clean_model_name(task.model_override) or _clean_model_name(
+        resolve_model_map(board).get("worker")
+    )
     if model:
         meta["model"] = model
     if executor in ("claude-code", "codex"):
@@ -9208,10 +9366,11 @@ def _dispatch_once_locked(
     # The board pool is an additional cap to global max_in_progress. It is a
     # counter over running tasks, not a separately persisted pool entity.
     try:
-        board_agent_limit = int(read_board_metadata(board).get("agent_limit", 10))
+        board_agent_limit = int(read_board_metadata(board).get("agent_limit", _BOARD_AGENT_LIMIT_CAP))
     except (TypeError, ValueError):
-        board_agent_limit = 10
-    board_agent_limit = max(1, board_agent_limit)
+        board_agent_limit = _BOARD_AGENT_LIMIT_CAP
+    # Defensive: honour the pacing safety cap even against a stale board.json.
+    board_agent_limit = max(1, min(board_agent_limit, _BOARD_AGENT_LIMIT_CAP))
     effective_max_in_progress = board_agent_limit
     if isinstance(max_in_progress, int) and max_in_progress > 0:
         effective_max_in_progress = min(effective_max_in_progress, max_in_progress)

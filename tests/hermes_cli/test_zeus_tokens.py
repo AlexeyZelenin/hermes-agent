@@ -291,3 +291,93 @@ def test_token_cost_none_when_no_data():
 ])
 def test_humanize_tokens(n, expected):
     assert zeus_tokens.humanize_tokens(n) == expected
+
+
+# ---------------------------------------------------------------------------
+# model_split / model_breakdown_by_task (task t_3f79b87d)
+# ---------------------------------------------------------------------------
+
+
+def _insert_usage(path: Path, rows):
+    """Insert ``rows`` of (task_id, model, total, provider, effort, subscription)
+    into a token_usage db (created if absent)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    if not conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='token_usage'"
+    ).fetchone():
+        conn.executescript(_SCHEMA)
+    conn.executemany(
+        "INSERT INTO token_usage "
+        "(task_id, ts, model, provider, effort, subscription, "
+        " prompt_tokens, completion_tokens, total_tokens) "
+        "VALUES (?, 1.0, ?, ?, ?, ?, 0, 0, ?)",
+        [(t, m, prov, eff, sub, tot) for (t, m, tot, prov, eff, sub) in rows],
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_model_split_single_model(tmp_path):
+    p = _make_zeus(tmp_path / "zeus.db")
+    _insert_usage(p, [("t_a", "claude-opus-4-8[1m]", 1000, "acp-claude-code", "high", "personal")])
+    conn = zeus_tokens.connect(p)
+    split = zeus_tokens.model_split(conn, "t_a")
+    conn.close()
+    assert split["total_tokens"] == 1000
+    assert len(split["models"]) == 1
+    assert split["models"][0]["model"] == "claude-opus-4-8[1m]"
+    assert split["models"][0]["pct"] == 100.0
+    assert split["providers"] == ["acp-claude-code"]
+    assert split["efforts"] == ["high"]
+    assert split["subscriptions"] == ["personal"]
+
+
+def test_model_split_multi_model_percentages(tmp_path):
+    p = _make_zeus(tmp_path / "zeus.db")
+    _insert_usage(p, [
+        ("t_b", "claude-opus-4-8", 700, "acp-claude-code", "", ""),
+        ("t_b", "claude-fable-5", 300, "acp-claude-code", "", ""),
+    ])
+    conn = zeus_tokens.connect(p)
+    split = zeus_tokens.model_split(conn, "t_b")
+    conn.close()
+    # Sorted by tokens desc; percentages reflect the token share.
+    assert [m["model"] for m in split["models"]] == ["claude-opus-4-8", "claude-fable-5"]
+    assert split["models"][0]["pct"] == 70.0
+    assert split["models"][1]["pct"] == 30.0
+
+
+def test_model_split_coalesces_empty_model_to_unknown(tmp_path):
+    p = _make_zeus(tmp_path / "zeus.db")
+    _insert_usage(p, [("t_c", "", 500, "", "", "")])
+    conn = zeus_tokens.connect(p)
+    split = zeus_tokens.model_split(conn, "t_c")
+    conn.close()
+    assert split["models"][0]["model"] == "unknown"
+
+
+def test_model_split_none_when_no_rows(tmp_path):
+    p = _make_zeus(tmp_path / "zeus.db")
+    conn = zeus_tokens.connect(p)
+    assert zeus_tokens.model_split(conn, "t_missing") is None
+    conn.close()
+
+
+def test_model_split_none_when_ledger_absent():
+    assert zeus_tokens.model_split(None, "t_x") is None
+
+
+def test_model_breakdown_by_task_batches(tmp_path):
+    p = _make_zeus(tmp_path / "zeus.db")
+    _insert_usage(p, [
+        ("t_1", "m1", 100, "", "", ""),
+        ("t_2", "m1", 40, "", "", ""),
+        ("t_2", "m2", 60, "", "", ""),
+    ])
+    conn = zeus_tokens.connect(p)
+    out = zeus_tokens.model_breakdown_by_task(conn, ["t_1", "t_2", "t_none"])
+    conn.close()
+    assert set(out) == {"t_1", "t_2"}
+    assert len(out["t_1"]) == 1
+    assert {m["model"] for m in out["t_2"]} == {"m1", "m2"}

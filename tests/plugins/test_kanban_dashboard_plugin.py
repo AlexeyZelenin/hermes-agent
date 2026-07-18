@@ -2578,7 +2578,10 @@ def test_board_patch_models_executor_agent_limit(client):
     })
     assert r.status_code == 200
     board = r.json()["board"]
-    assert board["agent_limit"] == 4
+    # agent_limit is deprecated/ignored via the settings API — concurrency is
+    # owned by the pacing controller, so the input does not take effect and the
+    # board keeps its default safety cap.
+    assert board["agent_limit"] == 10
     assert board["executor"] == "claude-code"
     assert board["models"] == {"worker": "m-worker", "cheap": "m-cheap"}
 
@@ -2800,3 +2803,28 @@ def test_patch_task_unknown_category_rejected(client):
     tid = client.post("/api/plugins/kanban/tasks", json={"title": "t"}).json()["task"]["id"]
     r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"category": "ghost"})
     assert r.status_code == 400
+
+
+def test_dashboard_gates_rows_on_persistent_task_id():
+    """Cards must never render for phantom/optimistic rows lacking a DB id.
+
+    Regression: a live board occasionally showed empty '(untitled)' cards
+    ("phantom rows") in a status column for tasks that did not exist in the
+    database (not active, archived, a child, nor in task_links). The /board
+    endpoint only ever returns real tasks, so these came from the client's
+    cached grid holding a malformed/optimistic entry with no id. The rendered
+    board must drop any task object without a saved, non-empty string id
+    before it reaches a card.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text(encoding="utf-8")
+
+    # The persistence predicate exists and requires a non-empty string id.
+    assert "function isPersistentTask(t)" in js
+    assert 'return !!t && typeof t.id === "string" && t.id.trim() !== "";' in js
+    # The board-render filter gates every row on it, ahead of the other
+    # (tenant/assignee/search) filters so counts and groups exclude phantoms.
+    assert "if (!isPersistentTask(t)) return false;" in js
+    # The parent-picker's flattened task list is gated too.
+    assert "c.tasks.filter(isPersistentTask)" in js

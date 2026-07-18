@@ -103,7 +103,7 @@ def test_auto_resume_after_subscription_window_reset(
 ):
     # The pool's login check shells out to the Keychain; force the seeded
     # pocket to read as logged-in so capacity turns purely on the cooldown.
-    monkeypatch.setattr(subs, "is_logged_in", lambda config_dir: True)
+    monkeypatch.setattr(subs, "is_logged_in", lambda config_dir, provider="claude": True)
 
     future = time.time() + 3600  # pocket still cooling for another hour
     _seed_cooling_pocket(tmp_path, cooling_until=future)
@@ -171,7 +171,7 @@ def test_no_auto_unblock_for_non_marker_capability_block(
 ):
     """A capability block WITHOUT the subscriptions marker must be left alone
     even when the pool has capacity — auto-unblock is scoped to the pool."""
-    monkeypatch.setattr(subs, "is_logged_in", lambda config_dir: True)
+    monkeypatch.setattr(subs, "is_logged_in", lambda config_dir, provider="claude": True)
     _seed_cooling_pocket(tmp_path, cooling_until=None)  # fully available
 
     with kb.connect() as conn:

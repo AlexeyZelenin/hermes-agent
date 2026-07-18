@@ -269,10 +269,11 @@ class _connection_context:
 
 
 class _FakeLease:
-    def __init__(self, name):
+    def __init__(self, name, provider="claude"):
         self.id = 1
         self.name = name
         self.config_dir = f"/cfg/{name}"
+        self.provider = provider
 
 
 def test_partial_output_salvaged_on_limit_rotation(monkeypatch, kanban_conn, tmp_path):
@@ -287,9 +288,9 @@ def test_partial_output_salvaged_on_limit_rotation(monkeypatch, kanban_conn, tmp
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
 
     # Two-pocket pool: pocket 1 dies mid-work on a limit, pocket 2 finishes.
-    monkeypatch.setattr(subs, "pool_size", lambda: 2)
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 2)
     leases = iter([_FakeLease("p1"), _FakeLease("p2")])
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: next(leases))
     monkeypatch.setattr(subs, "release", lambda lease: None)
     marked: list = []
     monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: marked.append(name))
@@ -337,9 +338,9 @@ def test_no_salvage_comment_when_no_partial_output(monkeypatch, kanban_conn, tmp
     task_id = kb.create_task(kanban_conn, title="Task", assignee="external")
     assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
-    monkeypatch.setattr(subs, "pool_size", lambda: 2)
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 2)
     leases = iter([_FakeLease("p1"), _FakeLease("p2")])
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: next(leases))
     monkeypatch.setattr(subs, "release", lambda lease: None)
     monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: None)
 
@@ -379,9 +380,9 @@ def test_successful_handoff_mentioning_limits_is_not_a_death(monkeypatch, kanban
 
     # A single-pocket pool: a spurious rotation would exhaust the iterator and
     # raise StopIteration, so "task completes" also proves "did not rotate".
-    monkeypatch.setattr(subs, "pool_size", lambda: 1)
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 1)
     leases = iter([_FakeLease("p1")])
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: next(leases))
     monkeypatch.setattr(subs, "release", lambda lease: None)
     marked: list = []
     monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: marked.append(name))
@@ -420,9 +421,9 @@ def test_verbose_limit_exception_rotates_not_parks(monkeypatch, kanban_conn, tmp
     task_id = kb.create_task(kanban_conn, title="Verbose limit", assignee="external")
     assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
-    monkeypatch.setattr(subs, "pool_size", lambda: 2)
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 2)
     leases = iter([_FakeLease("p1"), _FakeLease("p2")])
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: next(leases))
     monkeypatch.setattr(subs, "release", lambda lease: None)
     marked: list = []
     monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: marked.append(name))
@@ -466,9 +467,9 @@ def test_typed_limit_error_rotates_without_substring(monkeypatch, kanban_conn, t
     task_id = kb.create_task(kanban_conn, title="Typed limit", assignee="external")
     assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
     monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
-    monkeypatch.setattr(subs, "pool_size", lambda: 2)
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 2)
     leases = iter([_FakeLease("p1"), _FakeLease("p2")])
-    monkeypatch.setattr(subs, "acquire", lambda task_id="": next(leases))
+    monkeypatch.setattr(subs, "acquire", lambda task_id="", provider=None: next(leases))
     monkeypatch.setattr(subs, "release", lambda lease: None)
     marked: list = []
     monkeypatch.setattr(subs, "mark_limited", lambda name, msg, now=None: marked.append(name))
@@ -778,3 +779,124 @@ def test_tool_feed_toggle_env(monkeypatch):
     assert executor._tool_feed_enabled() is False
     monkeypatch.setenv("HERMES_ACP_TOOL_FEED", "off")
     assert executor._tool_feed_enabled() is False
+
+
+def test_codex_task_leases_codex_pocket_and_pins_codex_home(monkeypatch, kanban_conn, tmp_path):
+    """A codex task runs through the pool: it leases a Codex-provider pocket,
+    pins CODEX_HOME (not CLAUDE_CONFIG_DIR), and spawns the codex ACP command."""
+    from agent import acp_task_executor as executor
+    from agent import claude_subscriptions as subs
+
+    task_id = kb.create_task(kanban_conn, title="Codex task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    seen = {}
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 1 if provider == "codex" else 0)
+    def _acquire(task_id="", provider=None):
+        seen["provider"] = provider
+        return _FakeLease("cx1", provider="codex")
+    monkeypatch.setattr(subs, "acquire", _acquire)
+    monkeypatch.setattr(subs, "release", lambda lease: None)
+
+    captured = {}
+
+    class FakeClient:
+        last_model = "gpt-5.6"
+        last_turn_usage = None
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.last_partial_text = ""
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            return "codex done", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    commands = {}
+    def _command_for(name):
+        commands["name"] = name
+        return (f"acp-{name}", ["--stdio"])
+    monkeypatch.setattr(executor, "command_for", _command_for)
+
+    result = executor.run_task(
+        executor="codex", task_id=task_id, workspace=str(tmp_path), board="test"
+    )
+    assert result == "codex done"
+    assert seen["provider"] == "codex", "codex task must lease only codex pockets"
+    assert captured["extra_env"]["CODEX_HOME"] == "/cfg/cx1"
+    assert "CLAUDE_CONFIG_DIR" not in captured["extra_env"]
+    assert commands["name"] == "codex", "must spawn the codex ACP command"
+
+
+def test_cross_vendor_fallover_when_own_pool_cooling(monkeypatch, kanban_conn, tmp_path):
+    """With HERMES_POOL_CROSS_VENDOR on, a claude task whose Claude pockets are
+    all cooling falls over to a free Codex pocket (deliverable 4), and then runs
+    the codex command + CODEX_HOME derived from the leased pocket's provider."""
+    from agent import acp_task_executor as executor
+    from agent import claude_subscriptions as subs
+
+    monkeypatch.setenv("HERMES_POOL_CROSS_VENDOR", "1")
+    task_id = kb.create_task(kanban_conn, title="Claude task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 1)
+
+    calls = {"n": 0}
+    def _acquire(task_id="", provider=None):
+        calls["n"] += 1
+        if provider == "claude":  # own vendor exhausted
+            raise subs.NoSubscriptionAvailable("all cooling")
+        return _FakeLease("cx1", provider="codex")  # cross-vendor pool
+    monkeypatch.setattr(subs, "acquire", _acquire)
+    monkeypatch.setattr(subs, "release", lambda lease: None)
+
+    captured = {}
+
+    class FakeClient:
+        last_model = "gpt-5.6"
+        last_turn_usage = None
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.last_partial_text = ""
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            return "ran on codex", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: (f"acp-{name}", ["--stdio"]))
+
+    result = executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+    )
+    assert result == "ran on codex"
+    assert calls["n"] == 2, "tries own vendor first, then the cross-vendor pool"
+    assert captured["extra_env"]["CODEX_HOME"] == "/cfg/cx1"
+
+
+def test_no_cross_vendor_fallover_by_default(monkeypatch, kanban_conn, tmp_path):
+    """Without the opt-in flag, an exhausted Claude pool blocks the task rather
+    than silently routing claude-tuned work onto a Codex pocket."""
+    from agent import acp_task_executor as executor
+    from agent import claude_subscriptions as subs
+
+    monkeypatch.delenv("HERMES_POOL_CROSS_VENDOR", raising=False)
+    task_id = kb.create_task(kanban_conn, title="Claude task", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+    monkeypatch.setattr(subs, "pool_size", lambda provider=None: 1)
+
+    providers_tried = []
+    def _acquire(task_id="", provider=None):
+        providers_tried.append(provider)
+        raise subs.NoSubscriptionAvailable("all cooling")
+    monkeypatch.setattr(subs, "acquire", _acquire)
+    monkeypatch.setattr(subs, "release", lambda lease: None)
+    monkeypatch.setattr(executor, "command_for", lambda name: (f"acp-{name}", ["--stdio"]))
+
+    with pytest.raises(subs.NoSubscriptionAvailable):
+        executor.run_task(
+            executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+        )
+    assert providers_tried == ["claude"], "must not retry cross-vendor when flag is off"

@@ -52,6 +52,17 @@ def _steering_enabled():
     """Interactive steering is on unless explicitly disabled. An empty inbox is
     a no-op (one file stat per task), so the default is safe."""
     return os.getenv("HERMES_ACP_STEERING", "1").strip().lower() not in ("0", "false", "no", "off")
+_PLACEHOLDER_MODELS = frozenset({"default", "inherit", "auto", "none", ""})
+def _clean_model(value):
+    """Concrete model id, or None for a falsy/placeholder token. Keeps
+    'default'/'' out of run metadata + the token ledger so the card's model
+    line never shows a fake name (t_3f79b87d)."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in _PLACEHOLDER_MODELS:
+        return None
+    return text
 def _stamp_session_metadata(metadata, client):
     """Layer the adapter's per-session facts (permission mode, reasoning effort,
     context-window occupancy, cumulative cost) onto the run metadata so the
@@ -75,7 +86,7 @@ def _report_usage(client, executor, task_id, subscription=None):
         invoke_hook("post_api_request", task_id=task_id,
                     session_id=getattr(client, "last_session_id", "") or "",
                     provider=f"acp-{executor}", api_mode="acp",
-                    model=getattr(client, "last_model", "") or executor, usage=usage,
+                    model=_clean_model(getattr(client, "last_model", "")) or executor, usage=usage,
                     subscription=subscription or "",
                     effort=getattr(client, "last_effort", "") or "",
                     context_used=context.get("context_used"),
@@ -194,33 +205,64 @@ def _salvage_partial_output(task_id, board, client):
                            body="partial handoff (limit-interrupted)\n\n" + partial)
     except Exception:
         pass
-def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None, tool_activity_sink=None, run_id=None):
-    """Run the prompt on the Claude subscription pool, rotating on usage limits.
+# One worker subscription pool spans vendors: a Claude pocket pins
+# CLAUDE_CONFIG_DIR, a Codex pocket pins CODEX_HOME. The env var and the ACP
+# executor to spawn are the only per-vendor differences on this path (task
+# t_2eec7f4a) - lease/rotation/cooldown/pacing are provider-blind.
+_PROVIDER_ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+_PROVIDER_EXECUTOR = {"claude": "claude-code", "codex": "codex"}
+def _provider_for_executor(executor):
+    from agent import claude_subscriptions as subs
+    return subs.PROVIDER_CODEX if executor == "codex" else subs.PROVIDER_CLAUDE
+def _cross_vendor_enabled():
+    """Whether a task may fall over to another vendor's pocket when its own
+    vendor's pool is fully cooling (task t_2eec7f4a deliverable 4). Off by
+    default: a vendor-tuned task stays on its vendor unless the operator opts in
+    with HERMES_POOL_CROSS_VENDOR, since command + config-dir are then driven by
+    the leased pocket's provider (Codex command + CODEX_HOME for a Codex lease)."""
+    return os.getenv("HERMES_POOL_CROSS_VENDOR", "0").strip().lower() in ("1", "true", "yes", "on")
+def _acquire_pocket(subs, task_id, provider):
+    """Lease a pocket of ``provider``; fall over to the whole pool (any vendor)
+    when that vendor is exhausted and cross-vendor routing is enabled."""
+    try:
+        return subs.acquire(task_id=task_id, provider=provider)
+    except subs.NoSubscriptionAvailable:
+        if provider is not None and _cross_vendor_enabled():
+            return subs.acquire(task_id=task_id, provider=None)
+        raise
+def _run_pooled_session(executor, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None, tool_activity_sink=None, run_id=None):
+    """Run the prompt on the vendor-agnostic subscription pool, rotating on limits.
 
-    Each session gets CLAUDE_CONFIG_DIR pinned to a leased subscription dir
-    ('spread' strategy). A session that dies on a usage limit puts that
-    subscription into cooldown and the task retries immediately on the next
-    one; NoSubscriptionAvailable propagates when the whole pool is cooling.
-    An empty pool (no login dirs on this host) falls back to the legacy
-    single-session path with Claude Code's own default config dir.
+    ``executor`` picks the desired vendor (claude-code -> Claude pockets, codex
+    -> Codex pockets). Each session pins the leased pocket's config dir via the
+    provider's env var (CLAUDE_CONFIG_DIR / CODEX_HOME) and spawns that vendor's
+    ACP command ('spread' strategy). A session that dies on a usage/auth limit
+    puts that pocket into cooldown and the task retries immediately on the next
+    pocket of the same vendor; NoSubscriptionAvailable propagates when the whole
+    vendor pool is cooling. An empty vendor pool (no login dirs on this host)
+    falls back to the legacy single-session path with the CLI's default dir.
     """
     from agent import claude_subscriptions as subs
-    if subs.pool_size() == 0:
+    provider = _provider_for_executor(executor)
+    if subs.pool_size(provider) == 0:
+        command, args = command_for(executor)
         extra_env = _contributed_worker_env(task_id, board, None, run_id) or None
         client = _new_client(command, args, workspace, model, extra_env=extra_env,
                              effort=effort, tool_activity_sink=tool_activity_sink)
         text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
         return text, client, None
     while True:
-        lease = subs.acquire(task_id=task_id)
+        lease = _acquire_pocket(subs, task_id, provider)
+        command, args = command_for(_PROVIDER_EXECUTOR.get(lease.provider, executor))
+        env_var = _PROVIDER_ENV_VAR.get(lease.provider, "CLAUDE_CONFIG_DIR")
         limited = None
         client = None
         try:
             # Plugin-contributed env (e.g. Zeus Langfuse OTLP) first, then the
-            # core-owned CLAUDE_CONFIG_DIR last so the leased subscription dir
-            # always wins over any contributed key.
+            # core-owned config-dir var last so the leased pocket's dir always
+            # wins over any contributed key.
             extra_env = _contributed_worker_env(task_id, board, lease.name, run_id)
-            extra_env["CLAUDE_CONFIG_DIR"] = lease.config_dir
+            extra_env[env_var] = lease.config_dir
             client = _new_client(command, args, workspace, model,
                                  extra_env=extra_env,
                                  effort=effort, tool_activity_sink=tool_activity_sink)
@@ -269,8 +311,11 @@ def run_task(*, executor, task_id, workspace, board=None):
         subscription=None
         follow_up=(lambda: _drain_steer(task_id, board)) if _steering_enabled() else None
         tool_sink=_make_tool_activity_sink(task_id, board, run_id) if _tool_feed_enabled() else None
-        if executor == "claude-code":
-            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort,tool_sink,run_id)
+        if executor in ("claude-code", "codex"):
+            # Both vendors run through the one worker pool: lease a pocket of the
+            # matching provider (pinning CLAUDE_CONFIG_DIR / CODEX_HOME) with
+            # limit rotation. An empty vendor pool degrades to a bare session.
+            text,client,subscription=_run_pooled_session(executor,workspace,prompt,timeout,model,task_id,follow_up,board,effort,tool_sink,run_id)
         else:
             client=_new_client(command,args,workspace,model,effort=effort,tool_activity_sink=tool_sink)
             text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
@@ -279,7 +324,7 @@ def run_task(*, executor, task_id, workspace, board=None):
         with kb.connect_closing(board=board) as conn: kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)
         raise
     metadata={"executor":executor,"acp_command":command,"provider":f"acp-{executor}","workspace":workspace}
-    run_model=getattr(client,"last_model","") or model
+    run_model=_clean_model(getattr(client,"last_model","")) or _clean_model(model)
     if run_model: metadata["model"]=run_model
     if effort: metadata["effort_requested"]=effort
     if subscription: metadata["subscription"]=subscription

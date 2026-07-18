@@ -39,9 +39,14 @@ from __future__ import annotations
 import math
 import os
 import sqlite3
-from typing import Optional
+from typing import Any, Optional
 
-from hermes_cli import subscription_limits, zeus_circuit_breaker, zeus_tokens
+from hermes_cli import (
+    pocket_accounting,
+    subscription_limits,
+    zeus_circuit_breaker,
+    zeus_tokens,
+)
 
 # Fallback window length when the true window can't be pinned from the pacing
 # row (Claude subscription limits reset weekly, so 7 days is the right default).
@@ -141,7 +146,9 @@ def _save_window_backup(
         pass
 
 
-def _restore_window(conn: sqlite3.Connection, board: str, row: sqlite3.Row, now: float):
+def _restore_window(
+    conn: sqlite3.Connection, board: str, row: sqlite3.Row, now: float
+) -> "sqlite3.Row | dict[str, Any]":
     """Overlay the last-good window backup onto a row the controller blanked.
 
     A restart leaves a pacing row with a NULL ``reset_at`` (window un-computed).
@@ -293,10 +300,13 @@ def _window_tokens(
 
 
 def _subscription_meta(conn: sqlite3.Connection) -> dict[str, dict]:
-    """``{name: {display_name, enabled, cooling_until, last_limited_at}}``.
+    """``{name: {display_name, enabled, reserved, cooling_until, last_limited_at}}``.
 
-    Enriches each pocket with its human label and cool-down state from
-    ``claude_subscriptions``. Empty when that table is absent.
+    Enriches each pocket with its human label, reserved flag, and cool-down
+    state from ``claude_subscriptions``. Pacing observes a reserved pocket for
+    measurement only — it is never leased to workers (task t_83c4b740). Empty
+    when that table is absent; ``reserved`` degrades to ``False`` on a pool DB
+    predating the column.
     """
     try:
         rows = conn.execute(
@@ -305,10 +315,15 @@ def _subscription_meta(conn: sqlite3.Connection) -> dict[str, dict]:
         ).fetchall()
     except sqlite3.OperationalError:
         return {}
+    reserved_by_name = _reserved_flags(conn)
+    dirs_by_name = _config_dirs(conn)
     return {
         r["name"]: {
             "display_name": r["display_name"] or "",
             "enabled": bool(r["enabled"]),
+            "reserved": reserved_by_name.get(r["name"], False),
+            "config_dir": dirs_by_name.get(r["name"], ("", "claude"))[0],
+            "provider": dirs_by_name.get(r["name"], ("", "claude"))[1],
             "cooling_until": (
                 float(r["cooling_until"]) if r["cooling_until"] is not None else None
             ),
@@ -316,6 +331,39 @@ def _subscription_meta(conn: sqlite3.Connection) -> dict[str, dict]:
                 float(r["last_limited_at"]) if r["last_limited_at"] is not None else None
             ),
         }
+        for r in rows
+    }
+
+
+def _reserved_flags(conn: sqlite3.Connection) -> dict[str, bool]:
+    """``{name: reserved}`` — tolerant of a pool DB predating the column."""
+    try:
+        rows = conn.execute(
+            "SELECT name, reserved FROM claude_subscriptions"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {r["name"]: bool(r["reserved"]) for r in rows}
+
+
+def _config_dirs(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """``{name: (config_dir, provider)}`` — the login dir each pocket's sessions
+    write under, so interactive spend can be attributed to it (task t_5580f23b).
+    Tolerant of a pool DB predating the ``provider`` column (defaults to claude)."""
+    try:
+        rows = conn.execute(
+            "SELECT name, config_dir, provider FROM claude_subscriptions"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        try:
+            rows = conn.execute(
+                "SELECT name, config_dir FROM claude_subscriptions"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {r["name"]: (r["config_dir"] or "", "claude") for r in rows}
+    return {
+        r["name"]: (r["config_dir"] or "", (r["provider"] or "claude"))
         for r in rows
     }
 
@@ -360,11 +408,33 @@ def _session_breaker(
     return breaker, start, reset, tokens
 
 
+def _interactive_tokens(
+    meta: dict, window_start: Optional[float], until: float, exclude: frozenset[str]
+) -> Optional[int]:
+    """Interactive (non-worker) tokens this pocket burned in a window, or ``None``.
+
+    Best-effort filesystem read of the pocket's session logs (task t_5580f23b);
+    any error degrades to ``None`` so the live pacing view never breaks on it.
+    """
+    config_dir = meta.get("config_dir") or ""
+    if not config_dir or window_start is None:
+        return None
+    try:
+        result = pocket_accounting.interactive_window_tokens(
+            config_dir, meta.get("provider") or "claude",
+            window_start=window_start, until_ts=until, exclude_sessions=exclude,
+        )
+    except Exception:
+        return None
+    return result["total_tokens"]
+
+
 def _pocket(
-    row: sqlite3.Row,
+    row: "sqlite3.Row | dict[str, Any]",
     subs: dict[str, dict],
     conn: sqlite3.Connection,
     now: float,
+    exclude_sessions: frozenset[str],
 ) -> dict:
     """Shape one ``pacing_state`` row into a dashboard pocket dict."""
     spent = row["spent_percent"]
@@ -403,10 +473,17 @@ def _pocket(
         cooling=cooling,
     )
     effective = zeus_circuit_breaker.aggregate([breaker, breaker_5h])
+    # Interactive (operator/supervisor) spend attributed to this pocket by its
+    # login dir — the runtime count the ledger alone misses (task t_5580f23b).
+    # Additive/observational here: reported alongside worker ``window_tokens`` so
+    # the panel/`/subs` show real burn; it does not (yet) feed the breaker verdict.
+    interactive_week = _interactive_tokens(meta, window_start, now, exclude_sessions)
+    interactive_5h = _interactive_tokens(meta, five_start, now, exclude_sessions)
     return {
         "subscription": row["subscription"],
         "display_name": meta.get("display_name") or row["subscription"],
         "enabled": meta.get("enabled"),
+        "reserved": meta.get("reserved", False),
         "window_label": row["window_label"],
         "spent_percent": spent,
         "target_percent": target,
@@ -430,6 +507,12 @@ def _pocket(
         "last_limited_at": meta.get("last_limited_at"),
         "window_start": window_start,
         "window_tokens": live,
+        "config_dir": meta.get("config_dir") or "",
+        "provider": meta.get("provider") or "claude",
+        # Interactive (non-worker) tokens attributed to this pocket by its login
+        # dir, over the weekly and 5h windows. ``None`` when the dir can't be read.
+        "interactive_week_tokens": interactive_week,
+        "interactive_5h_tokens": interactive_5h,
         "circuit_breaker": breaker,
         "circuit_breaker_5h": breaker_5h,
         "five_hour_window": {
@@ -476,7 +559,11 @@ def pacing_snapshot(
     except sqlite3.OperationalError:
         return empty
     _save_window_backup(conn, board, rows, now)
-    pockets = [_pocket(_restore_window(conn, board, r, now), subs, conn, now) for r in rows]
+    exclude = frozenset(pocket_accounting.attributed_session_ids(conn))
+    pockets = [
+        _pocket(_restore_window(conn, board, r, now), subs, conn, now, exclude)
+        for r in rows
+    ]
     total = sum(
         p["window_tokens"]["total_tokens"]
         for p in pockets

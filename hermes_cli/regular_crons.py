@@ -363,7 +363,7 @@ def emit_finding(
         "  title=excluded.title, detail=excluded.detail, "
         "  evidence_json=excluded.evidence_json, category=excluded.category, "
         "  severity=excluded.severity, updated_at=excluded.updated_at, "
-        "  status=CASE WHEN findings.status IN ('dismissed','snoozed') "
+        "  status=CASE WHEN findings.status IN ('dismissed','snoozed','accepted') "
         "              THEN findings.status ELSE 'open' END",
         (board, FINDINGS_SOURCE, finding_key, title, detail,
          json.dumps(evidence), category, severity, now, now),

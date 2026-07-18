@@ -5051,6 +5051,13 @@ class TestAuxiliaryClientPoisonedCacheEviction:
             ), patch(
                 "agent.auxiliary_client._try_payment_fallback",
                 return_value=(None, None, ""),
+            ), patch(
+                # Neutralise the subscription last-resort layer (compression is
+                # in its default allowlist) so the contract under test — cache
+                # eviction + re-raise once every fallback is exhausted — is not
+                # masked by a real Claude pool on the test host.
+                "agent.auxiliary_client._build_subscription_last_resort_client",
+                return_value=(None, None),
             ):
                 with pytest.raises(ConnectionError):
                     call_llm(
@@ -5087,6 +5094,11 @@ class TestAuxiliaryClientPoisonedCacheEviction:
             ), patch(
                 "agent.auxiliary_client._try_payment_fallback",
                 return_value=(None, None, ""),
+            ), patch(
+                # See sync twin above: stub the subscription last-resort so the
+                # eviction/re-raise contract isn't masked by a real pool.
+                "agent.auxiliary_client._build_subscription_last_resort_client",
+                return_value=(None, None),
             ):
                 with pytest.raises(ConnectionError):
                     await async_call_llm(

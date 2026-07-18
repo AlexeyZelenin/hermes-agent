@@ -286,6 +286,13 @@ _PROVIDER_ALIASES = {
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
     "claude-code": "anthropic",
+    # Claude Code subscription pool (ACP subprocess), distinct from the
+    # api.anthropic.com HTTP provider above. See the claude-subscriptions
+    # branch in resolve_provider_client.
+    "claude-subscription": "claude-subscriptions",
+    "claude-subs": "claude-subscriptions",
+    "claude-code-subscription": "claude-subscriptions",
+    "claude-code-subscriptions": "claude-subscriptions",
     "github": "copilot",
     "github-copilot": "copilot",
     "github-model": "copilot",
@@ -4194,6 +4201,50 @@ def _try_configured_fallback_chain(
     return None, None, ""
 
 
+_SUBSCRIPTION_LAST_RESORT_PROVIDER = "claude-subscriptions"
+
+
+def _subscription_last_resort_tasks() -> set:
+    """Aux tasks eligible for the Claude subscription last-resort fallback.
+
+    Read from ``auxiliary.subscription_last_resort`` (a list of task names).
+    Default covers the critical Kanban/compression functions that must not die
+    when every paid provider is down. An empty list disables it entirely.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+        tasks = aux.get("subscription_last_resort")
+        if isinstance(tasks, list):
+            return {str(t).strip() for t in tasks if str(t).strip()}
+    except Exception:
+        logger.debug("subscription_last_resort config read failed", exc_info=True)
+    return {"triage_specifier", "kanban_decomposer", "compression"}
+
+
+def _build_subscription_last_resort_client(
+    task: Optional[str],
+    failed_provider: Optional[str],
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Build the subscription-pool aux client when it is the last option left.
+
+    Returns ``(None, None)`` unless the task opted in, the failed provider was
+    not already the subscription pool (no self-recursion), and at least one
+    Claude Code subscription pocket is logged in on this host.
+    """
+    if not task or task not in _subscription_last_resort_tasks():
+        return None, None
+    if (failed_provider or "").strip().lower() == _SUBSCRIPTION_LAST_RESORT_PROVIDER:
+        return None, None
+    try:
+        from agent.claude_subscription_aux import build_client
+        return build_client(task=task)
+    except Exception:
+        logger.debug("subscription last-resort build failed", exc_info=True)
+        return None, None
+
+
 def _try_configured_fallback_for_unavailable_client(
     task: Optional[str],
     failed_provider: str,
@@ -4569,6 +4620,15 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             return sync_client, model
     except ImportError:
         pass
+    try:
+        from agent.claude_subscription_aux import ClaudeSubscriptionAuxClient
+        # Subprocess-backed ACP facade: no async httpx transport to swap. Return
+        # it unchanged rather than wrapping its ``acp://`` marker base_url in a
+        # real AsyncOpenAI client (which would HTTP the bogus URL).
+        if isinstance(sync_client, ClaudeSubscriptionAuxClient):
+            return sync_client, model
+    except ImportError:
+        pass
 
     async_kwargs = {
         "api_key": sync_client.api_key,
@@ -4889,6 +4949,27 @@ def resolve_provider_client(
         client = _create_openai_client(
             api_key=explicit_api_key or "no-key-required", base_url=endpoint,
         )
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
+    # ── Claude Code subscriptions (ACP subprocess pool, haiku-tier) ──────────
+    # Fallback for auxiliary tasks when every paid provider is unavailable
+    # (OpenRouter/Nous payment error, no Codex OAuth, Copilot 403, no local
+    # model): route the aux prompt through the same leased/rotated Claude Code
+    # subscription pool the Kanban executor uses. Respects cooling_until and
+    # per-pocket concurrency; logs token_usage with subscription attribution.
+    # Distinct from the ``anthropic`` (api.anthropic.com HTTP) provider.
+    if provider == "claude-subscriptions":
+        from agent.claude_subscription_aux import build_client as _build_sub_aux_client
+        client, default = _build_sub_aux_client(model, task=task)
+        if client is None:
+            logger.warning(
+                "resolve_provider_client: claude-subscriptions requested but no "
+                "Claude Code subscription logins were found on this host "
+                "(register/log in a Claude Code subscription pocket first)."
+            )
+            return None, None
+        final_model = default
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
@@ -6946,9 +7027,21 @@ def call_llm(
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
         if client is None:
-            raise RuntimeError(
-                f"No LLM provider configured for task={task} provider={resolved_provider}. "
-                f"Run: hermes setup")
+            # Last resort before giving up: the leased Claude Code subscription
+            # pool (opt-in per task). Lets specify/decompose/compression run
+            # when no paid provider has usable credentials at all.
+            _sub_client, _sub_model = _build_subscription_last_resort_client(
+                task, resolved_provider)
+            if _sub_client is not None:
+                logger.info(
+                    "Auxiliary %s: no provider configured; falling back to the "
+                    "Claude Code subscription pool (%s)", task or "call", _sub_model)
+                client, final_model = _sub_client, _sub_model
+                resolved_provider = _SUBSCRIPTION_LAST_RESORT_PROVIDER
+            else:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}. "
+                    f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
 
@@ -7403,12 +7496,31 @@ def call_llm(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
+            # Last resort — the leased Claude Code subscription pool (opt-in per
+            # task). Tried only after every configured/paid/free fallback above
+            # returned nothing, so subscription quota is spent only when there
+            # is genuinely no external provider left. This is the fix for the
+            # payment-error outage that killed specify/decompose/compression.
+            sub_client, sub_model = _build_subscription_last_resort_client(
+                task, resolved_provider)
+            if sub_client is not None:
+                sub_resp = _call_fallback_candidate_sync(
+                    sub_client, sub_model,
+                    f"{_SUBSCRIPTION_LAST_RESORT_PROVIDER}(last-resort)",
+                    task=task, messages=messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config)
+                if sub_resp is not None:
+                    return sub_resp
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
             logger.warning(
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
+                "(fallback_chain + main agent model + subscriptions). "
+                "Raising original error.",
                 task or "call", reason, resolved_provider,
             )
         # Connection/timeout errors leave the cached client poisoned (closed
