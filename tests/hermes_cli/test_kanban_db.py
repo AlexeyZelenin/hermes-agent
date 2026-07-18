@@ -2898,6 +2898,112 @@ def test_janitor_flags_dirty_worktree(kanban_home, tmp_path):
     assert payload["shared_checkout"] is False
 
 
+# ---------------------------------------------------------------------------
+# Post-completion janitor: anchor-repo invariant (repo on trunk + clean tree)
+# t_253890e8
+# ---------------------------------------------------------------------------
+
+
+def _anchor_events(conn, task_id):
+    return [
+        e for e in kb.list_events(conn, task_id)
+        if e.kind in ("anchor_restored_to_trunk", "anchor_off_trunk")
+    ]
+
+
+def _current_branch(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _park_on_task_branch(repo: Path, branch: str) -> None:
+    """Leave the anchor checkout parked on a fresh branch off main."""
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-q", "-b", branch],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def test_anchor_janitor_restores_clean_off_trunk_anchor(kanban_home, tmp_path, monkeypatch):
+    """A clean anchor stranded on a task branch is checked back out to trunk."""
+    repo = tmp_path / "anchor"
+    _init_git_repo(repo)
+    kb.create_board("anchor-board", default_workdir=str(repo))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "anchor-board")
+    _park_on_task_branch(repo, "task/t_stranded")
+    assert _current_branch(repo) == "task/t_stranded"
+
+    with kb.connect(board="anchor-board") as conn:
+        t = kb.create_task(conn, title="ship", board="anchor-board")
+        assert kb.complete_task(conn, t, result="done")
+
+        events = _anchor_events(conn, t)
+        assert [e.kind for e in events] == ["anchor_restored_to_trunk"]
+        payload = events[0].payload
+        assert payload["restored"] is True
+        assert payload["branch"] == "task/t_stranded"
+        assert payload["trunk"] == "main"
+        comments = kb.list_comments(conn, t)
+        assert any(c.author == "janitor" and "checked out 'main'" in c.body for c in comments)
+
+    # The anchor is now back on trunk; the stranded branch is preserved.
+    assert _current_branch(repo) == "main"
+    assert kb._git_branch_exists(repo, "task/t_stranded")
+
+
+def test_anchor_janitor_reports_dirty_anchor_without_clobber(kanban_home, tmp_path, monkeypatch):
+    """A DIRTY anchor is detected + routed but never clobbered — work is kept."""
+    repo = tmp_path / "anchor"
+    _init_git_repo(repo)
+    kb.create_board("anchor-dirty-board", default_workdir=str(repo))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "anchor-dirty-board")
+    _park_on_task_branch(repo, "task/t_dirty")
+    (repo / "wip.py").write_text("x = 1\n", encoding="utf-8")  # untracked → dirty
+
+    with kb.connect(board="anchor-dirty-board") as conn:
+        t = kb.create_task(conn, title="ship", board="anchor-dirty-board")
+        assert kb.complete_task(conn, t, result="done")
+
+        events = _anchor_events(conn, t)
+        assert [e.kind for e in events] == ["anchor_off_trunk"]
+        payload = events[0].payload
+        assert payload["restored"] is False
+        assert payload["branch"] == "task/t_dirty"
+        assert payload["dirty_count"] == 1
+        assert payload["dirty"] == ["?? wip.py"]
+        comments = kb.list_comments(conn, t)
+        assert any(c.author == "janitor" and "never clobbered" in c.body for c in comments)
+
+    # NOT clobbered: still on the task branch, the file still uncommitted.
+    assert _current_branch(repo) == "task/t_dirty"
+    assert (repo / "wip.py").exists()
+
+
+def test_anchor_janitor_silent_when_on_trunk_and_clean(kanban_home, tmp_path, monkeypatch):
+    """The healthy case (anchor on trunk, clean) emits no event and no comment."""
+    repo = tmp_path / "anchor"
+    _init_git_repo(repo)
+    kb.create_board("anchor-clean-board", default_workdir=str(repo))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "anchor-clean-board")
+    assert _current_branch(repo) == "main"
+
+    with kb.connect(board="anchor-clean-board") as conn:
+        t = kb.create_task(conn, title="ship", board="anchor-clean-board")
+        assert kb.complete_task(conn, t, result="done")
+        assert _anchor_events(conn, t) == []
+        assert [c for c in kb.list_comments(conn, t) if c.author == "janitor"] == []
+
+
+def test_anchor_janitor_noop_without_board_default_workdir(kanban_home):
+    """No board default_workdir → no anchor to guard → the janitor stays silent."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ship")
+        assert kb.complete_task(conn, t, result="done")
+        assert _anchor_events(conn, t) == []
+
+
 def test_is_managed_scratch_path_accepts_per_board_workspaces(kanban_home, tmp_path):
     """Per-board scratch dirs under ``<kanban_home>/kanban/boards/<slug>/workspaces`` are managed."""
     board_scratch = kanban_home / "kanban" / "boards" / "my-board" / "workspaces" / "task-1"

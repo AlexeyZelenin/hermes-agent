@@ -4885,6 +4885,11 @@ def complete_task(
     # or stray files left behind and route them to the reviewer stage. Never
     # commits — detection and routing only (t_7f2f37f8).
     _janitor_dir_workspace(conn, task_id, run_id)
+    # Anchor-invariant pass: the board's integration checkout must sit on trunk
+    # with a clean tree between tasks — a stranded task branch makes the gateway
+    # run branch code, not trunk. Restore it when safe (clean), detect+route when
+    # dirty; never clobber uncommitted work (t_253890e8).
+    _janitor_anchor_on_trunk(conn, task_id, run_id)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -5481,6 +5486,146 @@ def _janitor_dir_workspace(
             add_comment(conn, task_id, "janitor", "\n".join(lines))
         except Exception:
             pass
+    except Exception:
+        pass  # best-effort — never block or reverse a completion
+
+
+# ---------------------------------------------------------------------------
+# Post-completion janitor: anchor-repo invariant (repo on trunk + clean tree)
+# ---------------------------------------------------------------------------
+#
+# The board anchor (``default_workdir``) is the integration surface ONLY: task
+# work lives in ``.worktrees/<id>`` checkouts on their own branches, never on
+# the anchor's branch. A worker or a failed hand-merge occasionally strands the
+# anchor on a task branch (so the gateway then runs branch code, not trunk) or
+# leaves it dirty (defect t_253890e8). After every completion we re-assert the
+# invariant. A clean-but-parked anchor is safely returned to trunk (no work to
+# lose); a dirty anchor is DETECTED and ROUTED only — never clobbered, mirroring
+# the dir/worktree janitor's philosophy.
+
+# Cap on how many dirty anchor paths we enumerate in the event / comment.
+_ANCHOR_MAX_LISTED_PATHS = 50
+
+
+def _restore_anchor_to_trunk(anchor: Path, trunk: str) -> bool:
+    """Return a clean, off-trunk anchor to ``trunk`` under the trunk lock.
+
+    Only ever called after verifying a clean tree; re-checks under the lock (an
+    integration on another thread may have moved or dirtied the anchor
+    meanwhile) and refuses if the tree became dirty. Returns True when the anchor
+    now sits on ``trunk``.
+    """
+    from hermes_cli.trunk_integrator import TrunkLock
+
+    with TrunkLock(anchor):
+        if _git_current_branch(anchor) == trunk:
+            return True  # an integration already parked us on trunk
+        if _git_status_porcelain_entries(anchor):
+            return False  # raced into a dirty tree — leave for detect-only
+        co = subprocess.run(
+            ["git", "-C", str(anchor), "checkout", "--quiet", trunk],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        return co.returncode == 0 and _git_current_branch(anchor) == trunk
+
+
+def _record_anchor_janitor(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    *,
+    anchor: Path,
+    trunk: str,
+    branch: Optional[str],
+    entries: list[tuple[str, str]],
+    restored: bool,
+) -> None:
+    """Record the anchor-invariant event + a human-readable janitor comment."""
+    dirty = entries or []
+    listed = [f"{code} {rel}" for code, rel in dirty[:_ANCHOR_MAX_LISTED_PATHS]]
+    on = branch or "(detached HEAD)"
+    payload = {
+        "anchor_repo": str(anchor),
+        "trunk": trunk,
+        "branch": branch,
+        "restored": restored,
+        "dirty_count": len(dirty),
+        "dirty": listed,
+        "truncated": len(dirty) > len(listed),
+    }
+    kind = "anchor_restored_to_trunk" if restored else "anchor_off_trunk"
+    with write_txn(conn):
+        _append_event(conn, task_id, kind, payload, run_id=run_id)
+    if restored:
+        msg = (
+            f"🧹 Janitor: anchor repo {anchor} was parked on '{on}' (clean tree) "
+            f"after completion — checked out '{trunk}'. The gateway must run "
+            "trunk code, never a stale task branch."
+        )
+    else:
+        lines = [
+            f"⚠️ Janitor: anchor repo {anchor} is off-invariant after completion "
+            f"— on '{on}' (trunk '{trunk}') with {len(dirty)} uncommitted "
+            "change(s). NOT auto-fixed: a dirty tree is never clobbered. Commit "
+            "or discard the work, then return the anchor to trunk.",
+        ]
+        if listed:
+            lines.append("")
+            lines.extend(f"  {e}" for e in listed)
+        if len(dirty) > len(listed):
+            lines.append(
+                f"  ... {len(dirty) - len(listed)} more "
+                f"(capped at {_ANCHOR_MAX_LISTED_PATHS})"
+            )
+        msg = "\n".join(lines)
+    try:
+        add_comment(conn, task_id, "janitor", msg)
+    except Exception:
+        pass
+
+
+def _janitor_anchor_on_trunk(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int]
+) -> None:
+    """Assert the board anchor repo is on trunk with a clean tree after a done.
+
+    * on trunk + clean  → healthy, silent.
+    * off trunk + clean → safe to correct: check out trunk (under the trunk
+      lock), record ``anchor_restored_to_trunk``. No work is lost.
+    * dirty (any branch) → DETECT and route only, never clobber: record
+      ``anchor_off_trunk`` + a janitor comment for the reviewer/overseer.
+
+    Best-effort: any error is swallowed so the janitor never blocks completion.
+    """
+    try:
+        from hermes_cli.trunk_integrator import main_worktree_root, resolve_trunk_ref
+
+        board_default = (
+            read_board_metadata(get_current_board()).get("default_workdir") or ""
+        ).strip()
+        if not board_default:
+            return  # no anchor configured — nothing to guard
+        anchor = main_worktree_root(Path(board_default).expanduser())
+        if anchor is None:
+            return
+        trunk = resolve_trunk_ref(anchor)
+        if trunk is None:
+            return  # unconventional trunk — don't guess
+        branch = _git_current_branch(anchor)
+        entries = _git_status_porcelain_entries(anchor)
+        if entries is None:
+            return  # git unavailable — can't judge
+        if branch == trunk and not entries:
+            return  # invariant holds — anchor on trunk, clean
+
+        restored = False
+        if not entries and branch != trunk:
+            restored = _restore_anchor_to_trunk(anchor, trunk)
+            entries = [] if restored else (_git_status_porcelain_entries(anchor) or [])
+        _record_anchor_janitor(
+            conn, task_id, run_id, anchor=anchor, trunk=trunk,
+            branch=branch, entries=entries, restored=restored,
+        )
     except Exception:
         pass  # best-effort — never block or reverse a completion
 
