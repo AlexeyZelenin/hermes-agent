@@ -164,3 +164,65 @@ def test_routing_is_deterministic_on_ties():
     # Identical score+suitability → stable tie-break by id ("a-id" < "b-id").
     d = route("cheap", grid=grid)
     assert d is not None and d.model == "a-id"
+
+
+# ── Local (zero-token) routing rule — task t_2cfa06c1 ────────────────────────
+
+def test_local_model_wins_cheap_over_priced_vendor():
+    """A local model is free, so it beats any paid vendor on the cheap tier."""
+    grid = [
+        _m(id="deepseek", price_in=0.14, price_out=0.28, swe_bench_verified=79.0,
+           sources={"swe_bench_verified": "s", "price": "p"}),
+        _m(id="qwen3-coder:30b", vendor="qwen", provider="local", local=True,
+           swe_bench_verified=50.3, sources={"swe_bench_verified": "s"}),
+    ]
+    d = route("cheap", grid=grid)
+    assert d is not None
+    assert d.mode == "local"
+    assert d.model == "qwen3-coder:30b"
+    assert d.provider == "local"
+    assert d.blended_price == 0.0            # zero subscription/metered cost
+
+
+def test_allow_local_false_restores_paid_pick():
+    """A known-down local box can be excluded to force the grid's cloud pick."""
+    grid = [
+        _m(id="deepseek", price_in=0.14, price_out=0.28, swe_bench_verified=79.0,
+           sources={"swe_bench_verified": "s", "price": "p"}),
+        _m(id="qwen3-coder:30b", provider="local", local=True,
+           swe_bench_verified=50.3, sources={"swe_bench_verified": "s"}),
+    ]
+    d = route("cheap", grid=grid, allow_local=False)
+    assert d is not None and d.mode == "metered" and d.model == "deepseek"
+
+
+def test_local_pick_prefers_higher_swe_v_among_locals():
+    grid = [
+        _m(id="weak-local", provider="local", local=True, swe_bench_verified=40.0,
+           sources={"swe_bench_verified": "s"}),
+        _m(id="strong-local", provider="local", local=True, swe_bench_verified=50.3,
+           sources={"swe_bench_verified": "s"}),
+    ]
+    d = route("cheap", grid=grid)
+    assert d is not None and d.model == "strong-local"
+
+
+def test_local_pick_handles_unbenchmarked_model():
+    grid = [_m(id="mystery-local", provider="local", local=True)]
+    d = route("cheap", grid=grid)
+    assert d is not None and d.mode == "local"
+    assert d.suitability == 0.0 and d.suitability_metric == "none"
+
+
+def test_shipped_grid_registers_local_qwen_for_cheap_and_aux():
+    """AC #2: the local Qwen3-Coder backend is registered + selected for the
+    cheap and aux tiers in the shipped grid."""
+    models = model_grid.load_grid()
+    local_rows = [m for m in models if m.local]
+    assert local_rows, "shipped grid must register at least one local model"
+    classes = {m.grid_class for m in local_rows}
+    assert {"cheap", "aux"} <= classes
+    for cls in ("cheap", "aux"):
+        d = route(cls)
+        assert d is not None and d.mode == "local" and d.provider == "local"
+        assert d.model == "qwen3-coder:30b"

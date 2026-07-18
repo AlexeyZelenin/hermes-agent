@@ -75,6 +75,7 @@ class GridModel:
     swe_bench_pro: Optional[float]
     lmarena_elo: Optional[float]
     sources: dict
+    local: bool = False
 
     def blended_price(self) -> Optional[float]:
         """Weighted metered $/1M-tok, or None when either side is unpriced."""
@@ -138,9 +139,43 @@ def load_grid(path: Optional[Path] = None) -> list[GridModel]:
                 swe_bench_pro=_coerce_float(entry.get("swe_bench_pro")),
                 lmarena_elo=_coerce_float(entry.get("lmarena_elo")),
                 sources=entry.get("sources") or {},
+                local=bool(entry.get("local")),
             )
         )
     return models
+
+
+def _local_pick(candidates: list[GridModel]) -> Optional[RouteDecision]:
+    """Prefer a locally-hosted model — it costs zero subscription/metered tokens.
+
+    A local OpenAI-compatible endpoint (Ollama / MLX / LM Studio) runs on the
+    operator's own hardware, so for the offload-worthy classes (cheap / aux) it
+    beats every paid vendor on cost by definition. When several local models are
+    tagged for a class, the highest SWE-bench Verified wins (else stable id) so
+    the pick is deterministic and auditable. Returns ``None`` when the class has
+    no local model, letting the paid metered/subscription rules take over.
+    """
+    locals_ = [m for m in candidates if m.local]
+    if not locals_:
+        return None
+    locals_.sort(key=lambda m: (-(m.swe_bench_verified or 0.0), m.id))
+    m = locals_[0]
+    suit = m.swe_bench_verified
+    metric = "swe_bench_verified" if suit is not None else "none"
+    src = m.sources.get("swe_bench_verified", "unknown") if suit is not None else "local"
+    suit_txt = f"SWE-V {suit:.1f}%" if suit is not None else "unbenchmarked"
+    rationale = (
+        f"class={m.grid_class} rule=local:zero-cost -> "
+        f"{m.vendor}/{m.id} ({suit_txt}; runs on local hardware, "
+        f"0 subscription/metered tokens; src: {src})"
+    )
+    return RouteDecision(
+        task_class=m.grid_class, mode="local", vendor=m.vendor,
+        provider=m.provider, model=m.id, catalog_id=m.catalog_id,
+        score=0.0, suitability=suit if suit is not None else 0.0,
+        suitability_metric=metric, suitability_source=src,
+        blended_price=0.0, rationale=rationale,
+    )
 
 
 def _metered_pick(candidates: list[GridModel],
@@ -212,9 +247,15 @@ def _subscription_pick(candidates: list[GridModel]) -> Optional[RouteDecision]:
 
 def route(task_class: str, *,
           prefer_subscription: bool = False,
+          allow_local: bool = True,
           budget_ceiling: Optional[float] = None,
           grid: Optional[list[GridModel]] = None) -> Optional[RouteDecision]:
     """Pick a vendor/model for ``task_class`` by price vs. suitability.
+
+    A locally-hosted model tagged for the class wins by default (``allow_local``)
+    because it costs zero subscription/metered tokens — this is the cheap/aux
+    offload path. Pass ``allow_local=False`` to force a paid vendor (e.g. when the
+    local endpoint is known-down and the caller wants the grid's cloud pick).
 
     Returns ``None`` when the class is not routable or has no rankable model.
     The chosen decision (or the no-pick) is logged so the rule is auditable.
@@ -230,10 +271,13 @@ def route(task_class: str, *,
         return None
 
     decision: Optional[RouteDecision] = None
-    if prefer_subscription:
-        decision = _subscription_pick(candidates) or _metered_pick(candidates, budget_ceiling)
-    else:
-        decision = _metered_pick(candidates, budget_ceiling) or _subscription_pick(candidates)
+    if allow_local:
+        decision = _local_pick(candidates)
+    if decision is None:
+        if prefer_subscription:
+            decision = _subscription_pick(candidates) or _metered_pick(candidates, budget_ceiling)
+        else:
+            decision = _metered_pick(candidates, budget_ceiling) or _subscription_pick(candidates)
 
     if decision is None:
         logger.info("model_grid.route: class=%s no rankable model (no priced+scored "

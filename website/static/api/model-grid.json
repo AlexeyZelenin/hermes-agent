@@ -243,6 +243,48 @@
         "subscription": "x.ai/pricing, felloai.com (2026-07-18)",
         "swe_bench_verified_thirdparty": "benchlm.ai/models/grok-4-5, vals.ai/benchmarks/swebench (2026-07): ~86.6% — third-party, not canon, not used for routing"
       }
+    },
+    {
+      "id": "qwen3-coder:30b",
+      "catalog_id": "qwen/qwen3-coder-30b-a3b-instruct",
+      "vendor": "qwen",
+      "provider": "local",
+      "class": "cheap",
+      "price_in_per_mtok": null,
+      "price_out_per_mtok": null,
+      "subscription": false,
+      "subscription_plan": null,
+      "local": true,
+      "swe_bench_verified": 50.3,
+      "swe_bench_pro": null,
+      "lmarena_elo": null,
+      "notes": "Local Ollama backend (Qwen3-Coder-30B-A3B-Instruct, MoE 30.5B/3.3B-active, Q4_K_M ~19GB). Runs on the operator's 64GB Apple Silicon Mac via an OpenAI-compatible endpoint (http://localhost:11434/v1) — zero subscription/metered tokens. Native tool-calling makes it fit for toolset-selection/classification aux tasks. Chosen over dense Qwen2.5-Coder-32B for MoE speed on the aux tier. See knowledge/local-coder-aux-tier.md.",
+      "sources": {
+        "swe_bench_verified": "huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct model card + artificialanalysis.ai/models/qwen3-coder-30b-a3b-instruct (2026-07-18): 50.3% Pass@1",
+        "size_quant": "ollama.com/library/qwen3-coder:30b (2026-07-18): 30b-a3b-q4_K_M = 19GB",
+        "local": "deployed via Ollama 0.32.1 on Mac16,11 (M4 Pro, 64GB) — task t_2cfa06c1"
+      }
+    },
+    {
+      "id": "qwen3-coder:30b",
+      "catalog_id": "qwen/qwen3-coder-30b-a3b-instruct",
+      "vendor": "qwen",
+      "provider": "local",
+      "class": "aux",
+      "price_in_per_mtok": null,
+      "price_out_per_mtok": null,
+      "subscription": false,
+      "subscription_plan": null,
+      "local": true,
+      "swe_bench_verified": 50.3,
+      "swe_bench_pro": null,
+      "lmarena_elo": null,
+      "notes": "Same local Qwen3-Coder-30B backend registered for the aux class (compression / session-search / skills-hub / toolset-pick side tasks). Preferred over paid vendors by model_grid.route() because it is subscription-token-free. See knowledge/local-coder-aux-tier.md.",
+      "sources": {
+        "swe_bench_verified": "huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct model card + artificialanalysis.ai/models/qwen3-coder-30b-a3b-instruct (2026-07-18): 50.3% Pass@1",
+        "size_quant": "ollama.com/library/qwen3-coder:30b (2026-07-18): 30b-a3b-q4_K_M = 19GB",
+        "local": "deployed via Ollama 0.32.1 on Mac16,11 (M4 Pro, 64GB) — task t_2cfa06c1"
+      }
     }
   ]
 }

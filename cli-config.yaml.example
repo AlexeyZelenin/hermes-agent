@@ -499,6 +499,34 @@ prompt_caching:
 # Other providers pick a sensible default automatically.
 #
 # auxiliary:
+#   # ---------------------------------------------------------------------------
+#   # Local coder backend (zero-token aux/cheap tier) — task t_2cfa06c1
+#   # ---------------------------------------------------------------------------
+#   # Run the offload-worthy side tasks (classification, simple edits, toolset
+#   # selection) on a local OpenAI-compatible model instead of spending
+#   # subscription/metered tokens. Default target: Qwen3-Coder-30B-A3B-Instruct
+#   # (MoE 30.5B / 3.3B-active, Q4_K_M ~19GB) served by Ollama on Apple Silicon.
+#   #
+#   #   Setup:  brew install ollama && ollama serve && ollama pull qwen3-coder:30b
+#   #
+#   # When enabled + reachable, "local" leads the auto aux fallback chain and the
+#   # model_grid router picks it for the cheap/aux classes (see
+#   # knowledge/local-coder-aux-tier.md). When the server is down it declines
+#   # instantly (short TCP probe, cached) and the paid chain proceeds unchanged —
+#   # nothing breaks. Env overrides: HERMES_LOCAL_AUX_{BASE_URL,MODEL,ENABLED}.
+#   local_model:
+#     enabled: false                       # opt-in; true routes the aux chain here
+#     base_url: "http://localhost:11434/v1"   # Ollama default (also MLX / LM-Studio)
+#     model: "qwen3-coder:30b"
+#   #
+#   # To pin a *specific* side task to the local box regardless of the chain,
+#   # set that task's provider to "local" (or "ollama"), e.g.:
+#   #   title_generation: { provider: "local" }
+#   #   skills_hub:        { provider: "local" }
+#   #   session_search:    { provider: "local" }
+#   # A down endpoint on an explicit provider:local task falls through to the
+#   # normal auto routing instead of raising.
+#   #
 #   # Image analysis: vision_analyze tool + browser screenshots
 #   vision:
 #     provider: "auto"
