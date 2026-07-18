@@ -8152,6 +8152,109 @@ def _post_gave_up_diagnostics(
         pass
 
 
+# Engine-room log vocabulary for a structural worker-death record. One event
+# name per death kind so the log-watcher's occurrence-gate (t_ed00fffe) and the
+# watchdog can group/count them; category is shared so a single filter surfaces
+# every worker death. Severity: a real crash is ``error``; a clean-exit protocol
+# violation or a provider quota wall is ``warn`` (expected, self-healing).
+_WORKER_DEATH_EVENTS: dict[str, tuple[str, str]] = {
+    # kind -> (engine_log event name, severity)
+    "clean_exit": ("worker_protocol_violation", "warn"),
+    "rate_limited": ("worker_rate_limited", "warn"),
+    "nonzero_exit": ("worker_crashed", "error"),
+    "signaled": ("worker_crashed", "error"),
+    "unknown": ("worker_crashed", "error"),
+}
+_WORKER_DEATH_CATEGORY = "worker_death"
+
+
+def _last_tool_step(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Short human summary of the most recent ``tool_call`` event, or ``None``.
+
+    The ACP executor mirrors every tool-call transition onto ``task_events``
+    (kind ``tool_call``); at death time the newest one is the last thing the
+    worker was doing — the 'где сломался' breadcrumb the operator asked for."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'tool_call' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        p = json.loads(row["payload"]) or {}
+    except (ValueError, TypeError):
+        return None
+    label = p.get("title") or p.get("kind") or p.get("tool_call_id") or "tool_call"
+    text = f"{label} [{p.get('status') or '?'}]"
+    hint = p.get("input")
+    if hint:
+        text += f": {hint}"
+    return text[:300]
+
+
+def _run_subscription(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Subscription (Claude account lease) stamped on the task's latest run, or
+    ``None``. Stamped early by the ACP executor (see :func:`stamp_run_metadata`)
+    so a worker that dies mid-session still reveals which subscription it was
+    burning — otherwise the name is only known on a clean completion."""
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["metadata"]:
+        return None
+    try:
+        meta = json.loads(row["metadata"]) or {}
+    except (ValueError, TypeError):
+        return None
+    sub = meta.get("subscription")
+    return str(sub) if sub else None
+
+
+def stamp_run_metadata(
+    task_id: str,
+    updates: dict,
+    *,
+    board: Optional[str] = None,
+    run_id: Optional[int] = None,
+) -> None:
+    """Best-effort merge of ``updates`` into a run's metadata from out-of-process.
+
+    Opens its own connection so an out-of-process worker (the ACP executor) can
+    durably record facts mid-session — chiefly the leased subscription the moment
+    it's acquired, so a worker that dies before completing still shows which
+    subscription it was on (``detect_crashed_workers`` reads it back). A missing
+    run or any I/O error is a silent no-op: a diagnostics stamp must never break
+    a live session."""
+    if not updates:
+        return
+    try:
+        with connect_closing(board=board) as conn:
+            with write_txn(conn):
+                rid = run_id or _current_run_id(conn, task_id)
+                if rid is None:
+                    return
+                row = conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?", (rid,),
+                ).fetchone()
+                if row is None:
+                    return
+                base: dict = {}
+                if row["metadata"]:
+                    try:
+                        base = json.loads(row["metadata"]) or {}
+                    except (ValueError, TypeError):
+                        base = {}
+                base.update(updates)
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (json.dumps(base, ensure_ascii=False), rid),
+                )
+    except Exception:
+        pass
+
+
 def detect_crashed_workers(
     conn: sqlite3.Connection, *, board: Optional[str] = None,
 ) -> list[str]:
@@ -8192,9 +8295,15 @@ def detect_crashed_workers(
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str, Optional[str]]] = []
     # (task_id, pid, claimer, protocol_violation, error_text, log_tail)
+    # Structural death records for the engine-room log (t_adf37522), written
+    # AFTER the main txn closes (record_log opens its own write_txn). One row
+    # per actually-released dead worker of any kind, so 'почему сломался' is
+    # always searchable in one place. Each entry:
+    #   (task_id, engine_log_event, severity, payload_dict)
+    death_log: list[tuple[str, str, str, dict]] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, executor FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8225,6 +8334,19 @@ def detect_crashed_workers(
                 _log_tail = worker_log_tail(row["id"], board=board)
             except Exception:
                 _log_tail = None
+            # Point-of-breakage breadcrumbs, resolved once and attached to both
+            # the task_events payload and the engine-room log row below: which
+            # subscription burned, the last tool_call/step the worker took, and
+            # the stderr tail. Capped so a giant log can't bloat the event feed.
+            _subscription = _run_subscription(conn, row["id"])
+            _last_step = _last_tool_step(conn, row["id"])
+            _death_extra: dict = {}
+            if _log_tail:
+                _death_extra["stderr_tail"] = _log_tail[-2000:]
+            if _last_step:
+                _death_extra["last_step"] = _last_step
+            if _subscription:
+                _death_extra["subscription"] = _subscription
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -8312,11 +8434,31 @@ def detect_crashed_workers(
                     error=error_text,
                     metadata=dict(event_payload),
                 )
+                # Enrich the live task_events payload with the point-of-breakage
+                # breadcrumbs (subscription / last step / stderr tail). Kept off
+                # the run metadata (``_end_run`` above) so that row stays lean —
+                # the full record lands in the engine-room log below.
                 _append_event(
                     conn, row["id"], event_kind,
-                    event_payload,
+                    {**event_payload, **_death_extra},
                     run_id=run_id,
                 )
+                # Structural engine-room record for every death kind — the
+                # single searchable place 'почему сломался' always lands.
+                _ev_name, _sev = _WORKER_DEATH_EVENTS.get(
+                    kind, ("worker_crashed", "error")
+                )
+                _log_payload = {
+                    "pid": pid,
+                    "exit_kind": kind,
+                    "reason": error_text,
+                    "executor": row["executor"],
+                    "claimer": row["claim_lock"],
+                }
+                if code is not None:
+                    _log_payload["exit_code"] = code
+                _log_payload.update(_death_extra)
+                death_log.append((row["id"], _ev_name, _sev, _log_payload))
                 if rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
@@ -8346,6 +8488,18 @@ def detect_crashed_workers(
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text, _log_tail)
                     )
+    # Outside the main txn (record_log opens its own write_txn): mirror each
+    # death into the engine-room structured log. Best-effort per row — a log
+    # failure never blocks the dispatch tick or the breaker accounting below.
+    for _tid, _ev_name, _sev, _log_payload in death_log:
+        try:
+            record_log(
+                conn, source="operator", severity=_sev,
+                category=_WORKER_DEATH_CATEGORY, event=_ev_name,
+                task_id=_tid, payload=_log_payload,
+            )
+        except Exception:
+            pass
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
     # on top of the event we already emitted).

@@ -213,6 +213,16 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
         return text, client, None
     while True:
         lease = subs.acquire(task_id=task_id)
+        # Durably record which subscription this session leased BEFORE running,
+        # so a worker that dies mid-session still reveals the account it was on
+        # (detect_crashed_workers reads it back for the death log). Rotations
+        # overwrite it, so the last-leased subscription is what a crash shows.
+        try:
+            from hermes_cli import kanban_db as _kb
+            _kb.stamp_run_metadata(task_id, {"subscription": lease.name},
+                                   board=board, run_id=run_id)
+        except Exception:
+            pass
         limited = None
         client = None
         try:
