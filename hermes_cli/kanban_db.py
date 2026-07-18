@@ -8969,6 +8969,77 @@ def _auto_unblock_subscription_blocked(conn: sqlite3.Connection) -> list[str]:
     return unblocked
 
 
+def _zeus_rank_map(task_ids: Iterable[str]) -> dict[str, float]:
+    """Manual drag-order ranks for ``task_ids``, read from the zeus dashboard.
+
+    Operators reorder the queue by dragging cards in the Zeus dashboard, which
+    persists a per-card ``rank`` (lower = earlier) into zeus.db's ``task_flags``
+    table. That store is separate from kanban.db, so the dispatcher reads it
+    here — read-only, on its own connection — to honour manual order at claim
+    time. Task ids are globally unique, so we look up by id rather than board,
+    which keeps this correct even when ``board`` isn't pinned for the tick.
+
+    Degrades to an empty map (rank ignored) whenever the zeus ledger is absent,
+    lacks the ``task_flags``/``rank`` column, or errors — boards without the
+    dashboard fall back to the plain priority/created_at order.
+    """
+    ids = [t for t in dict.fromkeys(task_ids) if t]
+    if not ids:
+        return {}
+    try:
+        from hermes_cli import zeus_tokens  # local import: optional dependency
+        conn = zeus_tokens.connect()
+    except Exception:
+        return {}
+    if conn is None:
+        return {}
+    out: dict[str, float] = {}
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                "SELECT task_id, rank FROM task_flags "
+                f"WHERE rank IS NOT NULL AND task_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                out[r["task_id"]] = float(r["rank"])
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    return out
+
+
+def _order_ready_by_manual_rank(rows: list) -> list:
+    """Re-order dispatcher-claim candidates to honour the operator's manual
+    drag-order from the Zeus dashboard.
+
+    The base SQL orders by ``priority DESC, created_at ASC``. Operators can
+    override that *within a priority band* by dragging cards, which persists a
+    per-card ``rank`` (lower = earlier) into zeus.db. We fold that in as a
+    tiebreak below priority and above created_at: ranked cards sort ahead of
+    un-ranked ones in the same priority band (NULLS LAST), and an absent zeus
+    ledger leaves the original SQL order untouched. ``rows`` must expose
+    ``id``, ``priority`` and ``created_at``.
+    """
+    ranks = _zeus_rank_map(r["id"] for r in rows)
+    if not ranks:
+        return list(rows)
+
+    def _key(r):
+        rk = ranks.get(r["id"])
+        return (
+            -int(r["priority"] or 0),
+            0 if rk is not None else 1,
+            rk if rk is not None else 0.0,
+            int(r["created_at"] or 0),
+        )
+
+    return sorted(rows, key=_key)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9126,10 +9197,13 @@ def _dispatch_once_locked(
     # never gets claimed/spawned regardless of how it reached 'ready'. This is
     # the single deterministic eligibility check the design calls for.
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, priority, created_at FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL AND paused = 0 "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    # Fold the operator's manual drag-order (zeus.db rank) in as a tiebreak
+    # below priority — the dashboard's reordering was previously ignored here.
+    ready_rows = _order_ready_by_manual_rank(ready_rows)
     # The board pool is an additional cap to global max_in_progress. It is a
     # counter over running tasks, not a separately persisted pool entity.
     try:
@@ -9379,10 +9453,12 @@ def _dispatch_once_locked(
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, priority, created_at FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    # Same manual drag-order tiebreak as the ready queue (see above).
+    review_rows = _order_ready_by_manual_rank(review_rows)
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
