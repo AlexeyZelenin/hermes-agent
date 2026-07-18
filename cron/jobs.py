@@ -323,8 +323,61 @@ def _jobs_lock():
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
-# into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+# into output writes/deletes. ``sealed`` marks a safety-switch job (a sealed-
+# core regular process such as the security-review agent) — letting an update
+# flip it off would defeat the point of sealing, so it is set once at create.
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "sealed"})
+
+
+class SealedJobError(RuntimeError):
+    """Raised when the user tries to disable/pause/remove a sealed cron job.
+
+    Sealed jobs are safety switches that live in the sealed core (e.g. the
+    security-review agent, task t_fd081437). Turning one off is intentionally
+    high-friction: the operation is refused here, and the attempt is logged and
+    flagged into the findings store so a silent teardown — an accidental
+    vibe-coded delete or a compromised agent quietly disabling review — is
+    visible rather than silent.
+    """
+
+
+def _is_disabling_update(updates: Dict[str, Any]) -> bool:
+    """True if an update would take a job out of active service."""
+    return updates.get("enabled") is False or updates.get("state") == "paused"
+
+
+def _flag_sealed_tamper(job: Dict[str, Any], action: str) -> None:
+    """Log a refused sealed-job teardown and best-effort flag it as a finding."""
+    job_id = job.get("id")
+    logger.warning(
+        "Refused to %s sealed cron job %s (%s): sealed safety switch",
+        action, job_id, job.get("name"))
+    try:
+        from hermes_cli import security_review as _sr
+        conn = _sr.open_findings_db()
+        if conn is None:
+            return
+        try:
+            result = _sr.CheckResult(
+                check_id=f"sealed_cron_tamper:{job_id}",
+                title=f"Попытка отключить sealed-крон «{job.get('name') or job_id}»",
+                status=_sr.STATUS_FAIL, severity="critical",
+                detail=f"Действие '{action}' над sealed-джобой {job_id} отклонено.")
+            _sr.emit_finding(conn, result, board="", regressed=True,
+                             prev_status=_sr.STATUS_OK)
+        finally:
+            conn.close()
+    except Exception as exc:  # flagging must never break the guard itself
+        logger.debug("could not flag sealed-cron tamper for %s: %s", job_id, exc)
+
+
+def _assert_not_sealed(job: Optional[Dict[str, Any]], action: str) -> None:
+    """Refuse (log + flag + raise) a teardown of a sealed job."""
+    if job and job.get("sealed"):
+        _flag_sealed_tamper(job, action)
+        raise SealedJobError(
+            f"Cron job {job.get('id')} is sealed (safety switch) and cannot be "
+            f"{action} by the user.")
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1054,6 +1107,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    sealed: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1098,6 +1152,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        sealed: When True, mark this a sealed safety-switch job (a sealed-core
+                regular process such as the security-review agent). Sealed jobs
+                cannot be disabled/paused/removed by the user — the attempt is
+                refused, logged, and flagged (see SealedJobError). Immutable
+                after creation.
 
     Returns:
         The created job dict
@@ -1225,6 +1284,10 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Only persist ``sealed`` when set, so the common (unsealed) job stays
+    # byte-identical. A sealed job is a safety switch (see SealedJobError).
+    if sealed:
+        job["sealed"] = True
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1305,6 +1368,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            # A sealed safety-switch job cannot be disabled/paused by the user.
+            if job.get("sealed") and _is_disabling_update(updates):
+                _assert_not_sealed(job, "disabled")
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -1453,6 +1520,7 @@ def remove_job(job_id: str) -> bool:
     job = resolve_job_ref(job_id)
     if not job:
         return False
+    _assert_not_sealed(job, "removed")
     canonical_id = job["id"]
     with _jobs_lock():
         jobs = load_jobs()

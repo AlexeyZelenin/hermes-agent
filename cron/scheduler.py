@@ -3681,6 +3681,28 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
+_security_cron_ensured = False
+
+
+def _ensure_sealed_security_cron() -> None:
+    """Self-establish the sealed security-review cron once per process.
+
+    The security review is a sealed-core safety switch (task t_fd081437): it must
+    always be present and always on, so we register it here rather than relying on
+    a one-off migration. Idempotent and best-effort — a failure just retries on
+    the next tick and never blocks job dispatch.
+    """
+    global _security_cron_ensured
+    if _security_cron_ensured:
+        return
+    try:
+        from hermes_cli.security_review import ensure_security_review_job
+        if ensure_security_review_job() is not None:
+            _security_cron_ensured = True
+    except Exception as exc:  # never let seeding break the ticker
+        logger.debug("sealed security cron ensure skipped: %s", exc)
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -3723,6 +3745,10 @@ def tick(
         return 0
 
     try:
+        # Self-establish the sealed security-review cron (best-effort, once per
+        # process) before dispatch so the safety review is always registered.
+        _ensure_sealed_security_cron()
+
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
