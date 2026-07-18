@@ -563,6 +563,69 @@ def get_board(
 
 
 # ---------------------------------------------------------------------------
+# Проблемы — per-board findings as draft cards (task t_e9b93153)
+# ---------------------------------------------------------------------------
+
+@router.get("/problems")
+def get_problems(board: Optional[str] = Query(default=None)):
+    """Open findings scoped to this board, worst-severity first.
+
+    Powers the per-project "Проблемы" section (hidden when empty, rendered last
+    after the trash zone). Global/system findings (``board=''``) are excluded
+    here — they live in the top-level Проблемы menu — so a board only ever shows
+    its own problems. Degrades to an empty list when the store is absent.
+    """
+    from hermes_cli import problems
+
+    slug = _resolve_board(board) or kanban_db.DEFAULT_BOARD
+    conn = problems.open_store()
+    try:
+        items = problems.list_problems(conn, board=slug)
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"problems": items, "board": slug, "count": len(items)}
+
+
+@router.post("/problems/{finding_id}/accept")
+def accept_problem(finding_id: int, board: Optional[str] = Query(default=None)):
+    """Materialise a finding as a triage backlog card on its own board."""
+    from hermes_cli import problems
+
+    conn = problems.open_store()
+    if conn is None:
+        raise HTTPException(status_code=503, detail="findings store unavailable")
+    try:
+        result = problems.accept_problem(conn, finding_id)
+    finally:
+        conn.close()
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail="problem not found or already resolved"
+        )
+    return {"ok": True, **result}
+
+
+@router.post("/problems/{finding_id}/dismiss")
+def dismiss_problem(finding_id: int, board: Optional[str] = Query(default=None)):
+    """Mark a finding resolved-by-human so re-scans don't resurface it."""
+    from hermes_cli import problems
+
+    conn = problems.open_store()
+    if conn is None:
+        raise HTTPException(status_code=503, detail="findings store unavailable")
+    try:
+        ok = problems.dismiss_problem(conn, finding_id)
+    finally:
+        conn.close()
+    if not ok:
+        raise HTTPException(
+            status_code=404, detail="problem not found or already resolved"
+        )
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # GET /tasks/:id
 # ---------------------------------------------------------------------------
 

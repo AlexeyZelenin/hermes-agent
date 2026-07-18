@@ -715,6 +715,9 @@
     const [config, setConfig] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    // Проблемы for THIS board (task t_e9b93153): open findings surfaced as
+    // draft cards in a section after the trash zone, hidden when empty.
+    const [problems, setProblems] = useState([]);
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
@@ -781,6 +784,29 @@
         })
         .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived, board]);
+
+    // --- Проблемы for this board (task t_e9b93153) -------------------------
+    const loadProblems = useCallback(function () {
+      return SDK.fetchJSON(withBoard(`${API}/problems`, board))
+        .then(function (data) { setProblems((data && data.problems) || []); })
+        .catch(function () { setProblems([]); });  // no store / no table → empty
+    }, [board]);
+
+    useEffect(function () { loadProblems(); }, [loadProblems]);
+
+    const acceptProblem = useCallback(function (id) {
+      return SDK.fetchJSON(withBoard(`${API}/problems/${id}/accept`, board),
+                           { method: "POST" })
+        .then(function () { loadProblems(); loadBoard(); })  // new triage card appears
+        .catch(function (e) { setError(String(e && e.message ? e.message : e)); });
+    }, [board, loadProblems, loadBoard]);
+
+    const dismissProblem = useCallback(function (id) {
+      return SDK.fetchJSON(withBoard(`${API}/problems/${id}/dismiss`, board),
+                           { method: "POST" })
+        .then(function () { loadProblems(); })
+        .catch(function (e) { setError(String(e && e.message ? e.message : e)); });
+    }, [board, loadProblems]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -1395,6 +1421,9 @@
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks.filter(isPersistentTask)); }, []),
           categories: (boardData && boardData.categories) || [],
+          problems: problems,
+          onAcceptProblem: acceptProblem,
+          onDismissProblem: dismissProblem,
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
@@ -2765,6 +2794,88 @@
   }
 
   // -------------------------------------------------------------------------
+  // Проблемы — per-board findings as draft cards (task t_e9b93153)
+  //
+  // Rendered as the last section after the trash zone, hidden when empty.
+  // Each card explains a finding + its proposed fix; "В бэклог" converts it
+  // into a real triage task on this board, "Отклонить" puts it to rest.
+  // System/global findings (board='') are NOT shown here — they live in the
+  // top-level Проблемы menu so they're never buried in a project.
+  // -------------------------------------------------------------------------
+
+  const PROBLEM_TONE_COLOR = {
+    info: "#8a94a6", warning: "#ff9e3b", error: "#ff6b3d", critical: "#ff4d4d",
+  };
+  const PROBLEM_TONE_LABEL = {
+    info: "инфо", warning: "внимание", error: "ошибка", critical: "критично",
+  };
+
+  function ProblemCard(props) {
+    const p = props.problem;
+    const [busy, setBusy] = useState(false);
+    const color = PROBLEM_TONE_COLOR[p.tone] || PROBLEM_TONE_COLOR.info;
+    const act = function (fn) {
+      setBusy(true);
+      Promise.resolve(fn(p.id)).finally(function () { setBusy(false); });
+    };
+    return h("div", {
+      className: "hermes-kanban-card hermes-kanban-problem-card",
+      style: { borderLeft: `3px solid ${color}` },
+    },
+      h("div", { className: "hermes-kanban-problem-head" },
+        h("span", { className: "hermes-kanban-problem-title" }, p.title || "Проблема"),
+        h(Badge, { variant: "outline", style: { color: color, borderColor: color } },
+          PROBLEM_TONE_LABEL[p.tone] || p.tone),
+        p.source ? h(Badge, { variant: "outline" }, p.source) : null,
+        p.category ? h(Badge, { variant: "outline" }, p.category) : null,
+      ),
+      p.explanation
+        ? h("div", { className: "hermes-kanban-problem-body" }, p.explanation)
+        : null,
+      p.proposed
+        ? h("div", { className: "hermes-kanban-problem-fix" },
+            h("div", { className: "hermes-kanban-problem-fix-label" },
+              "Предложенное решение"),
+            h("div", null, p.proposed),
+          )
+        : null,
+      h("div", { className: "hermes-kanban-problem-actions" },
+        h(Button, {
+          size: "sm", variant: "outline", disabled: busy,
+          onClick: function () { act(props.onDismiss); },
+        }, "Отклонить"),
+        h(Button, {
+          size: "sm", disabled: busy,
+          onClick: function () { act(props.onAccept); },
+        }, "В бэклог"),
+      ),
+    );
+  }
+
+  function ProblemsColumn(props) {
+    return h("div", {
+      "data-kanban-column": "__problems__",
+      className: "hermes-kanban-column hermes-kanban-problems-column",
+    },
+      h("div", { className: "hermes-kanban-column-header" },
+        h("span", { className: "hermes-kanban-dot hermes-kanban-problems-dot" }),
+        h("span", { className: "hermes-kanban-column-label" }, "Проблемы"),
+        h("span", { className: "hermes-kanban-column-count",
+                    title: `${props.problems.length} problem(s)` },
+          props.problems.length),
+      ),
+      h("div", { className: "hermes-kanban-column-body" },
+        props.problems.map(function (p) {
+          return h(ProblemCard, {
+            key: p.id, problem: p,
+            onAccept: props.onAccept, onDismiss: props.onDismiss,
+          });
+        }),
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // Columns
   // -------------------------------------------------------------------------
 
@@ -2903,6 +3014,14 @@
         selectedIds: props.selectedIds,
         onDelete: props.onDelete,
       }),
+      // Проблемы section — last, after the trash zone; hidden when empty.
+      (props.problems && props.problems.length)
+        ? h(ProblemsColumn, {
+            problems: props.problems,
+            onAccept: props.onAcceptProblem,
+            onDismiss: props.onDismissProblem,
+          })
+        : null,
     );
   }
 

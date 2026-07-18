@@ -21,6 +21,7 @@ import {
 } from "react-router-dom";
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   BookOpen,
   Clock,
@@ -88,6 +89,7 @@ import AnalyticsPage from "@/pages/AnalyticsPage";
 import ModelsPage from "@/pages/ModelsPage";
 import CronPage from "@/pages/CronPage";
 import RegularPage from "@/pages/RegularPage";
+import ProblemsPage from "@/pages/ProblemsPage";
 import PacingPage from "@/pages/PacingPage";
 import ProfilesPage from "@/pages/ProfilesPage";
 import ProfileBuilderPage from "@/pages/ProfileBuilderPage";
@@ -155,6 +157,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/logs": LogsPage,
   "/cron": CronPage,
   "/regular": RegularPage,
+  "/problems": ProblemsPage,
   "/pacing": PacingPage,
   "/skills": SkillsPage,
   "/plugins": PluginsPage,
@@ -201,6 +204,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
   { path: "/regular", label: "Регулярные", icon: Repeat },
+  { path: "/problems", label: "Проблемы", icon: AlertTriangle },
   { path: "/pacing", label: "Лимиты", icon: Gauge },
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
   { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },

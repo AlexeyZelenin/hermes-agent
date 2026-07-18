@@ -603,6 +603,22 @@ export const api = {
       { method: "POST" },
     ),
 
+  // Проблемы — browse the findings store as draft cards. The global page
+  // passes board="" (system-level findings only); accept converts a finding
+  // into a real triage backlog card, dismiss puts it to rest.
+  getProblems: (board = "") =>
+    fetchJSON<ProblemsResponse>(
+      `/api/problems?board=${encodeURIComponent(board)}`,
+    ),
+  acceptProblem: (id: number) =>
+    fetchJSON<ProblemActionResult>(`/api/problems/${id}/accept`, {
+      method: "POST",
+    }),
+  dismissProblem: (id: number) =>
+    fetchJSON<ProblemActionResult>(`/api/problems/${id}/dismiss`, {
+      method: "POST",
+    }),
+
   // Token/limit panel — per-pocket pacing state + windowed token spend
   getZeusPacing: (board = "") =>
     fetchJSON<ZeusPacing>(
@@ -2291,6 +2307,40 @@ export interface CronRegistry {
   crons: CronRegistryRow[];
   ticker: CronRegistryTicker;
   period_days: number;
+}
+
+export type ProblemTone = "info" | "warning" | "error" | "critical";
+
+export interface Problem {
+  id: number;
+  board: string;
+  source: string;
+  finding_key: string;
+  title: string;
+  explanation: string;
+  proposed: string;
+  severity: string;
+  severity_rank: number;
+  tone: ProblemTone;
+  category: string;
+  evidence: unknown[];
+  status: string;
+  converted_task_id: string;
+  created_at: number | null;
+  updated_at: number | null;
+}
+
+export interface ProblemsResponse {
+  problems: Problem[];
+  board: string;
+  count: number;
+}
+
+export interface ProblemActionResult {
+  ok: boolean;
+  error?: string;
+  task_id?: string;
+  board?: string;
 }
 
 export interface CronRegistryFinding {

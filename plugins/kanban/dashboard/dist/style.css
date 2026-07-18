@@ -1778,3 +1778,57 @@
 .hermes-kanban-context-menu-item--danger:hover {
   background: color-mix(in srgb, var(--color-destructive, #d14a4a) 12%, transparent);
 }
+
+/* ---- Проблемы — per-board findings section (task t_e9b93153) --------- */
+
+/* Amber dot to echo the top-level Проблемы menu icon. */
+.hermes-kanban-problems-dot { background: #ff9e3b; }
+
+.hermes-kanban-problem-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  cursor: default;
+}
+
+.hermes-kanban-problem-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.hermes-kanban-problem-title {
+  font-weight: 600;
+  margin-right: 0.15rem;
+}
+
+.hermes-kanban-problem-body {
+  font-size: 0.78rem;
+  color: var(--color-muted-foreground);
+  white-space: pre-wrap;
+}
+
+.hermes-kanban-problem-fix {
+  border: 1px solid color-mix(in srgb, var(--color-border) 60%, transparent);
+  background: color-mix(in srgb, var(--color-muted, #888) 12%, transparent);
+  border-radius: var(--radius-sm, 0.25rem);
+  padding: 0.4rem 0.5rem;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+}
+
+.hermes-kanban-problem-fix-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--color-muted-foreground);
+  margin-bottom: 0.2rem;
+}
+
+.hermes-kanban-problem-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
