@@ -83,6 +83,58 @@ def _report_usage(client, executor, task_id, subscription=None):
                     cost_usd=context.get("cost_usd"))
     except Exception:
         pass
+def _live_usage_snapshot(client):
+    """Current live token/cost figures for a running ACP session, or None.
+
+    Mid-run the adapter only streams context occupancy (``context_used``) and a
+    cumulative ``cost_usd`` - the real per-turn token totals arrive only when
+    the session/prompt returns. So we surface occupancy as a rough live token
+    proxy plus the accurate cumulative cost; the final ledger row corrects both
+    when the run ends. None until the first usage_update lands."""
+    context = getattr(client, "last_context", None) or {}
+    used = context.get("context_used")
+    size = context.get("context_size")
+    cost = context.get("cost_usd")
+    if not used and cost is None:
+        return None
+    return {
+        "session_id": getattr(client, "last_session_id", "") or "",
+        "total_tokens": int(used or 0),
+        "cost_usd": float(cost) if cost is not None else None,
+        "context_used": int(used) if used is not None else None,
+        "context_size": int(size) if size is not None else None,
+    }
+def _start_live_usage_flusher(client_box, task_id, board, run_id):
+    """Daemon that flushes the running session's live usage to kanban.db every
+    ~40s so the dashboard card shows a token/cost counter before the final zeus
+    ledger row lands. Returns (thread, stop_event), or (None, None) when
+    disabled (``HERMES_ACP_LIVE_USAGE_SECONDS<=0``). Best-effort throughout: a
+    DB error never disturbs the session. ``client_box`` is a mutable holder the
+    session runner fills once the client exists (it may rotate on a limit)."""
+    import threading
+    from hermes_cli import kanban_db as kb
+    try:
+        interval = float(os.getenv("HERMES_ACP_LIVE_USAGE_SECONDS", "40") or "40")
+    except ValueError:
+        interval = 40.0
+    if interval <= 0:
+        return None, None
+    stop = threading.Event()
+    def _loop():
+        while not stop.wait(interval):
+            client = client_box.get("client")
+            if client is None:
+                continue
+            try:
+                snap = _live_usage_snapshot(client)
+                if snap is None:
+                    continue
+                kb.record_live_usage(task_id, run_id=run_id, board=board, **snap)
+            except Exception:
+                pass
+    t = threading.Thread(target=_loop, name=f"live-usage-{task_id}", daemon=True)
+    t.start()
+    return t, stop
 def _contributed_worker_env(task_id, board=None, subscription=None, run_id=None):
     """Plugin-contributed env for a spawning ACP worker, merged before spawn.
 
@@ -194,7 +246,7 @@ def _salvage_partial_output(task_id, board, client):
                            body="partial handoff (limit-interrupted)\n\n" + partial)
     except Exception:
         pass
-def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None, tool_activity_sink=None, run_id=None):
+def _run_claude_code_session(command, args, workspace, prompt, timeout, model, task_id, follow_up=None, board=None, effort=None, tool_activity_sink=None, run_id=None, client_box=None):
     """Run the prompt on the Claude subscription pool, rotating on usage limits.
 
     Each session gets CLAUDE_CONFIG_DIR pinned to a leased subscription dir
@@ -209,6 +261,7 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
         extra_env = _contributed_worker_env(task_id, board, None, run_id) or None
         client = _new_client(command, args, workspace, model, extra_env=extra_env,
                              effort=effort, tool_activity_sink=tool_activity_sink)
+        if client_box is not None: client_box["client"] = client
         text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
         return text, client, None
     while True:
@@ -224,6 +277,7 @@ def _run_claude_code_session(command, args, workspace, prompt, timeout, model, t
             client = _new_client(command, args, workspace, model,
                                  extra_env=extra_env,
                                  effort=effort, tool_activity_sink=tool_activity_sink)
+            if client_box is not None: client_box["client"] = client
             text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
             # A completed session/prompt is structurally NOT a limit/auth death:
             # the request succeeded and this is the task's handoff. Substring-
@@ -269,11 +323,22 @@ def run_task(*, executor, task_id, workspace, board=None):
         subscription=None
         follow_up=(lambda: _drain_steer(task_id, board)) if _steering_enabled() else None
         tool_sink=_make_tool_activity_sink(task_id, board, run_id) if _tool_feed_enabled() else None
-        if executor == "claude-code":
-            text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort,tool_sink,run_id)
-        else:
-            client=_new_client(command,args,workspace,model,effort=effort,tool_activity_sink=tool_sink)
-            text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
+        # Live token counter for the running card: a daemon flushes the session's
+        # in-flight usage to kanban.db until the final ledger row lands (#t_d0cda94e).
+        client_box={}
+        kb.clear_live_usage(task_id, board=board)  # drop any stale row from a prior run
+        flush_thread,flush_stop=_start_live_usage_flusher(client_box,task_id,board,run_id)
+        try:
+            if executor == "claude-code":
+                text,client,subscription=_run_claude_code_session(command,args,workspace,prompt,timeout,model,task_id,follow_up,board,effort,tool_sink,run_id,client_box)
+            else:
+                client=_new_client(command,args,workspace,model,effort=effort,tool_activity_sink=tool_sink)
+                client_box["client"]=client
+                text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
+        finally:
+            if flush_stop is not None:
+                flush_stop.set()
+            kb.clear_live_usage(task_id, board=board)  # final ledger row takes over
         _report_usage(client,executor,task_id,subscription)
     except Exception as exc:
         with kb.connect_closing(board=board) as conn: kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)

@@ -778,3 +778,93 @@ def test_tool_feed_toggle_env(monkeypatch):
     assert executor._tool_feed_enabled() is False
     monkeypatch.setenv("HERMES_ACP_TOOL_FEED", "off")
     assert executor._tool_feed_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# Live token usage flush for running cards (#t_d0cda94e)
+# ---------------------------------------------------------------------------
+
+def test_live_usage_snapshot_from_context():
+    from agent import acp_task_executor as executor
+
+    class C:
+        last_session_id = "sess-9"
+        last_context = {"context_used": 1234, "context_size": 5000, "cost_usd": 0.42}
+
+    snap = executor._live_usage_snapshot(C())
+    assert snap == {
+        "session_id": "sess-9",
+        "total_tokens": 1234,
+        "cost_usd": 0.42,
+        "context_used": 1234,
+        "context_size": 5000,
+    }
+
+
+def test_live_usage_snapshot_none_before_first_update():
+    from agent import acp_task_executor as executor
+
+    class Empty:
+        last_context = None
+
+    class Blank:
+        last_context = {}
+
+    assert executor._live_usage_snapshot(Empty()) is None
+    assert executor._live_usage_snapshot(Blank()) is None
+
+
+def test_live_usage_snapshot_cost_only():
+    """A cost update with no occupancy still yields a (zero-token) snapshot."""
+    from agent import acp_task_executor as executor
+
+    class C:
+        last_session_id = ""
+        last_context = {"context_used": 0, "cost_usd": 0.05}
+
+    snap = executor._live_usage_snapshot(C())
+    assert snap["total_tokens"] == 0
+    assert snap["cost_usd"] == 0.05
+
+
+def test_live_usage_flusher_disabled_when_interval_non_positive(monkeypatch):
+    from agent import acp_task_executor as executor
+
+    monkeypatch.setenv("HERMES_ACP_LIVE_USAGE_SECONDS", "0")
+    thread, stop = executor._start_live_usage_flusher({}, "t_x", "board", 1)
+    assert thread is None and stop is None
+
+
+def test_live_usage_flusher_records_snapshot(monkeypatch):
+    from agent import acp_task_executor as executor
+    import threading
+
+    recorded = []
+    fired = threading.Event()
+
+    def fake_record(task_id, **kw):
+        recorded.append((task_id, kw))
+        fired.set()
+
+    monkeypatch.setattr(kb, "record_live_usage", fake_record)
+    monkeypatch.setenv("HERMES_ACP_LIVE_USAGE_SECONDS", "0.02")
+
+    class C:
+        last_session_id = "s1"
+        last_context = {"context_used": 777, "context_size": 5000, "cost_usd": 0.42}
+
+    thread, stop = executor._start_live_usage_flusher({"client": C()}, "t_y", "board", 9)
+    try:
+        assert fired.wait(2.0), "flusher never recorded a snapshot"
+    finally:
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=2)
+    task_id, kw = recorded[0]
+    assert task_id == "t_y"
+    assert kw["run_id"] == 9
+    assert kw["board"] == "board"
+    assert kw["session_id"] == "s1"
+    assert kw["total_tokens"] == 777
+    assert kw["cost_usd"] == 0.42

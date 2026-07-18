@@ -209,6 +209,36 @@ def _board_token_costs(
     return out
 
 
+def _with_live_token_cost(
+    base: Optional[dict[str, Any]],
+    live: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Overlay a running task's live token snapshot onto its ROI badge (#t_d0cda94e).
+
+    ``base`` is the zeus-ledger ``token_cost`` (spend from prior finished runs)
+    or None; ``live`` is the kanban live snapshot for the in-flight run or None.
+    Adds the live figures onto the card's ``own`` block and flags the badge
+    ``live`` so the UI reads it as in-flight (occupancy-based token proxy plus
+    the accurate cumulative cost — the final ledger row corrects both on
+    completion). Returns ``base`` unchanged when there is no live row.
+    """
+    if not live:
+        return base
+    tc = dict(base) if base else {}
+    own = dict(tc.get("own") or {})
+    own["total_tokens"] = int(own.get("total_tokens") or 0) + int(live.get("total_tokens") or 0)
+    own.setdefault("prompt_tokens", 0)
+    own.setdefault("completion_tokens", 0)
+    live_cost = live.get("cost_usd")
+    if live_cost is not None:
+        own["cost_usd"] = round(float(own.get("cost_usd") or 0.0) + float(live_cost), 4)
+    elif "cost_usd" not in own:
+        own["cost_usd"] = None
+    tc["own"] = own
+    tc["live"] = True
+    return tc
+
+
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
     return {
         "id": event.id,
@@ -501,6 +531,12 @@ def get_board(
         # the ledger is absent so the cards simply carry no cost badge.
         token_costs = _board_token_costs([t.id for t in tasks], children_map)
 
+        # Live token counter for still-running cards: overlay the in-flight
+        # snapshot the worker flushes (#t_d0cda94e) so a running card shows a
+        # counter before its final ledger row lands.
+        running_ids = [t.id for t in tasks if t.status == "running"]
+        live_usage = kanban_db.live_usages(conn, running_ids) if running_ids else {}
+
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
@@ -511,6 +547,8 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             tc = token_costs.get(t.id)
+            if t.status == "running":
+                tc = _with_live_token_cost(tc, live_usage.get(t.id))
             if tc:
                 d["token_cost"] = tc  # omitted when the card burned no tokens
             diags = diagnostics_per_task.get(t.id)
@@ -636,6 +674,10 @@ def get_task(
             if zeus_conn is not None:
                 zeus_conn.close()
         tc = zeus_tokens.token_cost(task_id, per_task, subtree)
+        if task_d.get("status") == "running":
+            tc = _with_live_token_cost(
+                tc, kanban_db.live_usages(conn, [task_id]).get(task_id)
+            )
         if tc:
             task_d["token_cost"] = tc
         return {

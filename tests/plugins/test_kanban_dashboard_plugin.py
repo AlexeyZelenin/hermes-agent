@@ -2800,3 +2800,66 @@ def test_patch_task_unknown_category_rejected(client):
     tid = client.post("/api/plugins/kanban/tasks", json={"title": "t"}).json()["task"]["id"]
     r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"category": "ghost"})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Live token counter on running cards (#t_d0cda94e)
+# ---------------------------------------------------------------------------
+
+def _force_running(task_id):
+    """Drive a task straight to ``running`` for overlay tests (bypasses the
+    dispatcher; the live overlay only reads ``status``)."""
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='running' WHERE id=?", (task_id,)
+            )
+
+
+def test_running_card_shows_live_counter_without_ledger(client, kanban_home):
+    """A running task with no finished-run ledger row still gets a live badge."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "live"}).json()["task"]
+    _force_running(t["id"])
+    kb.record_live_usage(
+        t["id"], total_tokens=150_000, cost_usd=1.25,
+        context_used=150_000, context_size=1_000_000,
+    )
+    card = _find_card(client.get("/api/plugins/kanban/board").json(), t["id"])
+    assert card is not None
+    tc = card["token_cost"]
+    assert tc["live"] is True
+    assert tc["own"]["total_tokens"] == 150_000
+    assert tc["own"]["cost_usd"] == pytest.approx(1.25)
+
+
+def test_running_card_live_adds_to_prior_run_ledger(client, kanban_home):
+    """The live snapshot stacks on top of prior finished runs' ledger spend."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "rerun"}).json()["task"]
+    _seed_zeus(kanban_home, [(t["id"], 1.0, 200, 100, 300, 0.20)])
+    _force_running(t["id"])
+    kb.record_live_usage(t["id"], total_tokens=100, cost_usd=0.10)
+    card = _find_card(client.get("/api/plugins/kanban/board").json(), t["id"])
+    tc = card["token_cost"]
+    assert tc["live"] is True
+    assert tc["own"]["total_tokens"] == 400  # 300 prior + 100 live
+    assert tc["own"]["cost_usd"] == pytest.approx(0.30)
+
+
+def test_non_running_card_ignores_live_rows(client, kanban_home):
+    """A stale live row on a non-running card is never overlaid."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "idle"}).json()["task"]
+    kb.record_live_usage(t["id"], total_tokens=999, cost_usd=9.0)
+    card = _find_card(client.get("/api/plugins/kanban/board").json(), t["id"])
+    assert card is not None
+    assert "token_cost" not in card  # not running, no ledger -> no badge
+
+
+def test_task_detail_running_includes_live_counter(client, kanban_home):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "detail-live"}).json()["task"]
+    _force_running(t["id"])
+    kb.record_live_usage(t["id"], total_tokens=42_000, cost_usd=0.5)
+    detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()
+    tc = detail["task"]["token_cost"]
+    assert tc["live"] is True
+    assert tc["own"]["total_tokens"] == 42_000
+    assert tc["own"]["cost_usd"] == pytest.approx(0.5)

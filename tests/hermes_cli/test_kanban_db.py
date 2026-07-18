@@ -5221,3 +5221,65 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Live token usage for running tasks (#t_d0cda94e)
+# ---------------------------------------------------------------------------
+
+def test_live_usage_roundtrip(kanban_home):
+    kb.record_live_usage(
+        "t_live1", run_id=7, session_id="sess-a", total_tokens=150_000,
+        cost_usd=1.25, context_used=150_000, context_size=1_000_000,
+    )
+    with kb.connect() as conn:
+        got = kb.live_usages(conn, ["t_live1", "t_absent"])
+    assert set(got) == {"t_live1"}
+    row = got["t_live1"]
+    assert row["run_id"] == 7
+    assert row["total_tokens"] == 150_000
+    assert row["cost_usd"] == 1.25
+    assert row["context_used"] == 150_000
+    assert row["context_size"] == 1_000_000
+
+
+def test_live_usage_upsert_keeps_one_row(kanban_home):
+    kb.record_live_usage("t_live2", total_tokens=100, cost_usd=0.1)
+    kb.record_live_usage("t_live2", total_tokens=250, cost_usd=0.3)
+    with kb.connect() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM live_task_usage WHERE task_id='t_live2'"
+        ).fetchone()[0]
+        got = kb.live_usages(conn, ["t_live2"])
+    assert n == 1
+    assert got["t_live2"]["total_tokens"] == 250
+    assert got["t_live2"]["cost_usd"] == 0.3
+
+
+def test_live_usage_clear(kanban_home):
+    kb.record_live_usage("t_live3", total_tokens=42)
+    kb.clear_live_usage("t_live3")
+    with kb.connect() as conn:
+        got = kb.live_usages(conn, ["t_live3"])
+    assert got == {}
+
+
+def test_live_usage_ignores_stale_rows(kanban_home):
+    kb.record_live_usage("t_live4", total_tokens=999)
+    # Age the row well past the freshness window (dead worker, no cleanup).
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE live_task_usage SET updated_at = ? WHERE task_id = ?",
+                (int(time.time()) - 3600, "t_live4"),
+            )
+    with kb.connect() as conn:
+        fresh = kb.live_usages(conn, ["t_live4"], max_age_seconds=600)
+        loose = kb.live_usages(conn, ["t_live4"], max_age_seconds=7200)
+    assert fresh == {}
+    assert "t_live4" in loose
+
+
+def test_live_usage_empty_ids_no_query(kanban_home):
+    with kb.connect() as conn:
+        assert kb.live_usages(conn, []) == {}

@@ -1599,6 +1599,24 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Live token usage for a still-running task (#t_d0cda94e). The zeus ledger
+-- only lands a token_usage row when a run FINISHES, so a running card would
+-- show a spinner but no counter. The ACP worker flushes a snapshot here every
+-- ~30-60s while the session is live (context occupancy as a token proxy plus
+-- the cumulative cost the adapter streams); the dashboard overlays it onto the
+-- running card's ``token_cost`` badge. Exactly one row per task (upsert on
+-- ``task_id``), deleted when the run ends and the real ledger row takes over.
+CREATE TABLE IF NOT EXISTS live_task_usage (
+    task_id       TEXT PRIMARY KEY,
+    run_id        INTEGER,
+    session_id    TEXT NOT NULL DEFAULT '',
+    total_tokens  INTEGER NOT NULL DEFAULT 0,
+    cost_usd      REAL,
+    context_used  INTEGER,
+    context_size  INTEGER,
+    updated_at    INTEGER NOT NULL
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -3664,6 +3682,101 @@ def append_task_event(
     with connect_closing(board=board) as conn:
         with write_txn(conn):
             _append_event(conn, task_id, kind, payload, run_id=run_id)
+
+
+def record_live_usage(
+    task_id: str,
+    *,
+    run_id: Optional[int] = None,
+    session_id: str = "",
+    total_tokens: int = 0,
+    cost_usd: Optional[float] = None,
+    context_used: Optional[int] = None,
+    context_size: Optional[int] = None,
+    board: Optional[str] = None,
+) -> None:
+    """Upsert the running task's live token snapshot (#t_d0cda94e).
+
+    Called periodically by the out-of-process ACP worker while its session is
+    live, so the dashboard can show a token counter before the final zeus
+    ledger row lands. Opens its own connection (like :func:`append_task_event`)
+    and keeps exactly one row per task. Superseded by the real ledger row once
+    the run ends and :func:`clear_live_usage` removes this row.
+    """
+    now = int(time.time())
+    with connect_closing(board=board) as conn:
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO live_task_usage "
+                "(task_id, run_id, session_id, total_tokens, cost_usd, "
+                " context_used, context_size, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                " run_id=excluded.run_id, session_id=excluded.session_id, "
+                " total_tokens=excluded.total_tokens, cost_usd=excluded.cost_usd, "
+                " context_used=excluded.context_used, "
+                " context_size=excluded.context_size, updated_at=excluded.updated_at",
+                (task_id, run_id, session_id, int(total_tokens or 0), cost_usd,
+                 context_used, context_size, now),
+            )
+
+
+def clear_live_usage(task_id: str, *, board: Optional[str] = None) -> None:
+    """Drop a task's live token snapshot once its run has ended.
+
+    Best-effort: the real zeus ledger row takes over for a finished task, so a
+    stale live row would only double-show. Also called defensively before a new
+    run's first flush. A missing table (older DB) degrades silently.
+    """
+    try:
+        with connect_closing(board=board) as conn:
+            with write_txn(conn):
+                conn.execute("DELETE FROM live_task_usage WHERE task_id = ?", (task_id,))
+    except sqlite3.OperationalError:
+        pass
+
+
+def live_usages(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    max_age_seconds: int = 600,
+) -> dict[str, dict[str, Any]]:
+    """Fresh live token snapshots for ``task_ids`` (#t_d0cda94e).
+
+    Returns ``{task_id: {"total_tokens", "cost_usd", "context_used",
+    "context_size", "run_id", "updated_at"}}`` for rows updated within
+    ``max_age_seconds`` — a stale row (worker died without cleanup) is ignored
+    so a dead task never keeps a phantom counter. A missing table (older DB)
+    yields ``{}``.
+    """
+    ids = [tid for tid in dict.fromkeys(task_ids) if tid]
+    if not ids:
+        return {}
+    cutoff = int(time.time()) - int(max_age_seconds)
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                "SELECT task_id, run_id, total_tokens, cost_usd, context_used, "
+                " context_size, updated_at FROM live_task_usage "
+                f"WHERE task_id IN ({placeholders}) AND updated_at >= ?",
+                (*chunk, cutoff),
+            ).fetchall()
+            for r in rows:
+                out[r["task_id"]] = {
+                    "run_id": r["run_id"],
+                    "total_tokens": int(r["total_tokens"] or 0),
+                    "cost_usd": float(r["cost_usd"]) if r["cost_usd"] is not None else None,
+                    "context_used": r["context_used"],
+                    "context_size": r["context_size"],
+                    "updated_at": int(r["updated_at"]),
+                }
+    except sqlite3.OperationalError:
+        return {}
+    return out
 
 
 def _end_run(
