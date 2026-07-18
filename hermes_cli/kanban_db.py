@@ -1992,13 +1992,144 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
+# ---------------------------------------------------------------------------
+# Auto-repair: index-only corruption
+# ---------------------------------------------------------------------------
+#
+# Under a dispatcher burst ~10 worker processes hammer ``task_events`` (one row
+# per tool_call when the live tool-call feed is on), and the hot
+# ``idx_events_task`` index has twice been left with "wrong # of entries" /
+# "row N missing from index" — a logical index/table mismatch, NOT structural
+# page damage. The base tables still hold every row, so ``REINDEX`` rebuilds the
+# indexes from them and the DB is whole again (verified: integrity_check returns
+# ``ok`` and every row survives). Repairing here lets a hot-index corruption
+# self-heal on the next connect instead of quarantining the board and stalling
+# dispatch until an operator runs REINDEX by hand.
+#
+# Fail-closed contract: auto-REINDEX runs ONLY when EVERY integrity_check
+# problem is one of these index-content mismatches. Any other message (malformed
+# page, freelist damage, "database disk image is malformed", a NOT NULL / CHECK
+# violation) means the b-tree itself may be damaged — REINDEX cannot fix that and
+# would only write into a corrupt file — so those still back up and raise.
+_INDEX_ONLY_CORRUPTION_MARKERS: tuple[str, ...] = (
+    "wrong # of entries in index",
+    "missing from index",  # "row N missing from index NAME"
+    "non-unique entry in index",
+)
+
+
+def _integrity_rows_are_index_only(problems: list[str]) -> bool:
+    """True iff every reported integrity_check problem is a REINDEX-fixable
+    index-content mismatch. Empty input or any unrecognised row → False."""
+    cleaned = [p.strip().lower() for p in problems if p and p.strip().lower() != "ok"]
+    if not cleaned:
+        return False
+    return all(
+        any(marker in problem for marker in _INDEX_ONLY_CORRUPTION_MARKERS)
+        for problem in cleaned
+    )
+
+
+# connect() drains these into ``engine_log`` after the DB is fully open, so an
+# auto-repair surfaces in the operator "под капотом" viewer, not only the
+# process logger. Keyed by resolved path; each entry is recorded once.
+_PENDING_REPAIR_ALERTS: dict[str, dict[str, Any]] = {}
+_REPAIR_ALERT_LOCK = threading.Lock()
+
+
+def _attempt_index_reindex_repair(resolved: Path, problems: list[str]) -> bool:
+    """Rebuild all indexes on an index-corrupt DB in place and re-verify.
+
+    Precondition: :func:`_integrity_rows_are_index_only` is True for
+    ``problems`` — the base tables are intact, so ``REINDEX`` rebuilds every
+    index from them. Returns True iff a follow-up ``PRAGMA integrity_check``
+    passes; any failure (locked, REINDEX raised, still corrupt) → False and the
+    caller quarantines + raises as before.
+
+    The pre-repair bytes are backed up first (content-addressed, incl. WAL/SHM)
+    so an in-place rebuild can never be the only copy if it somehow worsens the
+    file.
+    """
+    backup = _backup_corrupt_db(resolved)
+    row: Optional[tuple] = None
+    conn = None
+    try:
+        conn = _sqlite_connect(resolved)
+        conn.execute("REINDEX")
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+    except sqlite3.Error as exc:
+        _log.error(
+            "kanban auto-repair: REINDEX of %s failed: %s (pre-repair backup=%s)",
+            resolved, exc, backup,
+        )
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if not row or (row[0] or "").lower() != "ok":
+        _log.error(
+            "kanban auto-repair: REINDEX of %s did NOT clear corruption "
+            "(post-check=%r); refusing to open. Pre-repair backup=%s",
+            resolved, row[0] if row else None, backup,
+        )
+        return False
+    _log.error(
+        "kanban auto-repair: REINDEX fixed index-only corruption in %s [%s]; "
+        "pre-repair bytes backed up at %s. ROOT CAUSE remains: concurrent "
+        "task_events writers can re-corrupt the hot index — see kanban task "
+        "t_5f71dfc4.",
+        resolved, "; ".join(problems)[:400], backup,
+    )
+    with _REPAIR_ALERT_LOCK:
+        _PENDING_REPAIR_ALERTS[str(resolved)] = {
+            "problems": problems[:20],
+            "backup": str(backup) if backup is not None else None,
+        }
+    return True
+
+
+def _drain_repair_alert(conn: sqlite3.Connection, resolved: str) -> None:
+    """Best-effort: record a just-completed auto-repair to ``engine_log``.
+
+    Runs after ``connect()`` has fully opened+initialised the DB, so the write
+    goes to a healthy connection. Never raises — an alerting failure must not
+    break opening the board.
+    """
+    with _REPAIR_ALERT_LOCK:
+        alert = _PENDING_REPAIR_ALERTS.pop(resolved, None)
+    if alert is None:
+        return
+    try:
+        record_log(
+            conn,
+            source="operator",
+            event="kanban.db auto-repaired: REINDEX fixed index corruption",
+            severity="error",
+            category="self_heal",
+            payload={
+                "path": resolved,
+                "problems": alert["problems"],
+                "pre_repair_backup": alert["backup"],
+                "root_cause": "concurrent task_events writers (t_5f71dfc4)",
+            },
+        )
+    except Exception:
+        _log.debug("kanban auto-repair: engine_log alert failed", exc_info=True)
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
     Opens the probe in read/write mode so SQLite can recover or
     checkpoint a healthy WAL/hot-journal DB before we declare it
-    corrupt. If the file is malformed, copy it (and any WAL/SHM
-    sidecars) to a timestamped backup and raise
+    corrupt. If the damage is confined to index content (see
+    :func:`_integrity_rows_are_index_only`), attempt an in-place
+    ``REINDEX`` first — a hot-index desync self-heals rather than
+    wedging the board. If the file is otherwise malformed, copy it (and
+    any WAL/SHM sidecars) to a backup and raise
     :class:`KanbanDbCorruptError` so callers cannot silently recreate
     the schema on top of a damaged DB.
 
@@ -2031,20 +2162,34 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if str(resolved) in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
+    problems: list[str] = []
     try:
         probe = _sqlite_connect(resolved)
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
+            rows = probe.execute("PRAGMA integrity_check").fetchall()
         finally:
             probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        problems = [str(r[0]) for r in rows if r and r[0] is not None]
+        first = problems[0] if problems else None
+        if not problems or (first or "").lower() != "ok":
+            reason = (
+                f"integrity_check returned {(first if first is not None else '<no row>')!r}"
+            )
     except sqlite3.OperationalError:
         # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
+        return
+    # Index-only corruption (e.g. idx_events_task desynced under a concurrent
+    # writer burst) is repairable in place: REINDEX rebuilds the indexes from
+    # the intact base tables. Try it before quarantining so the board self-heals
+    # instead of wedging dispatch. Structural/page corruption is excluded by
+    # _integrity_rows_are_index_only and still fails closed below.
+    if _integrity_rows_are_index_only(problems) and _attempt_index_reindex_repair(
+        resolved, problems
+    ):
         return
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
@@ -2153,6 +2298,9 @@ def connect(
         except Exception:
             conn.close()
             raise
+    # If _guard_existing_db_is_healthy auto-repaired an index corruption above,
+    # surface it in the operator engine_log now that the connection is healthy.
+    _drain_repair_alert(conn, resolved)
     return conn
 
 
