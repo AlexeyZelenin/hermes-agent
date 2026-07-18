@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import provider_health
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -2296,6 +2297,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "current_run_id" not in cols:
         _add_column_if_missing(
             conn, "tasks", "current_run_id", "current_run_id INTEGER"
+        )
+    # Zero-activity watchdog probe (task t_08676525). ``activity_probe_bytes``
+    # is the last observed worker-log size; ``activity_probe_at`` is the epoch
+    # at which activity (log growth OR a fresh heartbeat) was last seen. Seeded
+    # on spawn, advanced each tick by ``detect_zero_activity``; NULL on legacy /
+    # pre-spawn rows (the watchdog seeds them on first sighting).
+    if "activity_probe_bytes" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "activity_probe_bytes", "activity_probe_bytes INTEGER"
+        )
+    if "activity_probe_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "activity_probe_at", "activity_probe_at INTEGER"
         )
     if "workflow_template_id" not in cols:
         _add_column_if_missing(
@@ -7422,6 +7436,9 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    zero_activity: list[str] = field(default_factory=list)
+    """Task ids reclaimed by the zero-activity watchdog — no heartbeat AND no
+    worker-log growth within ``dispatch_zero_activity_timeout_seconds`` (t_08676525)."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -7902,6 +7919,45 @@ def enforce_max_runtime(
 # to match the original spec (">4h started + no commits in 1h").
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
+# Zero-activity watchdog default window (task t_08676525). A running worker that
+# advances NO activity signal — neither its heartbeat (bridged from any tool/API
+# traffic) nor its worker-log size — for this many seconds is treated as wedged
+# and reclaimed. Far tighter than ``detect_stale_running`` (4h) because the
+# incident it fixes hung for 11 min with 0 tokens / 0 CPU / a static log before a
+# human killed it. Configurable via ``kanban.dispatch_zero_activity_timeout_seconds``;
+# 0 disables the watchdog entirely.
+DEFAULT_ZERO_ACTIVITY_TIMEOUT_SECONDS = 900
+
+# How long a provider is auto-blacklisted after a zero-activity hang is blamed
+# on it, so the respawned task is not immediately handed back to the same broken
+# channel. Operator pause (provider_health.pause) is separate and sticky.
+_ZERO_ACTIVITY_PROVIDER_TTL_SECONDS = 1800
+
+
+def provider_for_task(task: "Task") -> Optional[str]:
+    """The dispatcher-visible provider identity for ``task``, or ``None``.
+
+    External ACP executors (``claude-code`` / ``codex``) run their session
+    against an ACP channel the executor labels ``acp-<executor>`` on its run
+    metadata; that label is the health key (see
+    :mod:`hermes_cli.provider_health`). The in-process ``hermes-worker`` has no
+    external ACP channel to gate — its provider fallback is handled inside the
+    worker's own auxiliary-client chain — so it returns ``None`` and is never
+    provider-gated here.
+    """
+    executor = (getattr(task, "executor", None) or "").strip()
+    if executor in ("claude-code", "codex"):
+        return f"acp-{executor}"
+    return None
+
+
+def _provider_for_executor(executor: Optional[str]) -> Optional[str]:
+    """Row-level twin of :func:`provider_for_task` (takes the raw executor)."""
+    executor = (executor or "").strip()
+    if executor in ("claude-code", "codex"):
+        return f"acp-{executor}"
+    return None
+
 
 def detect_stale_running(
     conn: sqlite3.Connection,
@@ -8027,6 +8083,167 @@ def detect_stale_running(
         # event already lives in task_events for auditability; that's the
         # right surface for "this happened" without conflating with the
         # spawn_failed / timed_out / crashed counters.
+
+    return reclaimed
+
+
+def _worker_log_size(task_id: str, board: Optional[str]) -> int:
+    """Current worker-log size in bytes, or 0 when the log is missing/unreadable."""
+    try:
+        return worker_log_path(task_id, board=board).stat().st_size
+    except (OSError, ValueError):
+        return 0
+
+
+def detect_zero_activity(
+    conn: sqlite3.Connection,
+    *,
+    zero_activity_timeout_seconds: int = 0,
+    board: Optional[str] = None,
+    signal_fn=None,
+) -> list[str]:
+    """Reclaim ``running`` tasks that show ZERO activity for the watchdog window.
+
+    Root-cause fix for the 2026-07-18 incident (task t_08676525): a worker was
+    handed a broken Copilot ACP session, the session never progressed, and the
+    task sat ``running`` for 11 minutes with 0 tokens, 0% CPU and a static
+    752-byte log before a human killed it. ``detect_stale_running`` could not
+    catch it — that check needs 4h elapsed + 1h heartbeat gap.
+
+    "Activity" is the union of two signals, so a genuinely-working-but-quiet
+    worker is never killed:
+
+    * a fresh **heartbeat** (``last_heartbeat_at`` within the window) — bridged
+      automatically from any tool/API traffic the worker makes; and
+    * **worker-log growth** since the last tick — output even without heartbeats.
+
+    Each tick advances a per-task probe (``activity_probe_bytes`` /
+    ``activity_probe_at``): when either signal moves, the probe resets; when
+    neither has moved for ``zero_activity_timeout_seconds``, the worker is
+    wedged. It is terminated (host-local only, via the shared reclaim path, with
+    the same survive-the-kill deferral as ``detect_stale_running``), the run is
+    closed ``zero_activity``, the task returns to ``ready``, and — for an
+    external ACP executor — its provider is blacklisted so the respawn is NOT
+    handed straight back to the broken channel (the preflight gate in
+    ``check_respawn_guard`` then defers it) and a "Проблемы" finding is emitted.
+
+    Like ``detect_stale_running`` this is dispatcher-side detection, NOT a worker
+    failure, so it does not tick ``consecutive_failures``. ``0`` disables the
+    watchdog. ``signal_fn`` is the test hook forwarded to the terminator.
+    """
+    if zero_activity_timeout_seconds <= 0:
+        return []
+
+    now = int(time.time())
+    reclaimed: list[str] = []
+
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.executor, t.activity_probe_bytes, t.activity_probe_at, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running'"
+    ).fetchall()
+
+    for row in rows:
+        tid = row["id"]
+        log_bytes = _worker_log_size(tid, board)
+        hb = row["last_heartbeat_at"]
+        probe_bytes = row["activity_probe_bytes"]
+        probe_at = row["activity_probe_at"]
+
+        grew = log_bytes > (int(probe_bytes) if probe_bytes is not None else -1)
+        hb_fresh = hb is not None and (now - int(hb)) < zero_activity_timeout_seconds
+
+        # Unseeded (legacy/pre-spawn row): seed and judge from the next tick.
+        if probe_at is None:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET activity_probe_bytes = ?, "
+                    "activity_probe_at = ? WHERE id = ? AND status = 'running'",
+                    (log_bytes, now, tid),
+                )
+            continue
+
+        if grew or hb_fresh:
+            # Activity observed — reset the idle clock. Keep the high-water byte
+            # mark so a truncated/rotated log can't fake growth next tick.
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET activity_probe_bytes = ?, "
+                    "activity_probe_at = ? WHERE id = ? AND status = 'running'",
+                    (max(log_bytes, int(probe_bytes or 0)), now, tid),
+                )
+            continue
+
+        idle = now - int(probe_at)
+        if idle < zero_activity_timeout_seconds:
+            continue  # quiet, but not yet past the window
+
+        pid = row["worker_pid"]
+        lock = row["claim_lock"] or ""
+        provider = _provider_for_executor(row["executor"])
+
+        termination = _terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination,
+                reason="zero_activity_worker_alive",
+            )
+            continue
+
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL, activity_probe_bytes = NULL, "
+                "activity_probe_at = NULL "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+                (tid, row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+
+            payload = {
+                "idle_seconds": int(idle),
+                "timeout_seconds": int(zero_activity_timeout_seconds),
+                "log_bytes": int(log_bytes),
+                "last_heartbeat_at": int(hb) if hb is not None else None,
+                "pid": int(pid) if pid else None,
+                "provider": provider,
+            }
+            payload.update(termination)
+            run_id = _end_run(
+                conn, tid,
+                outcome="zero_activity", status="zero_activity",
+                error=(
+                    f"no activity (heartbeat/log) for {int(idle)}s "
+                    f"(>{int(zero_activity_timeout_seconds)}s)"
+                ),
+                metadata=payload,
+            )
+            _append_event(conn, tid, "zero_activity", payload, run_id=run_id)
+            reclaimed.append(tid)
+
+        # Blacklist the provider + surface it OUTSIDE the write_txn so a findings
+        # / zeus.db hiccup can never roll back the reclaim itself.
+        if provider:
+            try:
+                provider_health.record_unavailable(
+                    conn, provider,
+                    reason=f"zero-activity hang on task {tid} ({int(idle)}s)",
+                    ttl_seconds=_ZERO_ACTIVITY_PROVIDER_TTL_SECONDS, now=now,
+                )
+            except Exception:
+                _log.debug("zero-activity: provider mark failed", exc_info=True)
+            try:
+                provider_health.emit_health_finding(
+                    provider, status="unhealthy",
+                    reason=f"зависшая сессия (task {tid}, {int(idle)}s без активности)",
+                )
+            except Exception:
+                _log.debug("zero-activity: finding emit failed", exc_info=True)
 
     return reclaimed
 
@@ -8698,6 +8915,14 @@ def _stamp_run_start(
                 "UPDATE task_runs SET metadata = ? WHERE id = ?",
                 (json.dumps(base, ensure_ascii=False), run_id),
             )
+            # Seed the zero-activity watchdog probe (task t_08676525): a fresh
+            # worker starts with an empty log and its idle clock ticking from
+            # now. detect_zero_activity advances this each tick on real activity.
+            conn.execute(
+                "UPDATE tasks SET activity_probe_bytes = 0, "
+                "activity_probe_at = ? WHERE id = ?",
+                (int(time.time()), task.id),
+            )
     except Exception:
         pass
 
@@ -8774,13 +8999,26 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, executor FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
 
     now = int(time.time())
+
+    # 0. Provider health gate (task t_08676525). Health-check the task's ACP
+    #    provider BEFORE any claim/spawn — the incident's whole point is that a
+    #    provider with failing auth (Copilot 403) kept being handed fresh
+    #    sessions. A provider marked ``unhealthy`` (auto, TTL) or ``paused``
+    #    (operator, sticky) defers the spawn here, so a killed task never
+    #    respawns straight back onto the same broken channel; it clears once the
+    #    TTL lapses (fresh probe) or the operator resumes the provider.
+    provider = _provider_for_executor(row["executor"] if "executor" in row.keys() else None)
+    if provider:
+        avail = provider_health.availability(conn, provider, now=now)
+        if not avail["available"]:
+            return f"provider_{avail['status']}"
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
@@ -9051,6 +9289,7 @@ def dispatch_once(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    zero_activity_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -9085,6 +9324,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
+            zero_activity_timeout_seconds=zero_activity_timeout_seconds,
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
@@ -9101,6 +9341,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
+            zero_activity_timeout_seconds=zero_activity_timeout_seconds,
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
@@ -9117,6 +9358,7 @@ def _dispatch_once_locked(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    zero_activity_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -9127,6 +9369,9 @@ def _dispatch_once_locked(
       1. Reclaim stale running tasks (TTL expired).
       2. Reclaim stale running tasks (no recent heartbeat).
       3. Reclaim crashed running tasks (host-local PID no longer alive).
+      3b. Reclaim zero-activity running tasks (alive PID but no heartbeat AND no
+          worker-log growth within the zero-activity window) and blacklist the
+          ACP provider blamed for the hang (task t_08676525).
       3. Promote todo -> ready where all parents are done.
       4. For each ready task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
@@ -9176,6 +9421,17 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Zero-activity watchdog (task t_08676525): AFTER crash/stale/timeout
+    # reclaimers so a dead-PID worker is classified/counted by
+    # detect_crashed_workers first; this catches the remaining "alive PID but
+    # wedged — no heartbeat AND no worker-log growth" case the incident hit, and
+    # blacklists the ACP provider blamed for the hang so the respawn is not
+    # handed straight back to the broken channel.
+    result.zero_activity = detect_zero_activity(
+        conn,
+        zero_activity_timeout_seconds=zero_activity_timeout_seconds,
+        board=board,
+    )
     result.auto_unblocked = _auto_unblock_subscription_blocked(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

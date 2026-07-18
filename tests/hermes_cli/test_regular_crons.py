@@ -192,6 +192,38 @@ def test_scan_and_emit_creates_finding(tmp_path):
         conn.close()
 
 
+def test_emit_finding_custom_source_and_action(tmp_path):
+    """emit_finding accepts a distinct source namespace + structured action
+    (used by provider-health) without disturbing the regular-crons default."""
+    import json
+    conn = _open_db(tmp_path)
+    try:
+        rc.emit_finding(
+            conn, board="", finding_key="provider:acp-claude-code",
+            title="Провайдер сломан", detail="403", category="reliability",
+            severity="high", evidence={"provider": "acp-claude-code"},
+            source="provider-health",
+            action={"verb": "pause_provider", "provider": "acp-claude-code"},
+            now=1000.0,
+        )
+        got = conn.execute(
+            "SELECT source, action_json, severity FROM findings "
+            "WHERE finding_key = 'provider:acp-claude-code'"
+        ).fetchone()
+        assert got["source"] == "provider-health"
+        assert got["severity"] == "high"
+        assert json.loads(got["action_json"])["verb"] == "pause_provider"
+        # A distinct source does not collide with the regular-crons key space.
+        rc.clear_finding(conn, board="", finding_key="provider:acp-claude-code",
+                         source="provider-health", now=1001.0)
+        status = conn.execute(
+            "SELECT status FROM findings WHERE finding_key = 'provider:acp-claude-code'"
+        ).fetchone()["status"]
+        assert status == "obsolete"
+    finally:
+        conn.close()
+
+
 def test_scan_and_emit_is_idempotent_and_preserves_created_at(tmp_path):
     conn, rows = _rows_with_anomaly(tmp_path)
     try:

@@ -344,42 +344,52 @@ def emit_finding(
     category: str,
     severity: str,
     evidence: Any,
+    source: str = FINDINGS_SOURCE,
+    action: Optional[dict] = None,
     now: Optional[float] = None,
 ) -> None:
     """Upsert one open finding, keyed by ``(board, source, finding_key)``.
 
-    Re-emitting refreshes the title/detail/severity and ``updated_at`` but
-    preserves ``created_at`` and never un-dismisses a finding a human already
-    put to rest (dismissed/snoozed stay as-is).
+    Re-emitting refreshes the title/detail/severity/action and ``updated_at``
+    but preserves ``created_at`` and never un-dismisses a finding a human
+    already put to rest (dismissed/snoozed stay as-is).
+
+    ``source`` defaults to this module's ``regular-crons`` namespace; other
+    producers (e.g. provider-health) pass their own so the key spaces never
+    collide. ``action`` is an optional structured proposal (persisted as
+    ``action_json``) the Проблемы UI renders as the finding's proposed fix.
     """
     now = time.time() if now is None else now
     conn.execute(_FINDINGS_SCHEMA)
     conn.execute(
         "INSERT INTO findings "
         "(board, source, finding_key, title, detail, evidence_json, category, "
-        " severity, created_at, updated_at, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open') "
+        " severity, action_json, created_at, updated_at, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open') "
         "ON CONFLICT(board, source, finding_key) DO UPDATE SET "
         "  title=excluded.title, detail=excluded.detail, "
         "  evidence_json=excluded.evidence_json, category=excluded.category, "
-        "  severity=excluded.severity, updated_at=excluded.updated_at, "
+        "  severity=excluded.severity, action_json=excluded.action_json, "
+        "  updated_at=excluded.updated_at, "
         "  status=CASE WHEN findings.status IN ('dismissed','snoozed') "
         "              THEN findings.status ELSE 'open' END",
-        (board, FINDINGS_SOURCE, finding_key, title, detail,
-         json.dumps(evidence), category, severity, now, now),
+        (board, source, finding_key, title, detail,
+         json.dumps(evidence), category, severity,
+         json.dumps(action or {}), now, now),
     )
     conn.commit()
 
 
 def clear_finding(conn: sqlite3.Connection, *, board: str, finding_key: str,
+                  source: str = FINDINGS_SOURCE,
                   now: Optional[float] = None) -> None:
-    """Mark a previously-open regular-cron finding obsolete (anomaly resolved)."""
+    """Mark a previously-open finding obsolete (the anomaly resolved)."""
     now = time.time() if now is None else now
     try:
         conn.execute(
             "UPDATE findings SET status='obsolete', updated_at=? "
             "WHERE source=? AND board=? AND finding_key=? AND status='open'",
-            (now, FINDINGS_SOURCE, board, finding_key),
+            (now, source, board, finding_key),
         )
         conn.commit()
     except sqlite3.OperationalError:

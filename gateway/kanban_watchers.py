@@ -955,6 +955,24 @@ class GatewayKanbanWatchersMixin:
             )
             stale_timeout_seconds = 0
 
+        # Read zero_activity_timeout_seconds — the short-fuse wedged-worker
+        # watchdog (t_08676525). 0 disables it. Defaults to the module constant
+        # so an install that never set the key still gets the safety net.
+        raw_zero_activity = kanban_cfg.get(
+            "dispatch_zero_activity_timeout_seconds",
+            _kb.DEFAULT_ZERO_ACTIVITY_TIMEOUT_SECONDS,
+        )
+        try:
+            zero_activity_timeout_seconds = int(raw_zero_activity or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid "
+                "kanban.dispatch_zero_activity_timeout_seconds=%r; using default %d",
+                raw_zero_activity,
+                _kb.DEFAULT_ZERO_ACTIVITY_TIMEOUT_SECONDS,
+            )
+            zero_activity_timeout_seconds = _kb.DEFAULT_ZERO_ACTIVITY_TIMEOUT_SECONDS
+
         # Read kanban.default_assignee — fallback profile for tasks
         # created without an explicit assignee (e.g. via the dashboard).
         # When set, the dispatcher applies it to unassigned ready tasks
@@ -1127,6 +1145,7 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
+                    zero_activity_timeout_seconds=zero_activity_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                 )

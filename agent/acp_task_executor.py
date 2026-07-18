@@ -10,6 +10,21 @@ def command_for(executor):
     command = os.getenv(prefix + "_COMMAND", "").strip() or _DEFAULT[executor][0]
     raw = os.getenv(prefix + "_ARGS", "").strip()
     return command, shlex.split(raw) if raw else list(_DEFAULT[executor][1])
+def _is_acp_auth_failure(exc):
+    """True when ``exc`` is an ACP authentication failure (e.g. Copilot 403) as
+    opposed to a transient quota wall or a task-specific error. Only auth
+    failures blacklist the provider (task t_08676525)."""
+    try:
+        from agent.copilot_acp_client import ACPAuthError
+        if isinstance(exc, ACPAuthError):
+            return True
+    except Exception:
+        pass
+    try:
+        from agent import claude_subscriptions as subs
+        return bool(subs.is_auth_error(str(exc)))
+    except Exception:
+        return False
 def steer_inbox_path(task_id, board=None):
     """Per-task interactive-steering control channel: a JSONL inbox under the
     board dir that the Zeus dashboard appends operator messages to and the live
@@ -276,7 +291,20 @@ def run_task(*, executor, task_id, workspace, board=None):
             text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
         _report_usage(client,executor,task_id,subscription)
     except Exception as exc:
-        with kb.connect_closing(board=board) as conn: kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)
+        with kb.connect_closing(board=board) as conn:
+            kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)
+            # Auth failure (e.g. Copilot 403) is a PROVIDER fault, not a task
+            # fault: blacklist the ACP channel so the dispatcher's preflight
+            # gate (check_respawn_guard) stops handing fresh sessions to it, and
+            # surface it in "Проблемы" for the operator (task t_08676525).
+            if _is_acp_auth_failure(exc):
+                provider=f"acp-{executor}"
+                try:
+                    from hermes_cli import provider_health
+                    provider_health.record_unavailable(conn,provider,reason=f"ACP auth failed: {exc}"[:200])
+                    provider_health.emit_health_finding(provider,status="unhealthy",reason=f"сбой auth ACP (task {task_id}): {exc}"[:200])
+                except Exception:
+                    pass
         raise
     metadata={"executor":executor,"acp_command":command,"provider":f"acp-{executor}","workspace":workspace}
     run_model=getattr(client,"last_model","") or model

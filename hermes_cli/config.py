@@ -2850,6 +2850,17 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Zero-activity watchdog (task t_08676525). A running worker that
+        # advances NO activity signal — neither its heartbeat (bridged from any
+        # tool/API traffic) nor its worker-log size — for this many seconds is
+        # treated as wedged and reclaimed to ``ready`` on the next tick, and the
+        # ACP provider blamed for the hang is blacklisted so the respawn is not
+        # handed straight back to the broken channel. Far tighter than
+        # ``dispatch_stale_timeout_seconds`` (4h) because the incident it fixes
+        # hung 11 min with 0 tokens / 0 CPU / a static log before a human killed
+        # it. 0 disables the watchdog. Corroborating log-growth means a
+        # genuinely-working-but-quiet worker is not killed.
+        "dispatch_zero_activity_timeout_seconds": 900,
         # Task-aware toolset selection for native hermes-workers. A worker
         # otherwise receives its profile's ENTIRE enabled CLI tool surface;
         # when enabled, the surface narrows to ``base`` plus only the toolsets
