@@ -1409,3 +1409,8 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+## Commit attribution
+- The Co-Authored-By trailer must name the ACTUAL model that authored the change
+  (e.g. `Co-Authored-By: Kimi K3 <noreply@moonshot.ai>`, `Co-Authored-By: GLM-5.2
+  <noreply@z.ai>`). Never copy another model's trailer from git history.

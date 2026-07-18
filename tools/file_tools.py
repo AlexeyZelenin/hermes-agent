@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import tempfile
 import posixpath
 import sys
 import threading
@@ -670,6 +671,12 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    # The user's temp dir is NOT a system path even though macOS puts it under
+    # /private/var/folders (and $TMPDIR resolves there). Blocking it broke
+    # every agent write to tempfile/pytest tmp_path.
+    _tmp = os.path.realpath(tempfile.gettempdir()).rstrip("/") + "/"
+    if resolved.startswith(_tmp) or normalized.startswith(_tmp):
+        return None
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
             return _err
