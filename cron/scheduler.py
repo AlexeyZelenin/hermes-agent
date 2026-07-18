@@ -3703,6 +3703,28 @@ def _ensure_sealed_security_cron() -> None:
         logger.debug("sealed security cron ensure skipped: %s", exc)
 
 
+_vision_reconcile_cron_ensured = False
+
+
+def _ensure_vision_reconcile_cron() -> None:
+    """Self-establish the vision-reconcile cron once per process.
+
+    Extends reflection (task t_f12b86f3): the nightly manual sverka of the
+    backlog against the project vision becomes a regular process that pushes
+    drift (orphans, contradictions) to Проблемы. Idempotent and best-effort — a
+    failure just retries on the next tick and never blocks job dispatch.
+    """
+    global _vision_reconcile_cron_ensured
+    if _vision_reconcile_cron_ensured:
+        return
+    try:
+        from hermes_cli.vision_reconcile import ensure_vision_reconcile_job
+        if ensure_vision_reconcile_job() is not None:
+            _vision_reconcile_cron_ensured = True
+    except Exception as exc:  # never let seeding break the ticker
+        logger.debug("vision-reconcile cron ensure skipped: %s", exc)
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -3748,6 +3770,9 @@ def tick(
         # Self-establish the sealed security-review cron (best-effort, once per
         # process) before dispatch so the safety review is always registered.
         _ensure_sealed_security_cron()
+        # Same for the vision-reconcile cron (reflection): keeps the backlog↔
+        # vision sverka running without nightly manual oversight.
+        _ensure_vision_reconcile_cron()
 
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")

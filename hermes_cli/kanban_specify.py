@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import vision as vision_mod
 
 from utils import env_int
 
@@ -86,6 +87,34 @@ _USER_TEMPLATE = """Task id: {task_id}
 Current title: {title}
 Current body:
 {body}
+"""
+
+
+# Appended to the system prompt only when a vision doc is available. Hands the
+# gate to the planner: before promoting a card, it must judge fit against the
+# project vision and emit a verdict the caller can act on.
+_VISION_SYSTEM_EXTRA = """
+
+VISION CHECK — the project vision document is provided below in the user
+message. Before finalising, judge whether this task fits the picture:
+  - Does it advance what we are building, or is it out of scope / redundant?
+  - Is it a HALF-SOLUTION the vision warns against (e.g. "a local repo and
+    that's it" when the vision calls for a finished pipeline)?
+  - Does it CONTRADICT the "What we do NOT do" section?
+
+Add a THIRD key to your JSON object:
+
+  "vision": {"fits": true|false, "reason": "<one short sentence>"}
+
+Set ``fits`` false ONLY when the task clearly does not belong in the picture;
+when in doubt set it true — the gate guards against obvious drift, it is not a
+gatekeeper that blocks legitimate work. Always fill ``reason``.
+"""
+
+_VISION_USER_EXTRA = """
+--- PROJECT VISION (knowledge/vision.md) ---
+{vision}
+--- END PROJECT VISION ---
 """
 
 
@@ -139,6 +168,43 @@ def _profile_author() -> str:
     )
 
 
+def _vision_verdict(parsed: Optional[dict]) -> Optional[tuple[bool, str]]:
+    """Extract the ``(fits, reason)`` vision verdict from a parsed reply.
+
+    Lenient by design: a missing / malformed ``vision`` key returns ``None``
+    (treated as "no verdict" -> promote as usual), so an old-shape reply or a
+    provider that dropped the key never strands an otherwise-fine task. Only an
+    explicit ``fits: false`` holds the card.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    v = parsed.get("vision")
+    if not isinstance(v, dict) or "fits" not in v:
+        return None
+    fits = bool(v.get("fits"))
+    reason = v.get("reason")
+    reason = reason.strip() if isinstance(reason, str) and reason.strip() else ""
+    return (fits, reason)
+
+
+def _record_vision_hold(task_id: str, reason: str, *, author: str) -> None:
+    """Leave an audit comment explaining why the gate held a card in Triage.
+
+    Best-effort: a failure to comment must not turn "held" into "crashed".
+    """
+    detail = reason or "не вписывается в текущее видение проекта"
+    body = (
+        "Vision-гейт: задача оставлена в Triage — не проходит "
+        f"vision-проверку планировщика. Причина: {detail}. Уточните "
+        "формулировку под knowledge/vision.md, либо отклоните."
+    )
+    try:
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, task_id, author, body)
+    except Exception as exc:  # pragma: no cover — comment is advisory only
+        logger.info("specify: could not record vision hold for %s: %s", task_id, exc)
+
+
 def specify_task(
     task_id: str,
     *,
@@ -167,11 +233,20 @@ def specify_task(
         logger.debug("specify: auxiliary client import failed: %s", exc)
         return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
 
+    # Vision doc (knowledge/vision.md) — when present, the gate is handed to the
+    # planner: the specifier also judges fit against the project vision and a
+    # card that does not fit is held in Triage rather than auto-promoted.
+    vision_text = vision_mod.load_vision_text()
+
     user_msg = _USER_TEMPLATE.format(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
     )
+    system_prompt = _SYSTEM_PROMPT
+    if vision_text:
+        system_prompt += _VISION_SYSTEM_EXTRA
+        user_msg += _VISION_USER_EXTRA.format(vision=vision_text)
 
     try:
         # Route through call_llm so auxiliary.triage_specifier.* config
@@ -180,7 +255,7 @@ def specify_task(
         resp = call_llm(
             task="triage_specifier",
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.3,
@@ -230,6 +305,20 @@ def specify_task(
         if new_body is None and new_title is None:
             return SpecifyOutcome(
                 task_id, False, "LLM response missing title and body"
+            )
+
+    # Vision gate: an explicit ``fits: false`` verdict holds the card in Triage
+    # (no auto-promotion) and records why, so obvious drift never reaches Todo
+    # without a human — the nightly manual oversight this replaces.
+    if vision_text:
+        verdict = _vision_verdict(parsed)
+        if verdict is not None and verdict[0] is False:
+            reason = verdict[1]
+            _record_vision_hold(
+                task_id, reason, author=author or _profile_author()
+            )
+            return SpecifyOutcome(
+                task_id, False, f"vision-check failed: {reason or 'does not fit'}"
             )
 
     with kb.connect_closing() as conn:
