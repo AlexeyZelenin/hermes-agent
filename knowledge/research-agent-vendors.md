@@ -293,3 +293,9 @@ Plan)**; cheap-слот — **DeepSeek V4 Flash**; vision/мультимодал
 Интеграция (ground truth — код Hermes):
 - `plugins/model-providers/{deepseek,gemini,xai,zai,qwen-oauth,alibaba-coding-plan}/__init__.py`
 - `website/static/api/model-catalog.json`
+
+## Железо для локального инференса: buy vs rent (веб-ресёрч 2026-07-18)
+- Точка баланса покупки: AMD Strix Halo 128GB (~$1.5-2k, MoE 120B @ 31-55 tok/s) или Mac Studio M4 Max 64GB (~$2.5k). Дороже — отдача падает: DGX Spark $4.7k = 2.7 tok/s single-stream на 70B; RTX 5090 32GB не вмещает 70B; 4x3090 (~$4k) — лучший VRAM/$, но гараж-сервер.
+- Аренда $200/мес = одна 4090/L4-класс карта (RunPod $0.34-0.69/ч, Vast $0.29/ч) — только средний coder (Qwen3-Coder-Next 80B/3B, Q4 ~46GB, 70.6% SWE-V). GLM/DeepSeek полноразмерные — мультикарта $8-28/ч, мимо.
+- Kimi K3 (2.8T/50B актив, вышел 16.07.26, веса с 27.07): self-host = 8x H200 ≈ $21.6k/мес. Категорически нет.
+- Вывод: подписка топ-модели ($200/мес ≈ $1000+ API-эквивалент) бьёт аренду по агентской пропускной способности; гибрид «свой Mac для фона + подписка для сложного» оптимален.
