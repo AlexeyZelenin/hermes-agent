@@ -225,3 +225,94 @@ def test_window_total_tokens_sums_across_pockets():
     conn.commit()
     snap = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)
     assert snap["window_total_tokens"] == 300
+
+
+# ---------------------------------------------------------------------------
+# Nested 5h-session window
+# ---------------------------------------------------------------------------
+
+FIVE_H = 5 * 3600
+
+
+def test_five_hour_window_anchored_on_client_reset():
+    # ``now`` sits just inside the block ending at the client reset (anchor).
+    anchor = NOW + 1000  # a grid boundary 1000s ahead
+    start, reset = zeus_pacing._five_hour_window(anchor, NOW)
+    assert reset == pytest.approx(anchor)
+    assert start == pytest.approx(anchor - FIVE_H)
+    assert start <= NOW < reset
+
+
+def test_five_hour_window_slides_from_an_old_anchor():
+    # A boundary several blocks in the past still lands the block around ``now``,
+    # phase-aligned to the anchor (reset - anchor is a whole number of blocks).
+    anchor = NOW - 3 * FIVE_H - 1000
+    start, reset = zeus_pacing._five_hour_window(anchor, NOW)
+    assert start <= NOW < reset
+    assert reset - start == pytest.approx(FIVE_H)
+    assert (reset - anchor) / FIVE_H == pytest.approx(round((reset - anchor) / FIVE_H))
+
+
+def test_five_hour_window_epoch_grid_fallback():
+    start, reset = zeus_pacing._five_hour_window(None, NOW)
+    assert int(reset) % FIVE_H == 0
+    assert start <= NOW < reset
+    assert reset - start == pytest.approx(FIVE_H)
+
+
+def test_five_hour_budget_is_the_weekly_even_share():
+    b = zeus_pacing._five_hour_budget(1_000_000.0, NOW - WEEK, NOW)
+    assert b == pytest.approx(1_000_000.0 * FIVE_H / WEEK)
+
+
+def test_five_hour_budget_none_when_underivable():
+    assert zeus_pacing._five_hour_budget(None, NOW - WEEK, NOW) is None
+    assert zeus_pacing._five_hour_budget(1000.0, None, NOW) is None
+    assert zeus_pacing._five_hour_budget(1000.0, NOW, NOW) is None  # zero-length week
+
+
+def test_pocket_carries_nested_session_and_effective_verdict():
+    conn = _conn()
+    _add_pacing(conn)
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert "circuit_breaker_5h" in p
+    assert "effective_breaker" in p
+    fw = p["five_hour_window"]
+    assert fw["reset"] > NOW
+    assert fw["seconds_to_reset"] == pytest.approx(fw["reset"] - NOW)
+    assert fw["reset"] - fw["start"] == pytest.approx(FIVE_H)
+
+
+def test_session_burndown_lifts_weekly_throttle_end_to_end():
+    # Weekly is throttling (spent ~= 50% at 50% elapsed -> projected ~100%),
+    # while the 5h session is deep in its tail (95% elapsed) and barely used ->
+    # burndown. The board-effective verdict is burndown: the throttle is lifted
+    # so the session remainder is drained. This is the operator doctrine even
+    # for a would-be-throttled pocket.
+    conn = _conn()
+    _add_pacing(conn)
+    # Client reset in the recent past -> session block is [NOW-0.95*5h, NOW+0.05*5h],
+    # and the pocket is NOT cooling (reset already passed).
+    conn.execute(
+        "INSERT INTO claude_subscriptions (name, display_name, enabled, cooling_until) "
+        "VALUES ('personal', 'Personal', 1, ?)",
+        (NOW - 0.95 * FIVE_H,),
+    )
+    # Weekly-budget calibration burn, placed BEFORE the session block starts so
+    # it counts toward the weekly window but not the session one.
+    conn.execute(
+        "INSERT INTO token_usage (ts, subscription, total_tokens) VALUES (?, 'personal', 500)",
+        (NOW - FIVE_H,),
+    )
+    # A trickle inside the session block -> far under its tiny even-share budget.
+    conn.execute(
+        "INSERT INTO token_usage (ts, subscription, total_tokens) VALUES (?, 'personal', 20)",
+        (NOW - 100,),
+    )
+    conn.commit()
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert p["cooling"] is False
+    assert p["circuit_breaker"]["state"] == "half_open"
+    assert p["circuit_breaker_5h"]["state"] == "burndown"
+    assert p["effective_breaker"]["state"] == "burndown"
+    assert p["effective_breaker"]["recommended_agent_limit"] is None

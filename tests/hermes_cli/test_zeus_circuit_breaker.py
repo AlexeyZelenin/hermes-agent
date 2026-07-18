@@ -212,3 +212,120 @@ def test_hard_spent_trips_without_a_window():
     assert v["state"] == "open"
     assert v["projected_spent_percent"] is None
     assert v["elapsed_fraction"] is None
+
+
+# ---------------------------------------------------------------------------
+# Explicit budget override (used by the nested 5h-session window)
+# ---------------------------------------------------------------------------
+
+def test_budget_tokens_overrides_calibration():
+    # budget forced to 400 -> 200 live is 50% (not the 20% the 500/50%
+    # calibration would imply). The override wins and still counts as derived.
+    v = _eval(live_tokens=200, snapshot_tokens=500, budget_tokens=400.0)
+    assert v["implied_budget_tokens"] == 400
+    assert v["live_spent_percent"] == pytest.approx(50.0)
+    assert v["live_derived"] is True
+
+
+def test_budget_tokens_ignored_when_non_positive():
+    # A zero/negative override is no override -> fall back to the calibration.
+    v = _eval(live_tokens=200, snapshot_tokens=500, spent_percent=50.0, budget_tokens=0.0)
+    assert v["implied_budget_tokens"] == 1000  # 500 / 50%
+    assert v["live_spent_percent"] == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
+# Burndown — under-utilizing in the tail of the window
+# ---------------------------------------------------------------------------
+
+def test_burndown_when_underutilizing_in_tail():
+    # 95% elapsed, only 50% spent -> projected ~53% by reset: budget would be
+    # left on the table, so drain it. No cap.
+    v = cb.evaluate(
+        spent_percent=None,
+        live_tokens=500,
+        snapshot_tokens=None,
+        window_start=NOW - WEEK * 0.95,
+        reset_at=NOW + WEEK * 0.05,
+        now=NOW,
+        budget_tokens=1000.0,
+    )
+    assert v["state"] == "burndown"
+    assert v["burning_down"] is True
+    assert v["recommended_agent_limit"] is None
+    assert v["projected_spent_percent"] == pytest.approx(52.6, abs=0.2)
+
+
+def test_no_burndown_before_the_tail():
+    # Same under-utilization at mid-window is just "closed" — plenty of window
+    # left to spend the rest at pace.
+    v = cb.evaluate(
+        spent_percent=None,
+        live_tokens=300,
+        snapshot_tokens=None,
+        window_start=NOW - WEEK * 0.5,
+        reset_at=NOW + WEEK * 0.5,
+        now=NOW,
+        budget_tokens=1000.0,
+    )
+    assert v["state"] == "closed"
+
+
+def test_no_burndown_when_on_pace_in_tail():
+    # 95% elapsed and 90% spent -> projected ~95%: reset will land near-full,
+    # nothing meaningful to burn down -> closed, not burndown.
+    v = cb.evaluate(
+        spent_percent=None,
+        live_tokens=900,
+        snapshot_tokens=None,
+        window_start=NOW - WEEK * 0.95,
+        reset_at=NOW + WEEK * 0.05,
+        now=NOW,
+        budget_tokens=1000.0,
+    )
+    assert v["state"] == "closed"
+
+
+# ---------------------------------------------------------------------------
+# aggregate() — folding nested windows into the board-effective verdict
+# ---------------------------------------------------------------------------
+
+def test_aggregate_open_halts_over_everything():
+    eff = cb.aggregate([{"state": "burndown", "reason": "b"}, {"state": "open", "reason": "wall"}])
+    assert eff["state"] == "open"
+    assert eff["tripped"] is True
+    assert eff["recommended_agent_limit"] == 0
+    assert eff["reason"] == "wall"
+
+
+def test_aggregate_burndown_lifts_a_throttle():
+    # Doctrine: the tail of a window is drained even when another window would
+    # throttle the pocket -> burndown wins over half_open, cap released.
+    eff = cb.aggregate([{"state": "half_open", "reason": "ahead"}, {"state": "burndown", "reason": "drain"}])
+    assert eff["state"] == "burndown"
+    assert eff["burning_down"] is True
+    assert eff["recommended_agent_limit"] is None
+    assert eff["reason"] == "drain"
+
+
+def test_aggregate_takes_the_tighter_throttle():
+    eff = cb.aggregate([{"state": "half_open", "reason": "ahead"}, {"state": "closed", "reason": "on pace"}])
+    assert eff["state"] == "half_open"
+    assert eff["recommended_agent_limit"] == 1
+
+
+def test_aggregate_all_unknown_fails_open():
+    eff = cb.aggregate([{"state": "unknown"}, {"state": "unknown"}])
+    assert eff["state"] == "unknown"
+    assert eff["tripped"] is False
+    assert eff["recommended_agent_limit"] is None
+
+
+def test_aggregate_empty_fails_open():
+    assert cb.aggregate([])["state"] == "unknown"
+
+
+def test_aggregate_keeps_component_windows():
+    a = {"state": "closed", "reason": "on pace"}
+    b = {"state": "burndown", "reason": "drain"}
+    assert cb.aggregate([a, b])["windows"] == [a, b]

@@ -31,6 +31,13 @@ Breaker states (classic vocabulary):
     Tripped: projected to exhaust the window budget before it resets, or the
     provider already rate-limited the pocket (cooling). Halt new spawns
     (``recommended_agent_limit`` 0).
+``burndown``
+    Late in the window and *under*-utilizing — on this pace the window would
+    reset with budget left unspent (wasted: subscription allowances don't roll
+    over). Release the cap and drain the remainder (``recommended_agent_limit``
+    None). This is the operator doctrine "deplete slowly, but finish the window
+    empty": in :func:`aggregate` a window in burndown *lifts* a throttle another
+    window imposed, so a reserved/throttled pocket still gets burned down.
 ``unknown``
     Not enough data to judge — treated as ``closed`` (fail open).
 """
@@ -56,8 +63,25 @@ HARD_SPENT_PERCENT = 95.0
 # not risk. Inside this slice only the HARD_SPENT near-exhaustion trip applies.
 MIN_ELAPSED_FRACTION = 0.02
 
+# Burndown band. Only in the tail of the window (past this elapsed fraction)...
+BURNDOWN_ELAPSED_FRACTION = 0.9
+# ...and only when the linear projection lands this far under a full window do
+# we call it under-utilization worth draining. At 0.9 elapsed a projection of
+# <90% means live spend is <81% -> real budget would be left on the table.
+BURNDOWN_MAX_PROJECTED_PERCENT = 90.0
+
 # Breaker-imposed agent cap per state; None means "no cap, defer to dispatcher".
-_LIMIT_BY_STATE = {"open": 0, "half_open": 1, "closed": None, "unknown": None}
+_LIMIT_BY_STATE = {
+    "open": 0,
+    "half_open": 1,
+    "burndown": None,
+    "closed": None,
+    "unknown": None,
+}
+
+# Aggregation precedence (lower folds first): a hard stop dominates a burndown,
+# which overrides a throttle, which overrides an on-pace window. See aggregate().
+_STATE_RANK = {"open": 0, "burndown": 1, "half_open": 2, "closed": 3, "unknown": 4}
 
 
 def implied_budget_tokens(
@@ -122,7 +146,9 @@ def _classify(
 
     Precedence: a provider cooldown is a definitional trip; then near-exhaustion
     of the budget (whatever the pace); then the projection bands — but the
-    projection is trusted only once past the opening slice of the window.
+    projection is trusted only once past the opening slice of the window;
+    finally, in the tail of the window, an under-utilizing pace flips to
+    ``burndown`` so the remainder gets drained before it resets and is lost.
     """
     if cooling:
         return "open", "provider rate-limited (cooling)"
@@ -139,6 +165,13 @@ def _classify(
             return "open", f"projected {projected:.0f}% of budget by reset"
         if projected >= WARN_PROJECTED_PERCENT:
             return "half_open", f"projected {projected:.0f}% of budget by reset"
+    if (
+        projected is not None
+        and elapsed_frac is not None
+        and elapsed_frac >= BURNDOWN_ELAPSED_FRACTION
+        and projected < BURNDOWN_MAX_PROJECTED_PERCENT
+    ):
+        return "burndown", f"projected {projected:.0f}% of budget by reset — burning down"
     return "closed", "on pace"
 
 
@@ -151,8 +184,9 @@ def evaluate(
     reset_at: Optional[float],
     now: float,
     cooling: bool = False,
+    budget_tokens: Optional[float] = None,
 ) -> dict:
-    """Circuit-breaker verdict for one subscription pocket.
+    """Circuit-breaker verdict for one subscription pocket, over one window.
 
     ``snapshot_tokens`` = ledger tokens burned up to the controller's
     ``updated_at`` (the calibration point); ``live_tokens`` = ledger tokens
@@ -161,11 +195,22 @@ def evaluate(
     fallback when no budget can be derived. ``cooling`` reflects a provider
     rate-limit already in force (a definitional trip).
 
+    ``budget_tokens`` lets a caller supply the window's token budget directly
+    instead of inverting it from ``spent_percent``/``snapshot_tokens``. The
+    nested 5h-session window uses this (:mod:`hermes_cli.zeus_pacing` derives
+    its budget from the weekly one), since the controller only calibrates the
+    weekly pocket.
+
     Returns a dict carrying the state, the live/projected figures behind it,
     and the ``recommended_agent_limit`` a consumer may cap to (``0`` open,
-    ``1`` half-open, ``None`` otherwise).
+    ``1`` half-open, ``None`` otherwise). Combine several windows'
+    verdicts with :func:`aggregate`.
     """
-    budget = implied_budget_tokens(spent_percent, snapshot_tokens)
+    budget = (
+        budget_tokens
+        if budget_tokens is not None and budget_tokens > 0
+        else implied_budget_tokens(spent_percent, snapshot_tokens)
+    )
     live_spent = live_spent_percent(live_tokens, budget, spent_percent)
     frac = elapsed_fraction(window_start, reset_at, now)
 
@@ -183,6 +228,7 @@ def evaluate(
         "state": state,
         "tripped": state == "open",
         "throttling": state == "half_open",
+        "burning_down": state == "burndown",
         "recommended_agent_limit": _LIMIT_BY_STATE[state],
         # True when spent-% was scaled from the live ledger; False when it fell
         # back to the controller's stale reading (no budget could be derived).
@@ -193,4 +239,49 @@ def evaluate(
         "implied_budget_tokens": int(budget) if budget is not None else None,
         "elapsed_fraction": round(frac, 4) if frac is not None else None,
         "reason": reason,
+    }
+
+
+def aggregate(verdicts: list[dict]) -> dict:
+    """Fold several nested-window verdicts into the one the board obeys.
+
+    A pocket is paced by more than one window at once — the weekly allowance
+    and the 5h session allowance nested inside it — and each yields its own
+    :func:`evaluate` verdict. The effective cap is *not* a plain ``min`` in
+    every case; the precedence encodes the operator doctrine:
+
+    #. **open wins.** A hard wall in *any* window (projected overshoot, near
+       exhaustion, or a provider cooldown) halts new spawns — this is the
+       ``min(weekly, session)`` of the spec, with open's limit ``0`` as the
+       floor. You can never burn into a real limit.
+    #. **then burndown wins.** With no open window, a window in ``burndown``
+       *lifts* a throttle another window imposed and releases the cap: the tail
+       of a window must be drained even for a reserved/throttled pocket
+       ("finish the window empty; personal's reserve does not survive
+       burndown"). This is the one place the effective cap is deliberately
+       looser than a raw ``min``.
+    #. **else the throttle min.** ``half_open`` (limit 1) beats ``closed``
+       (no cap).
+
+    Empty input, or all-``unknown``, folds to an ``unknown`` verdict (fail
+    open — never halt the board because telemetry is missing). The winning
+    window's ``state``/``reason`` carry through; ``windows`` keeps the
+    components for the dashboard.
+    """
+    known = [v for v in verdicts if v and v.get("state") != "unknown"]
+    winner = min(known, key=lambda v: _STATE_RANK[v["state"]]) if known else None
+    if winner is None:
+        state, reason, limit = "unknown", "insufficient pacing data", None
+    else:
+        state = winner["state"]
+        reason = winner.get("reason", "")
+        limit = _LIMIT_BY_STATE[state]
+    return {
+        "state": state,
+        "tripped": state == "open",
+        "throttling": state == "half_open",
+        "burning_down": state == "burndown",
+        "recommended_agent_limit": limit,
+        "reason": reason,
+        "windows": list(verdicts),
     }

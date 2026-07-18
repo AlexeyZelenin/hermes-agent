@@ -23,6 +23,7 @@ opened and closed by the caller, exactly like :mod:`hermes_cli.zeus_tokens`.
 
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 from typing import Optional
@@ -32,6 +33,13 @@ from hermes_cli import zeus_circuit_breaker, zeus_tokens
 # Fallback window length when the true window can't be pinned from the pacing
 # row (Claude subscription limits reset weekly, so 7 days is the right default).
 _DEFAULT_WINDOW_SECONDS = 7 * 24 * 3600
+
+# The nested session window. Claude subscriptions meter a rolling 5h "session"
+# limit *inside* the weekly one, and it is usually the binding wall — a burst
+# trips it hours before the weekly budget is close. The controller only paces
+# the weekly window, so :func:`_pocket` models this second, nested curve here.
+# Matches ``agent.claude_subscriptions.LIMIT_WINDOW_SECONDS``.
+_FIVE_HOUR_WINDOW_SECONDS = 5 * 3600
 
 
 def connect(path: Optional[os.PathLike | str] = None) -> Optional[sqlite3.Connection]:
@@ -68,6 +76,52 @@ def _window_start(
     if length <= 0:
         return reset_at - _DEFAULT_WINDOW_SECONDS
     return reset_at - length
+
+
+def _five_hour_window(anchor: Optional[float], now: float) -> tuple[float, float]:
+    """``(start, reset)`` of the 5h session window containing ``now``.
+
+    The window is anchored on the *client's* reported reset (``anchor`` —
+    typically ``cooling_until``, the reset time the provider handed back on the
+    last limit-hit), which is a point on the true 5h grid. We slide by whole 5h
+    steps from that anchor to the block around ``now``, so the nested window
+    stays phase-aligned with the provider's real reset rather than an arbitrary
+    clock offset. With no anchor, fall back to the epoch-aligned 5h boundary
+    (the same grid ``agent.claude_subscriptions.next_window_boundary`` uses).
+    """
+    w = _FIVE_HOUR_WINDOW_SECONDS
+    if anchor is None:
+        reset = (int(now) // w + 1) * w
+        return float(reset - w), float(reset)
+    steps = math.floor((now - anchor) / w) + 1
+    reset = anchor + steps * w
+    return reset - w, reset
+
+
+def _five_hour_budget(
+    weekly_budget: Optional[float],
+    weekly_start: Optional[float],
+    reset_at: Optional[float],
+) -> Optional[float]:
+    """Session-window token budget implied by the weekly one, or ``None``.
+
+    The controller calibrates only the weekly pocket, so there is no direct
+    session budget. Under the operator's even-rate doctrine ("deplete slowly,
+    evenly") a 5h session's fair share is the weekly budget scaled by its slice
+    of the week — ``weekly_budget * 5h / week_length``. Capping each session to
+    that share is what stops a single block from front-loading the week and
+    tripping the session wall. ``None`` when the weekly budget or length can't
+    be pinned (the session verdict then degrades to ``unknown`` — fail open).
+
+    The empirically-measured true session cap (task ``t_e38bbe56``) will later
+    replace this derived share; the curve around it is identical.
+    """
+    if weekly_budget is None or weekly_start is None or reset_at is None:
+        return None
+    weekly_len = reset_at - weekly_start
+    if weekly_len <= 0:
+        return None
+    return weekly_budget * (_FIVE_HOUR_WINDOW_SECONDS / weekly_len)
 
 
 def _window_tokens(
@@ -134,6 +188,41 @@ def _subscription_meta(conn: sqlite3.Connection) -> dict[str, dict]:
     }
 
 
+def _session_breaker(
+    conn: sqlite3.Connection,
+    subscription: str,
+    *,
+    cooling_until: Optional[float],
+    weekly_budget: Optional[int],
+    weekly_start: Optional[float],
+    reset_at: Optional[float],
+    now: float,
+    cooling: bool,
+) -> tuple[dict, float, float, Optional[dict]]:
+    """Nested 5h-session verdict + its window bounds and in-window tokens.
+
+    The controller only paces the weekly pocket, so this evaluates the second,
+    nested curve: the same live ledger read over the current 5h session window
+    (anchored on the client reset), judged against the session budget derived
+    from the weekly one under the even-rate doctrine. Returns
+    ``(breaker_5h, start, reset, tokens)``.
+    """
+    start, reset = _five_hour_window(cooling_until, now)
+    tokens = _window_tokens(conn, subscription, start)
+    budget = _five_hour_budget(weekly_budget, weekly_start, reset_at)
+    breaker = zeus_circuit_breaker.evaluate(
+        spent_percent=None,
+        live_tokens=tokens["total_tokens"] if tokens is not None else None,
+        snapshot_tokens=None,
+        window_start=start,
+        reset_at=reset,
+        now=now,
+        cooling=cooling,
+        budget_tokens=budget,
+    )
+    return breaker, start, reset, tokens
+
+
 def _pocket(
     row: sqlite3.Row,
     subs: dict[str, dict],
@@ -163,6 +252,20 @@ def _pocket(
         now=now,
         cooling=cooling,
     )
+    # Fold the nested session verdict into the weekly one: open (either wall)
+    # halts, a session burndown in the block's tail lifts a weekly throttle to
+    # drain the remainder, else the tighter throttle wins (see aggregate()).
+    breaker_5h, five_start, five_reset, five_live = _session_breaker(
+        conn,
+        row["subscription"],
+        cooling_until=cooling_until,
+        weekly_budget=breaker["implied_budget_tokens"],
+        weekly_start=window_start,
+        reset_at=reset_at,
+        now=now,
+        cooling=cooling,
+    )
+    effective = zeus_circuit_breaker.aggregate([breaker, breaker_5h])
     return {
         "subscription": row["subscription"],
         "display_name": meta.get("display_name") or row["subscription"],
@@ -191,6 +294,16 @@ def _pocket(
         "window_start": window_start,
         "window_tokens": live,
         "circuit_breaker": breaker,
+        "circuit_breaker_5h": breaker_5h,
+        "five_hour_window": {
+            "start": five_start,
+            "reset": five_reset,
+            "seconds_to_reset": max(0.0, five_reset - now),
+            "tokens": five_live,
+        },
+        # Board-effective verdict: weekly ∧ session folded (see aggregate()).
+        # ``recommended_agent_limit`` here is the cap the board should obey.
+        "effective_breaker": effective,
     }
 
 
@@ -206,7 +319,10 @@ def pacing_snapshot(
     pocket carries its pacing state (spent/target/elapsed %, mode, agent limit,
     burn rate, time to reset), cool-down state, the tokens it burned in the
     current window, and a ``circuit_breaker`` verdict (pacing v2 — the real-time
-    spend cutoff, see :mod:`hermes_cli.zeus_circuit_breaker`). ``conn is None``
+    spend cutoff, see :mod:`hermes_cli.zeus_circuit_breaker`). Alongside it a
+    ``circuit_breaker_5h`` verdict over the nested 5h-session window and an
+    ``effective_breaker`` that folds the two (the cap the board should obey).
+    ``conn is None``
     or a missing ``pacing_state`` table yields
     an empty ``pockets`` list rather than raising, so the panel degrades to a
     "no pacing data" state instead of a 500.
