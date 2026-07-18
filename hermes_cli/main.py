@@ -305,6 +305,7 @@ from hermes_cli.subcommands.config import build_config_parser
 from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.version import build_version_parser
 from hermes_cli.subcommands.update import build_update_parser
+from hermes_cli.subcommands.layers import build_layers_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
@@ -4384,6 +4385,70 @@ def cmd_import(args):
     from hermes_cli.backup import run_import
 
     run_import(args)
+
+
+def cmd_layers(args):
+    """Sealed-core / userland layer ops: status, self-modify toggle, backup, restore."""
+    from hermes_cli import system_layers as sl
+
+    action = getattr(args, "layers_action", None)
+    if action == "status":
+        _print_layers_status(sl)
+    elif action in ("lock", "unlock"):
+        sl.set_self_modify(action == "unlock")
+        state = "ENABLED" if action == "unlock" else "DISABLED"
+        print(f"✓ self-modify {state} — sealed-core changes are now "
+              f"{'allowed' if action == 'unlock' else 'blocked'}.")
+    elif action == "backup":
+        _run_layers_backup(sl, args.layer)
+    elif action == "list":
+        _print_layers_backups(sl)
+    elif action == "restore":
+        _run_layers_restore(sl, args.backup_id, getattr(args, "clean", False))
+    else:  # pragma: no cover - argparse enforces required subaction
+        print("Unknown layers action.")
+        sys.exit(1)
+
+
+def _print_layers_status(sl) -> None:
+    enabled = sl.is_self_modify_enabled()
+    print("Hermes state layers:")
+    print(f"  sealed-core : {sl.sealed_core_root()}")
+    print(f"  userland    : {sl.userland_root()}")
+    print(f"  self-modify : {'ENABLED (sealed-core writable)' if enabled else 'DISABLED (sealed-core locked)'}")
+    print(f"  backups     : {len(sl.list_backups())} on disk ({sl.backups_root()})")
+
+
+def _run_layers_backup(sl, layer_arg: str) -> None:
+    if layer_arg == "both":
+        refs = sl.backup_all()
+    else:
+        one = sl.backup_layer(sl.Layer(layer_arg))
+        refs = [one] if one is not None else []
+    if not refs:
+        print("Nothing to back up (empty or missing layer).")
+        return
+    for ref in refs:
+        print(f"✓ {ref.layer.value}: {ref.manifest['file_count']} files → {ref.path}")
+
+
+def _print_layers_backups(sl) -> None:
+    backups = sl.list_backups()
+    if not backups:
+        print("No layer backups yet. Create one with `hermes layers backup`.")
+        return
+    for ref in backups:
+        print(f"  {ref.backup_id}  ({ref.manifest.get('file_count', '?')} files)")
+
+
+def _run_layers_restore(sl, backup_id: str, clean: bool) -> None:
+    try:
+        result = sl.restore_layer(backup_id, clean=clean)
+    except sl.LayerBackupNotFound:
+        print(f"✗ No backup with id '{backup_id}'. See `hermes layers list`.")
+        sys.exit(1)
+    extra = f", removed {result.removed} untracked" if clean else ""
+    print(f"✓ Restored {result.layer.value}: {result.restored} files{extra} → {result.root}")
 
 
 def _print_version_info(*, check_updates: bool = True) -> None:
@@ -13230,6 +13295,11 @@ def main():
     # backup command  (parser built in hermes_cli/subcommands/backup.py)
     # =========================================================================
     build_backup_parser(subparsers, cmd_backup=cmd_backup)
+
+    # =========================================================================
+    # layers command (sealed-core / userland)
+    # =========================================================================
+    build_layers_parser(subparsers, cmd_layers=cmd_layers)
 
     # =========================================================================
     # checkpoints command
