@@ -2237,6 +2237,11 @@ DEFAULT_CONFIG = {
     "memory": {
         "memory_enabled": True,
         "user_profile_enabled": True,
+        # Per-project memory isolation. When true, coding sessions inside a
+        # project root keep MEMORY.md/USER.md in a project-scoped store so
+        # preferences never leak across projects; non-coding/out-of-project
+        # sessions stay on the shared global store. False = single shared store.
+        "project_scope": False,
         # Approval gate for memory writes (add/replace/remove), applied to BOTH
         # foreground agent turns and the background self-improvement review fork
         # (the source of unprompted "wrong assumption" saves users reported).

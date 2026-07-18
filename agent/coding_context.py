@@ -51,6 +51,7 @@ Activation (config ``agent.coding_context``):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -568,6 +569,23 @@ class RuntimeMode:
             return frozenset()
         return frozenset(self.profile.compact_skill_categories)
 
+    def memory_scope(self) -> Optional[str]:
+        """Per-project memory scope key for this posture, or ``None`` for global.
+
+        Non-``None`` only when the active profile declares
+        ``memory_policy == "project"`` (the coding posture) AND the cwd resolves
+        to a project root. In every other case memory stays global (per-profile),
+        so preferences in a non-code session, or outside any project, land in the
+        shared ``memories/`` store exactly as before.
+
+        The key is a pure function of the resolved project-root path, so distinct
+        projects always map to distinct scopes (no cross-project leakage) and the
+        same project always maps to the same scope (stable across sessions).
+        """
+        if self.profile.memory_policy != "project":
+            return None
+        return project_scope_key(self.cwd)
+
 
 def resolve_runtime_mode(
     *,
@@ -814,6 +832,35 @@ def _project_facts(root: Path) -> list[str]:
         facts.append(f"- Context files: {', '.join(f.context_files)}")
 
     return facts
+
+
+def _scope_key_from_root(root: Path) -> str:
+    """Filesystem-safe, collision-resistant scope id for a project root.
+
+    ``<basename>-<8 hex>`` where the hex is a SHA-256 prefix of the root's
+    absolute path. The basename is cosmetic (so ``memories/projects/`` stays
+    human-browsable); the hash is what guarantees isolation — two roots that
+    share a basename but live in different directories never collide, and the
+    same root always yields the same key.
+    """
+    resolved = str(root.resolve())
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:8]
+    base = re.sub(r"[^A-Za-z0-9_.-]", "-", root.name).strip("-.")[:48] or "project"
+    return f"{base}-{digest}"
+
+
+def project_scope_key(cwd: Optional[str | Path] = None) -> Optional[str]:
+    """Stable per-project scope key for ``cwd`` — ``None`` outside a workspace.
+
+    Uses the same root detection as the system-prompt snapshot (git root, else
+    marker root). Returned value is safe to use as a directory name; callers key
+    per-project state (e.g. scoped memory) on it.
+    """
+    resolved = _resolve_cwd(cwd)
+    root = _git_root(resolved) or _marker_root(resolved)
+    if root is None:
+        return None
+    return _scope_key_from_root(root)
 
 
 def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, Any]]:

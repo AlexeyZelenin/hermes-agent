@@ -1396,7 +1396,24 @@ def init_agent(
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
+                from tools.memory_tool import MemoryStore, set_memory_scope
+                # Per-project memory isolation (opt-in via memory.project_scope).
+                # When enabled and this session runs in the coding posture inside
+                # a project root, scope MEMORY.md/USER.md to that project so
+                # preferences never leak between projects. Resolved once, before
+                # the store loads, and held for the session's context so every
+                # later read/write agrees on the same scope. Global (unchanged)
+                # otherwise — no migration of existing shared memory.
+                agent._memory_scope = None
+                if mem_config.get("project_scope", False):
+                    try:
+                        from agent.coding_context import resolve_runtime_mode
+                        _scope = resolve_runtime_mode(platform=platform).memory_scope()
+                        if _scope:
+                            set_memory_scope(_scope)
+                            agent._memory_scope = _scope
+                    except Exception:
+                        pass  # scope resolution is best-effort — fall back to global
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),

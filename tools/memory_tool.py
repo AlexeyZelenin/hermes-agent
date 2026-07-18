@@ -29,6 +29,7 @@ import os
 import tempfile
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -48,13 +49,52 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Active per-project memory scope. When set to a non-empty key, memory files
+# resolve to a project-isolated subdirectory instead of the shared store, so
+# preferences saved in one project never leak into another. Empty/None keeps
+# the classic global (per-profile) behaviour. A ContextVar (not a plain global)
+# mirrors the HERMES_HOME override in ``hermes_constants`` — it keeps the scope
+# consistent across every ``get_memory_dir()`` caller within a session's context
+# while staying isolated between concurrently multiplexed sessions.
+_MEMORY_SCOPE: ContextVar[Optional[str]] = ContextVar("_MEMORY_SCOPE", default=None)
+
+
+def set_memory_scope(scope: Optional[str]):
+    """Activate a per-project memory scope. Pass ``None``/"" for global memory.
+
+    Returns a token accepted by :func:`reset_memory_scope`. The ``scope`` must
+    already be a filesystem-safe key (see ``coding_context.project_scope_key``).
+    """
+    return _MEMORY_SCOPE.set(scope or None)
+
+
+def reset_memory_scope(token) -> None:
+    """Restore the memory scope captured by a prior :func:`set_memory_scope`."""
+    _MEMORY_SCOPE.reset(token)
+
+
+def get_memory_scope() -> Optional[str]:
+    """Return the active per-project memory scope key, or ``None`` if global."""
+    return _MEMORY_SCOPE.get()
+
+
 # Where memory files live — resolved dynamically so profile overrides
-# (HERMES_HOME env var changes) are always respected.  The old module-level
-# constant was cached at import time and could go stale if a profile switch
-# happened after the first import.
+# (HERMES_HOME env var changes) and the active per-project scope are always
+# respected.  The old module-level constant was cached at import time and could
+# go stale if a profile switch happened after the first import.
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Return the memories directory for the active scope.
+
+    Global (per-profile) by default: ``<hermes_home>/memories``. When a
+    per-project scope is active (set via :func:`set_memory_scope`), memory is
+    isolated under ``<hermes_home>/memories/projects/<scope>`` so a preference
+    saved in one project is invisible in another.
+    """
+    base = get_hermes_home() / "memories"
+    scope = get_memory_scope()
+    if scope:
+        return base / "projects" / scope
+    return base
 
 ENTRY_DELIMITER = "\n§\n"
 

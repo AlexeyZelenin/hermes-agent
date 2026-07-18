@@ -557,7 +557,14 @@ memory:
   
   # User profile: preferences, communication style, expectations
   user_profile_enabled: true
-  
+
+  # Per-project memory isolation. When true, coding sessions inside a project
+  # (git root or a recognised project root) keep their MEMORY.md/USER.md in a
+  # project-scoped store, so preferences learned in one project never leak into
+  # another. Non-coding sessions and sessions outside any project stay on the
+  # shared global store. Default false = the classic single shared store.
+  project_scope: false
+
   # Character limits (~2.75 chars per token, model-independent)
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
