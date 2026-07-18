@@ -1541,6 +1541,27 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    # Local model server (Ollama/vLLM via config auxiliary.local_model).
+    # The aux router already knows this provider; without this short-circuit
+    # a main-loop `--provider local` falls through to the generic env/config
+    # path and silently lands on OpenRouter/Codex instead of localhost.
+    # A user-saved custom provider named "local" keeps priority — the generic
+    # named-custom path below resolves it with its saved credentials.
+    if requested_provider == "local" and not _get_named_custom_provider("local"):
+        from agent.auxiliary_client import _resolve_local_aux_runtime
+
+        local_base_url, local_default_model, _local_enabled = (
+            _resolve_local_aux_runtime()
+        )
+        return {
+            "provider": "local",
+            "api_mode": "chat_completions",
+            "base_url": ((explicit_base_url or "").strip() or local_base_url).rstrip("/"),
+            "api_key": (explicit_api_key or "").strip() or "no-key-required",
+            "source": "local-aux-config",
+            "requested_provider": requested_provider,
+        }
+
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would
     # return provider="custom" with chat_completions api_mode and no valid key).
