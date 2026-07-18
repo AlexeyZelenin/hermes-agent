@@ -164,6 +164,52 @@ def test_coverage_gap_silent_when_not_delivered():
 
 
 # ---------------------------------------------------------------------------
+# Drift (d): unmerged-branch (stranded delivery off trunk)
+# ---------------------------------------------------------------------------
+
+
+def test_unmerged_branch_fires_for_commits_off_trunk():
+    task = {"id": "t_a483b17b", "title": "zeus_watchdog"}
+    delivery = {
+        "delivered": True, "files": ["zeus_watchdog/x.py"], "trunk": "main",
+        "unmerged_commits": ["64948e0deadbeef"],
+        "unmerged_branches": ["ra/t_a483b17b"],
+    }
+    f = ia.detect_unmerged_branch(task, delivery)
+    assert f is not None
+    assert f["kind"] == ia.KIND_UNMERGED_BRANCH
+    assert f["finding_key"] == "integrity:t_a483b17b:unmerged_branch"
+    assert f["severity"] == "warning"
+    assert "ra/t_a483b17b" in f["detail"]
+    assert f["evidence"]["unmerged_commits"] == ["64948e0deadbeef"]
+
+
+def test_unmerged_branch_silent_when_all_commits_landed():
+    task = {"id": "t_1", "title": "F"}
+    delivery = {"delivered": True, "files": ["a.py"], "trunk": "main",
+                "unmerged_commits": [], "unmerged_branches": []}
+    assert ia.detect_unmerged_branch(task, delivery) is None
+
+
+def test_unmerged_branch_silent_when_no_trunk_resolved():
+    # Probe left unmerged_commits empty (no main/master) -> no false positive.
+    task = {"id": "t_1", "title": "F"}
+    delivery = {"delivered": True, "files": ["a.py"], "trunk": None,
+                "unmerged_commits": []}
+    assert ia.detect_unmerged_branch(task, delivery) is None
+
+
+def test_unmerged_branch_disjoint_from_scratch_trap():
+    # A stranded delivery is delivered=True, so scratch-trap stays silent and
+    # only the unmerged-branch drift fires — the two never double-report.
+    task = {"id": "t_x", "title": "F", "branch_name": "ra/t_x"}
+    delivery = {"delivered": True, "files": ["x.py"], "trunk": "main",
+                "unmerged_commits": ["abc123"], "unmerged_branches": ["ra/t_x"]}
+    assert ia.detect_scratch_trap(task, delivery) is None
+    assert ia.detect_unmerged_branch(task, delivery) is not None
+
+
+# ---------------------------------------------------------------------------
 # reconcile (pure orchestration)
 # ---------------------------------------------------------------------------
 
@@ -314,6 +360,20 @@ def test_delivery_for_task_absent_for_unknown_id(temp_repo):
     assert d["files"] == []
 
 
+@pytest.fixture()
+def trunk_repo(tmp_path):
+    """A temp repo whose default branch is a real trunk (``main``)."""
+    repo = tmp_path / "trunk_repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "base.txt").write_text("base\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "chore: base")
+    return repo
+
+
 def test_delivery_for_task_on_unmerged_branch(temp_repo):
     _git(temp_repo, "checkout", "-q", "-b", "wt/t_branch01")
     (temp_repo / "b.py").write_text("y = 2\n")
@@ -324,6 +384,49 @@ def test_delivery_for_task_on_unmerged_branch(temp_repo):
     d = ia.delivery_for_task(temp_repo, "t_branch01")
     assert d["delivered"] is True
     assert "b.py" in d["files"]
+
+
+def test_delivery_reports_unmerged_commit_and_branch(trunk_repo):
+    # A commit stranded on a task branch, never merged into main.
+    _git(trunk_repo, "checkout", "-q", "-b", "ra/t_stranded")
+    (trunk_repo / "watchdog.py").write_text("z = 3\n")
+    _git(trunk_repo, "add", "-A")
+    _git(trunk_repo, "commit", "-q", "-m", "feat: watchdog (t_stranded)")
+    _git(trunk_repo, "checkout", "-q", "main")
+
+    d = ia.delivery_for_task(trunk_repo, "t_stranded")
+    assert d["delivered"] is True
+    assert d["trunk"] == "main"
+    assert len(d["unmerged_commits"]) == 1
+    assert d["unmerged_branches"] == ["ra/t_stranded"]
+
+
+def test_delivery_no_unmerged_after_merge_to_trunk(trunk_repo):
+    _git(trunk_repo, "checkout", "-q", "-b", "ra/t_landed")
+    (trunk_repo / "landed.py").write_text("z = 4\n")
+    _git(trunk_repo, "add", "-A")
+    _git(trunk_repo, "commit", "-q", "-m", "feat: landed work (t_landed)")
+    _git(trunk_repo, "checkout", "-q", "main")
+    _git(trunk_repo, "merge", "-q", "--no-ff", "--no-edit", "ra/t_landed")
+
+    d = ia.delivery_for_task(trunk_repo, "t_landed")
+    assert d["delivered"] is True
+    assert d["unmerged_commits"] == []
+    assert d["unmerged_branches"] == []
+
+
+def test_reconcile_end_to_end_flags_unmerged_branch(trunk_repo):
+    _git(trunk_repo, "checkout", "-q", "-b", "ra/t_leak001")
+    (trunk_repo / "leak.py").write_text("z = 5\n")
+    _git(trunk_repo, "add", "-A")
+    _git(trunk_repo, "commit", "-q", "-m", "feat: leak (t_leak001)")
+    _git(trunk_repo, "checkout", "-q", "main")
+
+    tasks = [{"id": "t_leak001", "title": "Leak", "branch_name": "ra/t_leak001"}]
+    findings = ia.reconcile(tasks, ia.default_git_probe(trunk_repo))
+    kinds = [f["kind"] for f in findings]
+    assert ia.KIND_UNMERGED_BRANCH in kinds
+    assert ia.KIND_SCRATCH_TRAP not in kinds  # it DID deliver, just not to trunk
 
 
 def test_default_git_probe_end_to_end_scratch_trap(temp_repo):

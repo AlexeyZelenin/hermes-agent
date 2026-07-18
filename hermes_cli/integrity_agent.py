@@ -25,6 +25,11 @@ Integrity = all three agree. DRIFT signals:
   absent now (moved/deleted, yet the trail proves it existed) — *deferred*;
 * (c) **coverage-gap** — a code delivery shipped with no test alongside it (or,
   once the DoD facet of t_48c56a39 exists, a facet claims tests but none exist).
+* (d) **unmerged-branch** — card is done and DID commit, but its commits are
+  stranded on a task branch and never landed on trunk (``main``/``master``).
+  This is the merge-queue leak that let t_a483b17b close with commit 64948e0
+  living only on ``ra/t_a483b17b`` (task t_7c3c828a): the delivery exists in git
+  but not where it ships from. Distinct from (a), which is "no commit at all".
 
 TEST COVERAGE is checked STATICALLY (no tenant, no board spin-up): we look at
 whether the delivery commit *also* touched a test file, and — when a DoD-facet
@@ -64,10 +69,16 @@ FINDINGS_SOURCE = "integrity"
 KIND_SCRATCH_TRAP = "scratch_trap"
 KIND_LOST_DELIVERY = "lost_delivery"
 KIND_COVERAGE_GAP = "coverage_gap"
-ALL_KINDS = (KIND_SCRATCH_TRAP, KIND_LOST_DELIVERY, KIND_COVERAGE_GAP)
+KIND_UNMERGED_BRANCH = "unmerged_branch"
+ALL_KINDS = (KIND_SCRATCH_TRAP, KIND_LOST_DELIVERY, KIND_COVERAGE_GAP,
+             KIND_UNMERGED_BRANCH)
 
 # A "GitDelivery" is a plain dict: {"delivered": bool, "commits": [sha, ...],
-#   "files": [repo-relative path, ...]}. A "LangfuseTrace" (deferred) is
+#   "files": [repo-relative path, ...], "trunk": name-or-None,
+#   "unmerged_commits": [sha, ...], "unmerged_branches": [name, ...]}. The last
+#   three describe merge status: commits referencing the card that are NOT yet an
+#   ancestor of trunk, and which local branches still hold them.
+#   A "LangfuseTrace" (deferred) is
 #   {"created_files": [...], "touched_files": [...]} or None. A "DodFacet"
 #   (t_48c56a39, not yet implemented) is {"requires_tests": bool} or None.
 GitProbe = Callable[[str], dict[str, Any]]
@@ -233,6 +244,49 @@ def detect_coverage_gap(
     )
 
 
+def detect_unmerged_branch(
+    task: dict[str, Any], delivery: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    """Drift (d): card done, but its commits are stranded off trunk.
+
+    Fires when the git probe found commits referencing the card that are NOT an
+    ancestor of trunk (``main``/``master``) — the delivery exists in git but only
+    on a task branch, never landed. This is the merge-queue leak that let
+    t_a483b17b close with its commit living only on ``ra/t_a483b17b``. Distinct
+    from :func:`detect_scratch_trap` (nothing committed at all): here work IS
+    committed, it just never reached the trunk it ships from. No-op when trunk
+    could not be resolved (the probe leaves ``unmerged_commits`` empty), so a repo
+    with no ``main``/``master`` never false-positives.
+    """
+    unmerged = delivery.get("unmerged_commits") or []
+    if not unmerged:
+        return None
+    tid = str(task.get("id"))
+    title = str(task.get("title") or tid)
+    trunk = str(delivery.get("trunk") or "main")
+    branches = list(delivery.get("unmerged_branches") or [])
+    if branches:
+        label = "ветка" if len(branches) == 1 else "ветки"
+        where = f" ({label} {', '.join(branches)})"
+    else:
+        where = ""
+    return _finding(
+        task, KIND_UNMERGED_BRANCH,
+        title=f"«{title}» помечена done, но её коммиты не влиты в {trunk}",
+        detail=(
+            f"Задача {tid} завершена, но {len(unmerged)} её коммит(ов) остались "
+            f"вне транка {trunk}{where} — деливери есть в git, но не приземлился "
+            "туда, откуда шипается. Мердж-квью закрыл таск без лендинга ветки."
+        ),
+        category="drift", severity="warning",
+        evidence={
+            "trunk": trunk,
+            "unmerged_commits": unmerged[:20],
+            "unmerged_branches": branches,
+        },
+    )
+
+
 def _finding(task: dict[str, Any], kind: str, *, title: str, detail: str,
              category: str, severity: str, evidence: Any) -> dict[str, Any]:
     """Assemble one finding dict, ready for :func:`emit_finding`."""
@@ -269,6 +323,7 @@ def reconcile_task(
         lambda: detect_scratch_trap(task, delivery),
         lambda: detect_lost_delivery(task, delivery, trace),
         lambda: detect_coverage_gap(task, delivery, dod),
+        lambda: detect_unmerged_branch(task, delivery),
     ):
         found = detector()
         if found:
@@ -369,7 +424,7 @@ def emit_finding(
         "  title=excluded.title, detail=excluded.detail, "
         "  evidence_json=excluded.evidence_json, category=excluded.category, "
         "  severity=excluded.severity, updated_at=excluded.updated_at, "
-        "  status=CASE WHEN findings.status IN ('dismissed','snoozed') "
+        "  status=CASE WHEN findings.status IN ('dismissed','snoozed','accepted') "
         "              THEN findings.status ELSE 'open' END",
         (board, FINDINGS_SOURCE, finding["finding_key"], finding["title"],
          finding["detail"], json.dumps(finding.get("evidence")),
@@ -442,12 +497,59 @@ def _run_git(repo: Path, args: list[str]) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
+def _git_ok(repo: Path, args: list[str]) -> bool:
+    """Run ``git -C <repo> <args>`` and report success by exit code.
+
+    For predicate plumbing like ``merge-base --is-ancestor``, which answers via
+    the exit code and emits no stdout — :func:`_run_git` can't distinguish those.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+# Trunk branches tried, in order, mirroring trunk_integrator.DEFAULT_TRUNK_CANDIDATES.
+_TRUNK_CANDIDATES = ("main", "master")
+
+
+def _resolve_trunk(repo: Path) -> Optional[str]:
+    """First existing local trunk branch (``main`` then ``master``), or ``None``."""
+    for name in _TRUNK_CANDIDATES:
+        if _git_ok(repo, ["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"]):
+            return name
+    return None
+
+
+def _local_branches_containing(
+    repo: Path, shas: Iterable[str], trunk: Optional[str]
+) -> list[str]:
+    """Local branch heads (excluding ``trunk``) that contain any of ``shas``."""
+    found: set[str] = set()
+    for sha in list(shas)[:50]:
+        out = _run_git(repo, ["for-each-ref", "--format=%(refname:short)",
+                              "--contains", sha, "refs/heads"])
+        for name in out.splitlines():
+            name = name.strip()
+            if name and name != trunk:
+                found.add(name)
+    return sorted(found)
+
+
 def delivery_for_task(repo: Path, task_id: str) -> dict[str, Any]:
-    """Git delivery for ``task_id``: commits referencing it and files they touched.
+    """Git delivery for ``task_id``: commits referencing it and their merge status.
 
     Searches every ref (``--all``) with a fixed-string grep so a card that
     landed on an unmerged branch still counts as delivered. ``files`` is the
-    union of paths those commits touched.
+    union of paths those commits touched. ``unmerged_commits`` are the referenced
+    commits that are NOT yet an ancestor of trunk (``main``/``master``) — the
+    delivery exists in git but is stranded off the branch it ships from — and
+    ``unmerged_branches`` names the local heads still holding them. When no trunk
+    resolves, the merge check is skipped (``unmerged_commits`` stays empty).
     """
     out = _run_git(repo, ["log", "--all", "--format=%H",
                           "--fixed-strings", f"--grep={task_id}"])
@@ -456,7 +558,23 @@ def delivery_for_task(repo: Path, task_id: str) -> dict[str, Any]:
     for sha in commits:
         names = _run_git(repo, ["show", "--name-only", "--format=", sha])
         files.update(n for n in names.splitlines() if n.strip())
-    return {"delivered": bool(commits), "commits": commits, "files": sorted(files)}
+
+    trunk = _resolve_trunk(repo)
+    unmerged: list[str] = []
+    if trunk:
+        unmerged = [
+            sha for sha in commits
+            if not _git_ok(repo, ["merge-base", "--is-ancestor", sha, trunk])
+        ]
+    branches = _local_branches_containing(repo, unmerged, trunk) if unmerged else []
+    return {
+        "delivered": bool(commits),
+        "commits": commits,
+        "files": sorted(files),
+        "trunk": trunk,
+        "unmerged_commits": unmerged,
+        "unmerged_branches": branches,
+    }
 
 
 def default_git_probe(repo: Path) -> GitProbe:
