@@ -74,27 +74,27 @@
         },
         {
           "id": "google/gemini-3.1-pro-preview",
-          "description": ""
+          "description": "mid coder - SWE-V 80.6%"
         },
         {
           "id": "google/gemini-3.5-flash",
-          "description": ""
+          "description": "aux - vision/multimodal, cheap"
         },
         {
           "id": "x-ai/grok-4.5",
-          "description": ""
+          "description": "niche - long-context 500k/search"
         },
         {
           "id": "deepseek/deepseek-v4-pro",
-          "description": ""
+          "description": "mid - pay-per-token, SWE-V 80.6%"
         },
         {
           "id": "deepseek/deepseek-v4-flash",
-          "description": ""
+          "description": "cheap aux - lowest $/tok"
         },
         {
           "id": "qwen/qwen3.7-max",
-          "description": ""
+          "description": "mid coder - Coding Plan flat-fee"
         },
         {
           "id": "qwen/qwen3.7-plus",
