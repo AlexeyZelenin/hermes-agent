@@ -415,6 +415,16 @@ def mark_limited(name: str, message: str, now: Optional[float] = None) -> float:
                 " VALUES (?, ?, 'limit', ?, ?)",
                 (now, name, message[:2000], reset_at),
             )
+        # Empirically measure the session cap this limit-hit just revealed, and
+        # flag a sustained vendor shift into Проблемы (task t_e38bbe56). Wholly
+        # best-effort and deterministic: a measurement failure must never block a
+        # pocket's cooldown, so any error degrades to nothing.
+        try:
+            from hermes_cli import subscription_limits
+            with conn:
+                subscription_limits.on_limit_hit(conn, name, reset_at=reset_at, now=now)
+        except Exception:  # pragma: no cover - measurement is never load-bearing
+            logger.debug("subscription-limit measurement skipped", exc_info=True)
         return reset_at
     finally:
         conn.close()

@@ -28,7 +28,7 @@ import os
 import sqlite3
 from typing import Optional
 
-from hermes_cli import zeus_circuit_breaker, zeus_tokens
+from hermes_cli import subscription_limits, zeus_circuit_breaker, zeus_tokens
 
 # Fallback window length when the true window can't be pinned from the pacing
 # row (Claude subscription limits reset weekly, so 7 days is the right default).
@@ -113,8 +113,11 @@ def _five_hour_budget(
     tripping the session wall. ``None`` when the weekly budget or length can't
     be pinned (the session verdict then degrades to ``unknown`` — fail open).
 
-    The empirically-measured true session cap (task ``t_e38bbe56``) will later
-    replace this derived share; the curve around it is identical.
+    Once the pocket has hit a limit and revealed its true session cap, the
+    empirical measurement (task ``t_e38bbe56``,
+    :func:`hermes_cli.subscription_limits.measured_session_limit`) supersedes this
+    derived share in :func:`_session_breaker`; this remains the cold-start
+    fallback. The curve around either budget is identical.
     """
     if weekly_budget is None or weekly_start is None or reset_at is None:
         return None
@@ -209,7 +212,12 @@ def _session_breaker(
     """
     start, reset = _five_hour_window(cooling_until, now)
     tokens = _window_tokens(conn, subscription, start)
-    budget = _five_hour_budget(weekly_budget, weekly_start, reset_at)
+    # Prefer the empirically-measured session cap (task t_e38bbe56) — a real
+    # limit-hit measurement gives the breaker a precise budget; fall back to the
+    # weekly-share estimate only until enough measurements exist.
+    budget = subscription_limits.measured_session_limit(conn, subscription)
+    if budget is None:
+        budget = _five_hour_budget(weekly_budget, weekly_start, reset_at)
     breaker = zeus_circuit_breaker.evaluate(
         spent_percent=None,
         live_tokens=tokens["total_tokens"] if tokens is not None else None,
