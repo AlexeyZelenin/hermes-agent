@@ -1442,7 +1442,19 @@ export default function ChatPage({
         >
           <div
             ref={hostRef}
-            className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
+            className={cn(
+              "hermes-chat-xterm-host min-h-0 min-w-0 flex-1",
+              // FitAddon always reserves a fixed gutter on the right for the
+              // xterm scrollbar (14px — `overviewRuler.width || 14`, since
+              // scrollback ≠ 0), so the terminal grid stops short of the host
+              // edge. On full-page /chat the card padding hides it, but in the
+              // flush dock that gutter is a raw-background strip the TUI skin
+              // never paints — the empty band the operator saw on the right.
+              // Grow the host 14px past the pane's right edge (the pane clips
+              // via overflow-hidden) so the reserved gutter falls off-screen
+              // and the grid fills flush to the dock/screen edge.
+              docked && "-mr-[14px]",
+            )}
           />
 
           {showReconnectOverlay && (
