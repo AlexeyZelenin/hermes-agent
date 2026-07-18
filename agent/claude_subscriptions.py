@@ -492,6 +492,38 @@ def pool_has_capacity(now: Optional[float] = None) -> bool:
         conn.close()
 
 
+def auto_resume_eta(now: Optional[float] = None) -> Optional[float]:
+    """Timestamp at which a subscription-exhausted block will deterministically
+    auto-resume, or ``None`` when no revival path exists.
+
+    The dispatcher auto-unblocks a ``[claude-subscriptions-exhausted]`` task the
+    first tick :func:`pool_has_capacity` turns true, so resume is *armed*
+    whenever some enabled, logged-in pocket is merely cooling: the block clears
+    when the earliest such cooldown lapses (returned here). If capacity already
+    exists, resume is imminent and ``now`` is returned. Returns ``None`` when
+    every pocket is disabled, logged out (auth-death), or its cooldown already
+    lapsed without freeing capacity — nothing will auto-recover, so the block
+    genuinely needs a human.
+    """
+    now = now if now is not None else time.time()
+    if pool_has_capacity(now):
+        return now
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT config_dir, cooling_until FROM claude_subscriptions"
+            " WHERE enabled = 1 AND cooling_until IS NOT NULL AND cooling_until > ?",
+            (now,),
+        ).fetchall()
+    finally:
+        conn.close()
+    etas = [
+        float(row["cooling_until"]) for row in rows
+        if Path(row["config_dir"]).is_dir() and is_logged_in(row["config_dir"])
+    ]
+    return min(etas) if etas else None
+
+
 def _try_acquire(conn: sqlite3.Connection, task_id: str, now: float) -> Optional[Lease]:
     # Login checks shell out to the Keychain — resolve candidates BEFORE
     # taking the write lock, then recheck lease counts atomically inside it.

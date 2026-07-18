@@ -468,6 +468,58 @@ class TestSelectableRows:
             conn.close()
 
 
+class TestAutoResumeEta:
+    """auto_resume_eta: is a subscription-exhausted block armed to self-heal?"""
+
+    def test_capacity_now_returns_now(self, tmp_path, _logged_in):
+        conn = subs.connect()
+        try:
+            d = tmp_path / "live"
+            d.mkdir()
+            _insert_sub(conn, "live", str(d))
+        finally:
+            conn.close()
+        now = time.time()
+        assert subs.auto_resume_eta(now) == now
+
+    def test_all_cooling_returns_earliest_future_recovery(self, tmp_path, _logged_in):
+        now = time.time()
+        conn = subs.connect()
+        try:
+            for name, eta in (("late", now + 1000), ("soon", now + 500)):
+                d = tmp_path / name
+                d.mkdir()
+                _insert_sub(conn, name, str(d), cooling_until=eta)
+        finally:
+            conn.close()
+        assert subs.auto_resume_eta(now) == now + 500
+
+    def test_all_disabled_has_no_revival_path(self, tmp_path, _logged_in):
+        now = time.time()
+        conn = subs.connect()
+        try:
+            d = tmp_path / "off"
+            d.mkdir()
+            _insert_sub(conn, "off", str(d), enabled=0, cooling_until=now + 500)
+        finally:
+            conn.close()
+        assert subs.auto_resume_eta(now) is None
+
+    def test_logged_out_cooling_pocket_is_not_a_revival_path(self, tmp_path, _logged_in):
+        # auth-death: the pocket is cooling but its cooldown lapsing won't help
+        # because it's logged out — nothing will auto-recover, so escalate.
+        now = time.time()
+        conn = subs.connect()
+        try:
+            d = tmp_path / "dead"
+            d.mkdir()
+            _insert_sub(conn, "dead", str(d), cooling_until=now + 500)
+            _logged_in.add(str(d))  # logged out
+        finally:
+            conn.close()
+        assert subs.auto_resume_eta(now) is None
+
+
 class TestTryAcquire:
     def test_leases_first_candidate(self, tmp_path, _logged_in):
         conn = subs.connect()
