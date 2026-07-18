@@ -496,6 +496,17 @@ export const ru: Translations = {
     switchTo: "Сменить язык",
   },
 
+  micInput: {
+    record: "диктовать",
+    recording: "стоп",
+    processing: "распознаю…",
+    tooltipIdle: "Надиктовать сообщение (локальное распознавание речи)",
+    tooltipRecording: "Остановить запись и распознать",
+    languageAuto: "АВТО",
+    languageRu: "RU",
+    languageToggle: "Язык распознавания",
+  },
+
   theme: {
     title: "Тема",
     switchTheme: "Сменить тему",

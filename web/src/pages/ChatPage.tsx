@@ -25,7 +25,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
+import { Copy, Loader2, Mic, PanelRight, RotateCcw, Square, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
@@ -34,6 +34,7 @@ import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
+import { useVoiceInput } from "@/hooks/useVoiceInput";
 import { api } from "@/lib/api";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { buildPtyConnectParams } from "@/lib/pty-connect";
@@ -447,6 +448,17 @@ export default function ChatPage({
     );
     return () => setEnd(null);
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd, zellijSession]);
+
+  // Inject dictated text into the Ink composer by writing it to the PTY as
+  // input (no trailing Return — the operator reviews/edits before sending).
+  // Ink inserts it at the cursor, appending to whatever's already typed.
+  const injectVoiceText = useCallback((text: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(text);
+    termRef.current?.focus();
+  }, []);
+  const voice = useVoiceInput(injectVoiceText);
 
   const handleCopyLast = () => {
     const ws = wsRef.current;
@@ -1520,6 +1532,101 @@ export default function ChatPage({
               </span>
             </span>
           </Button>
+
+          {/* Voice dictation: records the mic, transcribes locally via
+              mlx-whisper, and injects the text into the composer. Hidden
+              when the browser lacks getUserMedia/MediaRecorder. */}
+          {voice.supported && (
+            <div
+              className={cn(
+                "absolute z-10 flex flex-col items-start gap-1",
+                "bottom-2 left-2 sm:bottom-3 sm:left-3 lg:bottom-4 lg:left-4",
+              )}
+            >
+              {voice.error && (
+                <div
+                  role="alert"
+                  className="max-w-[15rem] rounded border border-warning/50 bg-black/80 px-2 py-1 text-[11px] leading-snug text-warning"
+                >
+                  {voice.error}
+                </div>
+              )}
+              <div className="flex items-center gap-1.5">
+                <Button
+                  ghost
+                  onClick={voice.toggle}
+                  disabled={voice.status === "processing"}
+                  title={
+                    voice.status === "recording"
+                      ? t.micInput?.tooltipRecording ??
+                        "Stop recording and transcribe"
+                      : t.micInput?.tooltipIdle ??
+                        "Dictate a message (local speech-to-text)"
+                  }
+                  aria-label={
+                    voice.status === "recording"
+                      ? t.micInput?.tooltipRecording ??
+                        "Stop recording and transcribe"
+                      : t.micInput?.tooltipIdle ??
+                        "Dictate a message (local speech-to-text)"
+                  }
+                  aria-pressed={voice.status === "recording"}
+                  className={cn(
+                    "normal-case tracking-normal font-normal",
+                    "rounded border border-current/30 bg-black/20",
+                    "opacity-70 hover:opacity-100 hover:border-current/60",
+                    "transition-opacity duration-150",
+                    "px-2 py-1 text-xs sm:px-2.5 sm:py-1.5",
+                    voice.status === "recording" &&
+                      "border-red-500/70 text-red-400 opacity-100 hover:border-red-500",
+                  )}
+                  style={
+                    voice.status === "recording"
+                      ? undefined
+                      : { color: terminalFg }
+                  }
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    {voice.status === "processing" ? (
+                      <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                    ) : voice.status === "recording" ? (
+                      <Square className="h-3 w-3 shrink-0 animate-pulse fill-current" />
+                    ) : (
+                      <Mic className="h-3 w-3 shrink-0" />
+                    )}
+                    <span className="hidden min-[400px]:inline tracking-wide">
+                      {voice.status === "processing"
+                        ? t.micInput?.processing ?? "transcribing…"
+                        : voice.status === "recording"
+                          ? t.micInput?.recording ?? "stop"
+                          : t.micInput?.record ?? "dictate"}
+                    </span>
+                  </span>
+                </Button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    voice.setLanguage(voice.language === "ru" ? "auto" : "ru")
+                  }
+                  disabled={voice.status !== "idle"}
+                  title={t.micInput?.languageToggle ?? "Recognition language"}
+                  aria-label={
+                    t.micInput?.languageToggle ?? "Recognition language"
+                  }
+                  className={cn(
+                    "rounded border border-current/30 bg-black/20 px-1.5 py-1 text-[11px] tracking-wide",
+                    "opacity-70 transition-opacity duration-150 hover:border-current/60 hover:opacity-100",
+                    "disabled:opacity-40",
+                  )}
+                  style={{ color: terminalFg }}
+                >
+                  {voice.language === "ru"
+                    ? t.micInput?.languageRu ?? "RU"
+                    : t.micInput?.languageAuto ?? "AUTO"}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {!narrow && !zellijSession && !docked && (

@@ -77,6 +77,7 @@ def _safe_find_spec(module_name: str) -> bool:
 
 
 _HAS_FASTER_WHISPER = _safe_find_spec("faster_whisper")
+_HAS_MLX_WHISPER = _safe_find_spec("mlx_whisper")
 _HAS_OPENAI = _safe_find_spec("openai")
 _HAS_MISTRAL = _safe_find_spec("mistralai")
 
@@ -87,6 +88,9 @@ _HAS_MISTRAL = _safe_find_spec("mistralai")
 DEFAULT_PROVIDER = "local"
 DEFAULT_LOCAL_MODEL = "base"
 DEFAULT_LOCAL_STT_LANGUAGE = "en"
+# Local mlx-whisper (Apple Silicon). The chat-composer voice button forces
+# this provider so dictation is always local, never a cloud STT API.
+DEFAULT_MLX_STT_MODEL = os.getenv("STT_MLX_MODEL", "mlx-community/whisper-large-v3-turbo")
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
@@ -787,6 +791,12 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "mlx":
+            # Route to the mlx handler even when the package is missing so the
+            # user gets the specific "install mlx-whisper" message instead of
+            # the generic "no provider" error.
+            return "mlx"
+
         if provider == "groq":
             if _HAS_OPENAI and get_env_value("GROQ_API_KEY"):
                 return "groq"
@@ -1191,6 +1201,66 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error("Local transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
+
+
+def _normalize_stt_language(language: Optional[str]) -> Optional[str]:
+    """Map a language selector to a Whisper language code, or None for auto-detect.
+
+    Treats empty / ``"auto"`` / ``"any"`` / ``"detect"`` as auto-detect so the
+    UI's ``ru | auto`` toggle can pass ``"auto"`` through unchanged.
+    """
+    if not language:
+        return None
+    normalized = str(language).strip().lower()
+    if normalized in ("", "auto", "any", "detect"):
+        return None
+    return normalized
+
+
+def _transcribe_mlx(
+    file_path: str, model_name: str, language: Optional[str] = None
+) -> Dict[str, Any]:
+    """Transcribe using local mlx-whisper (Apple Silicon, fully local, no network API).
+
+    The model weights are fetched from the Hugging Face MLX community on first
+    use and cached; transcription itself runs entirely on-device.
+    """
+    if not _HAS_MLX_WHISPER:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": (
+                "mlx-whisper is not installed. Install it on your Mac with "
+                "'pip install mlx-whisper' (Apple Silicon required)."
+            ),
+        }
+
+    try:
+        import mlx_whisper
+
+        kwargs: Dict[str, Any] = {"path_or_hf_repo": model_name}
+        forced_lang = _normalize_stt_language(language)
+        if forced_lang:
+            kwargs["language"] = forced_lang
+
+        result = mlx_whisper.transcribe(file_path, **kwargs)
+        transcript = str((result or {}).get("text") or "").strip()
+
+        logger.info(
+            "Transcribed %s via mlx-whisper (%s, lang=%s)",
+            Path(file_path).name,
+            model_name,
+            (result or {}).get("language"),
+        )
+        return {"success": True, "transcript": transcript, "provider": "mlx"}
+
+    except Exception as e:
+        logger.error("mlx-whisper transcription failed: %s", e, exc_info=True)
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"mlx-whisper transcription failed: {e}",
+        }
 
 
 def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str]]:
@@ -1709,17 +1779,28 @@ def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
+def transcribe_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    language: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
 
     Provider priority:
-      1. User config (``stt.provider`` in config.yaml)
-      2. Auto-detect: local > Groq > OpenAI > Mistral > xAI > ElevenLabs
+      1. Explicit ``provider`` argument (e.g. the chat voice button forces "mlx")
+      2. User config (``stt.provider`` in config.yaml)
+      3. Auto-detect: local > Groq > OpenAI > Mistral > xAI > ElevenLabs
 
     Args:
         file_path: Absolute path to the audio file to transcribe.
         model:     Override the model. If None, uses config or provider default.
+        language:  Override the recognition language ("ru", "en", ...) or
+                   "auto"/"" for auto-detect. If None, uses config. Currently
+                   honoured by the local and mlx providers.
+        provider:  Force a specific provider, bypassing config selection. Used
+                   by the chat composer to always dictate through local mlx.
 
     Returns:
         dict with keys:
@@ -1742,7 +1823,18 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "error": "STT is disabled in config.yaml (stt.enabled: false).",
         }
 
+    # An explicit provider argument overrides config selection entirely.
+    requested_provider = provider
+    if requested_provider:
+        stt_config = {**stt_config, "provider": requested_provider}
+
     provider = _get_provider(stt_config)
+
+    if provider == "mlx":
+        mlx_cfg = stt_config.get("mlx") or {}
+        model_name = model or mlx_cfg.get("model", DEFAULT_MLX_STT_MODEL)
+        lang = language if language is not None else mlx_cfg.get("language")
+        return _transcribe_mlx(file_path, model_name, language=lang)
 
     if provider == "local":
         local_cfg = stt_config.get("local") or {}

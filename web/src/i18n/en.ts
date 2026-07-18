@@ -557,6 +557,17 @@ export const en: Translations = {
     hint: "Toggle live auto-update of lists (chat stays live either way)",
   },
 
+  micInput: {
+    record: "dictate",
+    recording: "stop",
+    processing: "transcribing…",
+    tooltipIdle: "Dictate a message (local speech-to-text)",
+    tooltipRecording: "Stop recording and transcribe",
+    languageAuto: "AUTO",
+    languageRu: "RU",
+    languageToggle: "Recognition language",
+  },
+
   theme: {
     title: "Theme",
     switchTheme: "Switch theme",

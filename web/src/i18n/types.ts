@@ -578,6 +578,18 @@ export interface Translations {
     hint: string;
   };
 
+  // ── Chat composer voice input (optional — locales fall back to English). ──
+  micInput?: {
+    record: string;
+    recording: string;
+    processing: string;
+    tooltipIdle: string;
+    tooltipRecording: string;
+    languageAuto: string;
+    languageRu: string;
+    languageToggle: string;
+  };
+
   // ── Theme switcher ──
   theme: {
     title: string;

@@ -920,6 +920,11 @@ class WhatsAppOnboardingApply(BaseModel):
 class AudioTranscriptionRequest(BaseModel):
     data_url: str
     mime_type: Optional[str] = None
+    # Recognition language: "ru", "en", ... or "auto"/"" for auto-detect.
+    language: Optional[str] = None
+    # Force a specific STT provider (the chat composer sends "mlx" so voice
+    # dictation always runs through local mlx-whisper, never a cloud API).
+    provider: Optional[str] = None
 
 
 class ManagedFileUpload(BaseModel):
@@ -3766,7 +3771,15 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
         from tools.transcription_tools import transcribe_audio
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, transcribe_audio, temp_path)
+        result = await loop.run_in_executor(
+            None,
+            functools.partial(
+                transcribe_audio,
+                temp_path,
+                language=payload.language,
+                provider=payload.provider,
+            ),
+        )
     except HTTPException:
         raise
     except Exception as exc:
