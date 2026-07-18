@@ -53,7 +53,13 @@ EXEMPT_PROTOCOL_TOOLS = frozenset(
 # "local" is the on-device model server (Ollama/vLLM): flat-rate $0 spend.
 # Classifying it as metered would flag every turn as an unpriced api-key
 # call and fail-close the guard with budget_metering_dead.
-_SUBSCRIPTION_PROVIDERS = frozenset({"openai-codex", "xai-oauth", "local"})
+# zai / kimi-coding are flat-rate coding plans in this deployment; their
+# models are absent from the pricing feed, and metered classification would
+# flag every turn as an unpriced api-key call and fail-close the worker
+# (budget_metering_dead) - the qwen/glm night-cascade of 2026-07-19.
+_SUBSCRIPTION_PROVIDERS = frozenset(
+    {"openai-codex", "xai-oauth", "local", "zai", "kimi-coding"}
+)
 
 
 def classify_spend_source(
