@@ -283,6 +283,100 @@ def test_pocket_carries_nested_session_and_effective_verdict():
     assert fw["reset"] - fw["start"] == pytest.approx(FIVE_H)
 
 
+# ---------------------------------------------------------------------------
+# Restart survivability — a blanked window recovers from the backup cache
+# ---------------------------------------------------------------------------
+
+def _blank_windows(conn: sqlite3.Connection) -> None:
+    """Simulate the controller after a gateway restart: every pocket's window
+    comes back un-computed (reset_at NULL, idle, spent 0) even though the ledger
+    is intact — the failure mode from task t_ad49261a."""
+    conn.execute(
+        "UPDATE pacing_state SET reset_at = NULL, mode = 'idle', spent_percent = 0, "
+        "target_percent = 0, elapsed_percent = NULL, agent_limit = NULL, "
+        "burn_rate_per_min = NULL"
+    )
+    conn.commit()
+
+
+def test_all_pockets_recover_window_after_restart():
+    # Three pockets in distinct pre-restart states, mirroring the incident:
+    # personal/work1 healthy, work2 throttling toward a weekly reset days out.
+    conn = _conn()
+    _add_pacing(conn, subscription="personal", spent_percent=30.0, mode="idle")
+    _add_pacing(conn, subscription="work1", spent_percent=45.0, mode="throttle")
+    _add_pacing(
+        conn, subscription="work2", spent_percent=51.0, target_percent=37.0,
+        mode="throttle", reset_at=NOW + 4 * 24 * 3600,
+    )
+    # A healthy snapshot seeds the recovery cache for every pocket.
+    zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)
+
+    # Gateway restart blanks all windows; the dashboard polls an hour later.
+    _blank_windows(conn)
+    later = NOW + 3600
+    pockets = {
+        p["subscription"]: p
+        for p in zeus_pacing.pacing_snapshot(conn, "ra", now=later)["pockets"]
+    }
+
+    assert set(pockets) == {"personal", "work1", "work2"}
+    for name, expected_mode in [("personal", "idle"), ("work1", "throttle"), ("work2", "throttle")]:
+        p = pockets[name]
+        assert p["reset_at"] is not None, f"{name} lost its window"
+        assert p["mode"] == expected_mode
+        assert p["seconds_to_reset"] > 0
+        assert p["window_start"] is not None
+        # Restored data keeps its true age, so the UI still flags it as stale.
+        assert p["staleness_seconds"] == pytest.approx(3600.0)
+    # work2's throttle window specifically survived intact.
+    assert pockets["work2"]["reset_at"] == pytest.approx(NOW + 4 * 24 * 3600)
+    assert pockets["work2"]["spent_percent"] == 51.0
+
+
+def test_recovery_ignored_when_backed_up_reset_already_elapsed():
+    # A pocket whose cached reset has since passed: the window genuinely rolled
+    # over during downtime, so we do NOT resurrect a dead window — stay idle for
+    # the controller to re-establish it.
+    conn = _conn()
+    _add_pacing(conn, subscription="work2", reset_at=NOW + 100)
+    zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)  # seed cache (reset just ahead)
+    _blank_windows(conn)
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW + 200)["pockets"][0]
+    assert p["reset_at"] is None
+    assert p["seconds_to_reset"] is None
+
+
+def test_blanked_pocket_with_no_backup_stays_idle():
+    # Never had a healthy snapshot to back up from -> nothing to restore, and the
+    # read path must still degrade cleanly rather than raise.
+    conn = _conn()
+    _add_pacing(conn, subscription="work2", reset_at=None, mode="idle", spent_percent=0.0)
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert p["reset_at"] is None
+    assert p["mode"] == "idle"
+
+
+def test_healthy_row_is_not_overwritten_by_stale_backup():
+    # Once the controller recomputes a real window, its live reset_at wins over
+    # whatever the cache holds — restore only fills genuinely-blanked rows.
+    conn = _conn()
+    _add_pacing(conn, subscription="work2", reset_at=NOW + WEEK / 2)
+    zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)  # cache reset_at = NOW + WEEK/2
+    new_reset = NOW + WEEK  # controller establishes a fresh, later window
+    conn.execute("UPDATE pacing_state SET reset_at = ? WHERE subscription = 'work2'", (new_reset,))
+    conn.commit()
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert p["reset_at"] == pytest.approx(new_reset)
+
+
+def test_restore_degrades_when_backup_table_absent():
+    # _restore_window must never raise if the cache table was never created.
+    conn = _conn()
+    row = {"subscription": "work2", "reset_at": None}
+    assert zeus_pacing._restore_window(conn, "ra", row, NOW) is row
+
+
 def test_session_burndown_lifts_weekly_throttle_end_to_end():
     # Weekly is throttling (spent ~= 50% at 50% elapsed -> projected ~100%),
     # while the 5h session is deep in its tail (95% elapsed) and barely used ->

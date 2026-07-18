@@ -15,6 +15,19 @@ rate, time to reset — plus the actual ``token_usage`` burned in the current
 window. It answers the operator's terminal-statusline question inside the UI:
 *how much have I used, how long until reset, am I on pace?*
 
+**Restart survivability.** The weekly ``reset_at`` lives *only* in the
+controller's ``pacing_state`` row. When the gateway restarts, the controller
+re-derives each pocket's window from recent lease/probe activity — but a pocket
+that is merely pacing (not cooling, no fresh limit-hits) has no such events, so
+its window comes back un-computed: ``reset_at`` NULL, ``mode`` idle, spent 0,
+even while the ledger shows the week's real burn. To bridge that gap this module
+keeps a self-maintained recovery cache (``pacing_state_backup``): every snapshot
+backs up each healthy pocket's window fields, and a snapshot that finds a blanked
+row overlays the last-good backup (as long as its ``reset_at`` is still in the
+future). Because the cache is refreshed continuously on read, it survives even a
+hard kill (SIGKILL/SIGTERM) where an on-shutdown hook never runs. It only ever
+writes its own backup table — the controller's ``pacing_state`` is never touched.
+
 Everything degrades to empty when the ledger is absent (zeus plugin not
 installed) or a table is missing: :func:`connect` returns ``None`` and
 :func:`pacing_snapshot` returns an empty snapshot rather than raising. The DB is
@@ -40,6 +53,122 @@ _DEFAULT_WINDOW_SECONDS = 7 * 24 * 3600
 # the weekly window, so :func:`_pocket` models this second, nested curve here.
 # Matches ``agent.claude_subscriptions.LIMIT_WINDOW_SECONDS``.
 _FIVE_HOUR_WINDOW_SECONDS = 5 * 3600
+
+# The window fields this module snapshots into (and restores from) the recovery
+# cache. Excludes the (board, subscription) key. ``updated_at`` is carried too so
+# a restored pocket keeps its true staleness — the UI still flags the data as old.
+_WINDOW_COLUMNS = (
+    "window_label",
+    "spent_percent",
+    "target_percent",
+    "elapsed_percent",
+    "reset_at",
+    "mode",
+    "agent_limit",
+    "burn_rate_per_min",
+    "reason",
+    "updated_at",
+)
+
+_BACKUP_DDL = """
+CREATE TABLE IF NOT EXISTS pacing_state_backup (
+    board TEXT NOT NULL,
+    subscription TEXT NOT NULL,
+    window_label TEXT,
+    spent_percent REAL,
+    target_percent REAL,
+    elapsed_percent REAL,
+    reset_at REAL,
+    mode TEXT,
+    agent_limit INTEGER,
+    burn_rate_per_min REAL,
+    reason TEXT,
+    updated_at REAL,
+    saved_at REAL NOT NULL,
+    PRIMARY KEY (board, subscription)
+)
+"""
+
+
+def _save_window_backup(
+    conn: sqlite3.Connection, board: str, rows: list[sqlite3.Row], now: float
+) -> None:
+    """Cache each healthy pocket's window fields for restart recovery.
+
+    Only rows whose ``reset_at`` is set are backed up, so a controller row that
+    was blanked by a restart never overwrites the last-good backup we need to
+    restore *from*. Best-effort: a read-only DB or write contention degrades to a
+    no-op — the cache is an optimization, never a correctness dependency.
+    """
+    healthy = [r for r in rows if r["reset_at"] is not None]
+    if not healthy:
+        return
+    try:
+        conn.execute(_BACKUP_DDL)
+        conn.executemany(
+            "INSERT INTO pacing_state_backup "
+            "(board, subscription, window_label, spent_percent, target_percent, "
+            "elapsed_percent, reset_at, mode, agent_limit, burn_rate_per_min, "
+            "reason, updated_at, saved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(board, subscription) DO UPDATE SET "
+            "window_label=excluded.window_label, spent_percent=excluded.spent_percent, "
+            "target_percent=excluded.target_percent, "
+            "elapsed_percent=excluded.elapsed_percent, reset_at=excluded.reset_at, "
+            "mode=excluded.mode, agent_limit=excluded.agent_limit, "
+            "burn_rate_per_min=excluded.burn_rate_per_min, reason=excluded.reason, "
+            "updated_at=excluded.updated_at, saved_at=excluded.saved_at",
+            [
+                (
+                    board,
+                    r["subscription"],
+                    r["window_label"],
+                    r["spent_percent"],
+                    r["target_percent"],
+                    r["elapsed_percent"],
+                    r["reset_at"],
+                    r["mode"],
+                    r["agent_limit"],
+                    r["burn_rate_per_min"],
+                    r["reason"],
+                    r["updated_at"],
+                    now,
+                )
+                for r in healthy
+            ],
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def _restore_window(conn: sqlite3.Connection, board: str, row: sqlite3.Row, now: float):
+    """Overlay the last-good window backup onto a row the controller blanked.
+
+    A restart leaves a pacing row with a NULL ``reset_at`` (window un-computed).
+    When that happens, pull the cached window fields and overlay them so the
+    pocket shows its last-known pacing state instead of a phantom idle/0%. The
+    backup is only used while its ``reset_at`` is still in the future — a reset
+    that already elapsed means the window genuinely rolled over during downtime,
+    so we leave the pocket idle for the controller to re-establish. Rows that
+    already carry a ``reset_at`` pass through untouched.
+    """
+    if row["reset_at"] is not None:
+        return row
+    try:
+        backup = conn.execute(
+            "SELECT window_label, spent_percent, target_percent, elapsed_percent, "
+            "reset_at, mode, agent_limit, burn_rate_per_min, reason, updated_at "
+            "FROM pacing_state_backup WHERE board = ? AND subscription = ?",
+            (board, row["subscription"]),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return row
+    if backup is None or backup["reset_at"] is None or backup["reset_at"] <= now:
+        return row
+    merged = dict(row)
+    for col in _WINDOW_COLUMNS:
+        merged[col] = backup[col]
+    return merged
 
 
 def connect(path: Optional[os.PathLike | str] = None) -> Optional[sqlite3.Connection]:
@@ -346,7 +475,8 @@ def pacing_snapshot(
         ).fetchall()
     except sqlite3.OperationalError:
         return empty
-    pockets = [_pocket(r, subs, conn, now) for r in rows]
+    _save_window_backup(conn, board, rows, now)
+    pockets = [_pocket(_restore_window(conn, board, r, now), subs, conn, now) for r in rows]
     total = sum(
         p["window_tokens"]["total_tokens"]
         for p in pockets
