@@ -319,6 +319,28 @@ def _resolve_context_budget_tokens(cfg: dict) -> int:
 
 
 
+def _grid_suggestion(tier: str) -> str:
+    """Advisory data-driven vendor pick for *tier*, or ''.
+
+    Best-effort and fail-open: the price-vs-suitability router is auditable
+    context, never a hard model override (a vendor may lack credentials), so
+    any failure is swallowed and the assignment note is left unchanged.
+    """
+    try:
+        from hermes_cli import model_grid
+        decision = model_grid.route_for_decompose_tier(tier)
+    except Exception as exc:  # noqa: BLE001 — advisory only, must never break decompose
+        logger.debug("decompose: grid suggestion failed for tier %s: %s", tier, exc)
+        return ""
+    if decision is None:
+        return ""
+    price = (f"${decision.blended_price:.3f}/M"
+             if decision.blended_price is not None else "sub")
+    return (f" [grid: {decision.vendor}/{decision.model} — "
+            f"{decision.suitability_metric.replace('_', '-')} "
+            f"{decision.suitability:g}, {price}, {decision.mode}]")
+
+
 def _format_assignment_comment(tier: str, model: Optional[str],
                                rationale: str) -> str:
     """One-line, human-readable model-assignment note for a child task."""
@@ -326,6 +348,7 @@ def _format_assignment_comment(tier: str, model: Optional[str],
     line = f"Model tier: {tier} → {target}"
     if rationale:
         line += f" — {rationale}"
+    line += _grid_suggestion(tier)
     return line
 
 

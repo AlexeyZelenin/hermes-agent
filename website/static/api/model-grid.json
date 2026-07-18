@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "updated": "2026-07-18",
+  "task": "t_f1950f4c",
+  "source_doc": "knowledge/research-agent-vendors.md (research task t_ae8bb5a7)",
+  "note": "Data-driven suitability+price grid for multi-vendor auxiliary routing. Every benchmark number carries a per-number source in `sources`; gaps are explicit null (never a number borrowed from a different leaderboard or model version). Benchmarks are from independent leaderboards only. Prices are per-1M-tokens (cache-miss). See research-agent-vendors.md warnings: do NOT merge numbers across leaderboards; flagship-2026 models are absent from Aider Polyglot so it is not used here.",
+  "classes": ["cheap", "aux", "mid", "niche"],
+  "models": [
+    {
+      "id": "deepseek-v4-flash",
+      "catalog_id": "deepseek/deepseek-v4-flash",
+      "vendor": "deepseek",
+      "provider": "deepseek",
+      "class": "cheap",
+      "price_in_per_mtok": 0.14,
+      "price_out_per_mtok": 0.28,
+      "subscription": false,
+      "subscription_plan": null,
+      "swe_bench_verified": 79.0,
+      "swe_bench_pro": null,
+      "lmarena_elo": null,
+      "notes": "Lowest $/tok among tool-capable; cheap-slot recommendation.",
+      "sources": {
+        "price": "api-docs.deepseek.com/quick_start/pricing, nxcode.io (2026-07-18)",
+        "swe_bench_verified": "llm-stats.com/benchmarks/swe-bench-verified (2026-07-18)",
+        "subscription": "nxcode.io, api-docs.deepseek.com (2026-07-18): no subscription, pay-per-token only"
+      }
+    },
+    {
+      "id": "deepseek-v3.2",
+      "catalog_id": "deepseek/deepseek-v3.2",
+      "vendor": "deepseek",
+      "provider": "deepseek",
+      "class": "cheap",
+      "price_in_per_mtok": 0.28,
+      "price_out_per_mtok": 0.42,
+      "subscription": false,
+      "subscription_plan": null,
+      "swe_bench_verified": 73.1,
+      "swe_bench_pro": null,
+      "lmarena_elo": 1424,
+      "notes": "Legacy cheap/aux tier.",
+      "sources": {
+        "price": "api-docs.deepseek.com/quick_start/pricing (2026-07-18): V3.2-chat $0.28/$0.42",
+        "swe_bench_verified": "llm-stats.com/benchmarks/swe-bench-verified (2026-07-18)",
+        "lmarena_elo": "metatext.io/benchmarks/lmarena-elo (2026-07-18)"
+      }
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "catalog_id": "google/gemini-3.5-flash-lite",
+      "vendor": "gemini",
+      "provider": "gemini",
+      "class": "cheap",
+      "price_in_per_mtok": 0.10,
+      "price_out_per_mtok": null,
+      "subscription": true,
+      "subscription_plan": "Google AI (Free/Plus $7.99/Pro $19.99/Ultra $99.99 per mo)",
+      "swe_bench_verified": null,
+      "swe_bench_pro": null,
+      "lmarena_elo": null,
+      "notes": "Subscription-backed cheap alternative; output price and benchmarks not published for this tier.",
+      "sources": {
+        "price": "cloudzero.com/blog/gemini-pricing, suprmind.ai (2026-07-18): Flash-Lite from $0.10 in",
+        "subscription": "blog.google, felloai.com, suprmind.ai (2026-07-18)"
+      }
+    },
+    {
+      "id": "glm-5.2",
+      "catalog_id": "z-ai/glm-5.2",
+      "vendor": "glm",
+      "provider": "zai",
+      "class": "aux",
+      "price_in_per_mtok": null,
+      "price_out_per_mtok": null,
+      "subscription": true,
+      "subscription_plan": "GLM Coding Plan (Lite $18 / Pro $72 / Max $160 per mo)",
+      "swe_bench_verified": null,
+      "swe_bench_pro": 62.1,
+      "lmarena_elo": 1465,
+      "notes": "Best price-quality flat-fee coder; runs in Claude Code via Anthropic/OpenAI-compat. GLM-5.2 not separately listed on SWE-bench Verified (llm-stats lists GLM-5 at 77.8%).",
+      "sources": {
+        "subscription": "z.ai/subscribe, aipricing.guru/z-ai-subscription-pricing (2026-07-18)",
+        "swe_bench_pro": "benchlm.ai/models/glm-5-2, groundy.com (2026-07): 62.1%",
+        "lmarena_elo": "metatext.io/benchmarks/lmarena-elo (2026-07-18)"
+      }
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "catalog_id": "google/gemini-3.5-flash",
+      "vendor": "gemini",
+      "provider": "gemini",
+      "class": "aux",
+      "price_in_per_mtok": 1.50,
+      "price_out_per_mtok": 9.00,
+      "subscription": true,
+      "subscription_plan": "Google AI (Free/Plus $7.99/Pro $19.99/Ultra $99.99 per mo)",
+      "swe_bench_verified": null,
+      "swe_bench_pro": null,
+      "lmarena_elo": 1480,
+      "notes": "Vision/multimodal aux — only vendor of the five with strong native multimodality plus a cheap tier. SWE-bench Verified not listed for the 3.5-Flash version (llm-stats lists Gemini 3 Flash at 78.0%).",
+      "sources": {
+        "price": "cloudzero.com/blog/gemini-pricing (2026-07-18): $1.50/$9.00",
+        "lmarena_elo": "metatext.io/benchmarks/lmarena-elo (2026-07-18)",
+        "subscription": "blog.google, felloai.com (2026-07-18)"
+      }
+    },
+    {
+      "id": "gemini-3-flash",
+      "catalog_id": "google/gemini-3-flash",
+      "vendor": "gemini",
+      "provider": "gemini",
+      "class": "aux",
+      "price_in_per_mtok": null,
+      "price_out_per_mtok": null,
+      "subscription": true,
+      "subscription_plan": "Google AI (Free/Plus $7.99/Pro $19.99/Ultra $99.99 per mo)",
+      "swe_bench_verified": 78.0,
+      "swe_bench_pro": null,
+      "lmarena_elo": null,
+      "notes": "Per-token price for this exact version not published in the surveyed sources (null, not borrowed from the 3.5 tier).",
+      "sources": {
+        "swe_bench_verified": "llm-stats.com/benchmarks/swe-bench-verified (2026-07-18)",
+        "subscription": "blog.google, felloai.com (2026-07-18)"
+      }
+    },
+    {
+      "id": "glm-5",
+      "catalog_id": "z-ai/glm-5",
+      "vendor": "glm",
+      "provider": "zai",
+      "class": "aux",
+      "price_in_per_mtok": null,
+      "price_out_per_mtok": null,
+      "subscription": true,
+      "subscription_plan": "GLM Coding Plan (Lite $18 / Pro $72 / Max $160 per mo)",
+      "swe_bench_verified": 77.8,
+      "swe_bench_pro": null,
+      "lmarena_elo": 1446,
+      "notes": "Prior-gen GLM; carries a clean SWE-bench Verified number.",
+      "sources": {
+        "swe_bench_verified": "llm-stats.com/benchmarks/swe-bench-verified (2026-07-18)",
+        "lmarena_elo": "metatext.io/benchmarks/lmarena-elo (2026-07-18)",
+        "subscription": "z.ai/subscribe (2026-07-18)"
+      }
+    },
+    {
+      "id": "qwen-3.6-plus",
+      "catalog_id": "qwen/qwen3.6-plus",
+      "vendor": "qwen",
+      "provider": "alibaba-coding-plan",
+      "class": "aux",
+      "price_in_per_mtok": null,
+      "price_out_per_mtok": null,
+      "subscription": true,
+      "subscription_plan": "Qwen Coding Plan (~$50/mo Pro, up to 90K req/mo)",
+      "swe_bench_verified": 78.8,
+      "swe_bench_pro": null,
+      "lmarena_elo": null,
+      "notes": "Per-model per-token price not individually published (Qwen prices only Qwen3-Coder-Plus, context-scaled); null, not borrowed.",
+      "sources": {
+        "swe_bench_verified": "llm-stats.com/benchmarks/swe-bench-verified (2026-07-18)",
+        "subscription": "alibabacloud.com/help/en/model-studio/coding-plan (2026-07-18)"
+      }
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "catalog_id": "deepseek/deepseek-v4-pro",
+      "vendor": "deepseek",
+      "provider": "deepseek",
+      "class": "mid",
+      "price_in_per_mtok": 0.435,
+      "price_out_per_mtok": 0.87,
+      "subscription": false,
+      "subscription_plan": null,
+      "swe_bench_verified": 80.6,
+      "swe_bench_pro": null,
+      "lmarena_elo": 1449,
+      "notes": "Metered mid pick — spot/sporadic load; ~80% SWE-V at a fraction of frontier price.",
+      "sources": {
+        "price": "api-docs.deepseek.com/quick_start/pricing, nxcode.io (2026-07-18): $0.435/$0.87",
+        "swe_bench_verified": "llm-stats.com/benchmarks/swe-bench-verified (2026-07-18)",
+        "lmarena_elo": "metatext.io/benchmarks/lmarena-elo (2026-07-18)"
+      }
+    },
+    {
+      "id": "gemini-3.1-pro",
+      "catalog_id": "google/gemini-3.1-pro",
+      "vendor": "gemini",
+      "provider": "gemini",
+      "class": "mid",
+      "price_in_per_mtok": 2.00,
+      "price_out_per_mtok": 12.00,
+      "subscription": true,
+      "subscription_plan": "Google AI (Free/Plus $7.99/Pro $19.99/Ultra $99.99 per mo)",
+      "swe_bench_verified": 80.6,
+      "swe_bench_pro": null,
+      "lmarena_elo": 1480,
+      "notes": "Mid coder with strong multimodality; metered price higher than DeepSeek/Qwen at equal SWE-V.",
+      "sources": {
+        "price": "cloudzero.com/blog/gemini-pricing, suprmind.ai (2026-07-18): $2.00/$12.00",
+        "swe_bench_verified": "llm-stats.com/benchmarks/swe-bench-verified (2026-07-18)",
+        "lmarena_elo": "metatext.io/benchmarks/lmarena-elo (2026-07-18)",
+        "subscription": "blog.google (2026-07-18)"
+      }
+    },
+    {
+      "id": "qwen-3.7-max",
+      "catalog_id": "qwen/qwen3.7-max",
+      "vendor": "qwen",
+      "provider": "alibaba-coding-plan",
+      "class": "mid",
+      "price_in_per_mtok": null,
+      "price_out_per_mtok": null,
+      "subscription": true,
+      "subscription_plan": "Qwen Coding Plan (~$50/mo Pro, up to 90K req/mo)",
+      "swe_bench_verified": 80.4,
+      "swe_bench_pro": null,
+      "lmarena_elo": 1475,
+      "notes": "Flat-fee mid coder; per-model metered price not individually published (null, not borrowed).",
+      "sources": {
+        "swe_bench_verified": "llm-stats.com/benchmarks/swe-bench-verified (2026-07-18)",
+        "lmarena_elo": "metatext.io/benchmarks/lmarena-elo (2026-07-18): 3.7 Max Thinking",
+        "subscription": "alibabacloud.com/help/en/model-studio/coding-plan (2026-07-18)"
+      }
+    },
+    {
+      "id": "grok-4.5",
+      "catalog_id": "x-ai/grok-4.5",
+      "vendor": "grok",
+      "provider": "xai",
+      "class": "niche",
+      "price_in_per_mtok": 2.00,
+      "price_out_per_mtok": 6.00,
+      "subscription": true,
+      "subscription_plan": "SuperGrok $30/mo standalone (X Premium $8 / Premium+ $40 / Heavy $300)",
+      "swe_bench_verified": null,
+      "swe_bench_pro": null,
+      "lmarena_elo": null,
+      "notes": "Niche: long-context 500k/1M + search. Not on canonical leaderboards; third-party SWE-V ~86.6% (benchlm/vals.ai) is NOT canon and is excluded from routing. Grok 4.1 LMArena 1437 (4.5 not yet listed).",
+      "sources": {
+        "price": "x.ai/pricing, felloai.com, eesel.ai/blog/grok-4-5-pricing (2026-07-18): $2/$6",
+        "subscription": "x.ai/pricing, felloai.com (2026-07-18)",
+        "swe_bench_verified_thirdparty": "benchlm.ai/models/grok-4-5, vals.ai/benchmarks/swebench (2026-07): ~86.6% — third-party, not canon, not used for routing"
+      }
+    }
+  ]
+}
