@@ -44,6 +44,7 @@ import contextlib
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
@@ -295,6 +296,16 @@ _PROVIDER_ALIASES = {
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
     "tencentmaas": "tencent-tokenhub",
+    # Local OpenAI-compatible coder backend (Ollama / MLX / LM-Studio) reached
+    # over http://localhost:11434/v1. Registered as the zero-token aux/cheap
+    # tier — see the ``local`` branch in resolve_provider_client and
+    # _try_local_openai. Distinct from the "lmstudio" first-class provider.
+    "ollama": "local",
+    "ollama-local": "local",
+    "mlx": "local",
+    "local-openai": "local",
+    "local-model": "local",
+    "local-coder": "local",
 }
 
 
@@ -497,6 +508,10 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "opencode-go": "glm-5",
     "kilocode": "google/gemini-3-flash-preview",
     "ollama-cloud": "nemotron-3-nano:30b",
+    # Local coder backend default. The live value is resolved (with config/env
+    # override) in _resolve_local_aux_runtime(); this static entry is the
+    # fallback for any other caller of _get_aux_model_for_provider("local").
+    "local": "qwen3-coder:30b",
     "tencent-tokenhub": "hy3-preview",
     # NB: no "deepinfra" entry — its aux model lives on the ProviderProfile
     # (plugins/model-providers/deepinfra: default_aux_model), which
@@ -2422,6 +2437,108 @@ def _current_custom_base_url() -> str:
     return custom_base or ""
 
 
+# ── Local coder backend (Ollama / MLX / LM-Studio, OpenAI-compatible) ────────
+#
+# A zero-token aux/cheap tier: a local ~30B coder (default Qwen3-Coder-30B-A3B
+# via Ollama) serves the offload-worthy side tasks — classification, simple
+# edits, toolset selection — on the operator's own hardware, so no subscription
+# or metered tokens are spent. Reached over the standard OpenAI wire, so it
+# needs no bespoke transport. See model_grid.py (`local` route mode) for the
+# matching router-side registration and knowledge/local-coder-aux-tier.md.
+_LOCAL_AUX_DEFAULT_BASE_URL = "http://localhost:11434/v1"   # Ollama default
+_LOCAL_AUX_DEFAULT_MODEL = "qwen3-coder:30b"
+_LOCAL_AUX_REACHABLE_TTL = 20.0            # seconds; avoids a probe per aux call
+_local_reachable_cache: Dict[str, Tuple[float, bool]] = {}
+
+
+def _resolve_local_aux_runtime() -> Tuple[str, str, bool]:
+    """Resolve the local coder endpoint: ``(base_url, model, enabled)``.
+
+    Precedence (each field independently): env var → ``auxiliary.local_model``
+    config → built-in default. ``enabled`` gates only whether the *auto* aux
+    chain reaches for the local box; an explicit ``provider: local`` request
+    always attempts it (still reachability-gated), matching how the user's
+    explicit intent overrides auto policy elsewhere in this module.
+    """
+    cfg: Dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("auxiliary") or {}).get("local_model")
+        if isinstance(raw, dict):
+            cfg = raw
+    except Exception:
+        cfg = {}
+
+    base_url = (
+        os.getenv("HERMES_LOCAL_AUX_BASE_URL", "").strip()
+        or str(cfg.get("base_url", "")).strip()
+        or _LOCAL_AUX_DEFAULT_BASE_URL
+    )
+    base_url = _to_openai_base_url(base_url).rstrip("/")
+    model = (
+        os.getenv("HERMES_LOCAL_AUX_MODEL", "").strip()
+        or str(cfg.get("model", "")).strip()
+        or _LOCAL_AUX_DEFAULT_MODEL
+    )
+    env_enabled = os.getenv("HERMES_LOCAL_AUX_ENABLED", "").strip().lower()
+    if env_enabled in {"1", "true", "yes", "on"}:
+        enabled = True
+    elif env_enabled in {"0", "false", "no", "off"}:
+        enabled = False
+    else:
+        enabled = bool(cfg.get("enabled", False))
+    return base_url, model, enabled
+
+
+def _local_endpoint_reachable(base_url: str) -> bool:
+    """Cheap TCP-connect reachability probe for the local endpoint (cached).
+
+    A local model server that isn't running must not stall every aux call with
+    a full HTTP timeout, so we do a short-timeout socket connect and cache the
+    verdict briefly. On the hot path this is one cached bool.
+    """
+    if not base_url:
+        return False
+    now = time.monotonic()
+    cached = _local_reachable_cache.get(base_url)
+    if cached is not None and (now - cached[0]) < _LOCAL_AUX_REACHABLE_TTL:
+        return cached[1]
+
+    parsed = urlparse(base_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    ok = False
+    try:
+        with socket.create_connection((host, port), timeout=0.4):
+            ok = True
+    except OSError:
+        ok = False
+    _local_reachable_cache[base_url] = (now, ok)
+    return ok
+
+
+def _try_local_openai(vision: bool = False) -> Tuple[Optional[Any], Optional[str]]:
+    """Auto-chain builder for the local coder backend (opt-in + reachable).
+
+    Only participates in the *auto* fallback chain when the operator has enabled
+    it (``auxiliary.local_model.enabled`` / ``HERMES_LOCAL_AUX_ENABLED``) and the
+    endpoint answers. Vision is out of scope for the local coder — a text model
+    can't caption images, so we decline and let the vision chain continue.
+    """
+    if vision:
+        return None, None
+    base_url, model, enabled = _resolve_local_aux_runtime()
+    if not enabled:
+        return None, None
+    if not _local_endpoint_reachable(base_url):
+        logger.debug("Auxiliary client: local endpoint %s not reachable — skipping", base_url)
+        return None, None
+    logger.debug("Auxiliary client: local coder backend (%s @ %s)", model, base_url)
+    client = _create_openai_client(api_key="no-key-required", base_url=base_url)
+    return client, model
+
+
 def _validate_proxy_env_urls() -> None:
     """Fail fast with a clear error when proxy env vars have malformed URLs.
 
@@ -2814,6 +2931,10 @@ def _get_provider_chain() -> List[tuple]:
     a caller explicitly requests it with a model.
     """
     return [
+        # Opt-in local coder box first: when enabled + reachable it saves
+        # subscription/metered tokens on every side task; when disabled or down
+        # it declines immediately (cached bool) and the paid chain proceeds.
+        ("local", _try_local_openai),
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
@@ -4283,6 +4404,18 @@ def _resolve_auto(
             )
             _stale_base_url_warned = True
 
+    # ── Step 0: opt-in local coder box preempts the paid main provider ──
+    #
+    # When the operator has enabled a local model (auxiliary.local_model.enabled
+    # / HERMES_LOCAL_AUX_ENABLED) they did so precisely to keep auto side tasks
+    # off subscription/metered tokens, so it wins ahead of Step 1. Text-only and
+    # reachability-gated: vision resolves elsewhere, and a stopped server falls
+    # straight through to the main-provider resolution below (nothing breaks).
+    _local_client, _local_model = _try_local_openai()
+    if _local_client is not None:
+        logger.info("Auxiliary auto-detect: using local coder backend (%s)", _local_model)
+        return _local_client, _local_model
+
     # ── Step 1: main provider + main model → use them directly ──
     #
     # This is the primary aux backend for every user.  "auto" means
@@ -4578,7 +4711,11 @@ def resolve_provider_client(
     # sent to Codex after the main lane fell back to gpt-5.5). Let _resolve_auto()
     # return the actual current runtime model when the caller did not explicitly
     # request one. (# compression-current-model)
-    if not model and provider != "auto":
+    # "local" is excluded alongside "auto": the local branch resolves its own
+    # model from _resolve_local_aux_runtime() (config/env/default). Pre-filling
+    # here would leak the user's main-chat slug (e.g. a Claude id) onto the
+    # local Ollama endpoint, which would 404.
+    if not model and provider not in ("auto", "local"):
         model = _get_aux_model_for_provider(provider) or _read_main_model() or model
 
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
@@ -4729,6 +4866,29 @@ def resolve_provider_client(
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
+    # ── Local coder backend (Ollama / MLX / LM-Studio, OpenAI-compatible) ────
+    # The zero-token aux/cheap tier. An explicit ``provider: local`` request
+    # attempts the local box regardless of the enabled-flag (explicit intent
+    # wins), but is still reachability-gated so a stopped server degrades to
+    # (None, None) — the call_llm graceful-fallback set then routes onward
+    # instead of raising. Local servers need no auth; use a placeholder key.
+    if provider == "local":
+        base_url, default_model, _enabled = _resolve_local_aux_runtime()
+        endpoint = explicit_base_url and _to_openai_base_url(explicit_base_url).rstrip("/") or base_url
+        if not _local_endpoint_reachable(endpoint):
+            logger.warning(
+                "resolve_provider_client: local backend requested but %s is not "
+                "reachable — start the local model server (e.g. `ollama serve`) "
+                "or unset provider=local.", endpoint,
+            )
+            return None, None
+        final_model = model or default_model
+        client = _create_openai_client(
+            api_key=explicit_api_key or "no-key-required", base_url=endpoint,
+        )
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
@@ -6763,7 +6923,7 @@ def call_llm(
             # tasks because fallback entries may use OAuth / credential-pool
             # auth (for example openai-codex).
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            if _explicit and _explicit not in {"auto", "openrouter", "custom", "local"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit,
                 )
@@ -7381,7 +7541,7 @@ async def async_call_llm(
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            if _explicit and _explicit not in {"auto", "openrouter", "custom", "local"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit,
                 )

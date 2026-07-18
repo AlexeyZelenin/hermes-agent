@@ -1963,11 +1963,13 @@ class TestIsRateLimitError:
 class TestGetProviderChain:
     """_get_provider_chain() resolves functions at call time (testable)."""
 
-    def test_returns_four_entries(self):
+    def test_returns_expected_entries(self):
         chain = _get_provider_chain()
-        assert len(chain) == 4
+        assert len(chain) == 5
         labels = [label for label, _ in chain]
-        assert labels == ["openrouter", "nous", "local/custom", "api-key"]
+        # "local" (opt-in zero-token box) leads; it declines instantly when
+        # disabled/unreachable so the paid chain order is otherwise unchanged.
+        assert labels == ["local", "openrouter", "nous", "local/custom", "api-key"]
         # Codex is deliberately NOT in this chain — see _get_provider_chain
         # docstring. ChatGPT-account Codex has a shifting model allow-list;
         # guessing a model to fall back on breaks more often than it helps.
@@ -1978,7 +1980,7 @@ class TestGetProviderChain:
         sentinel = lambda: ("patched", "model")
         with patch("agent.auxiliary_client._try_openrouter", sentinel):
             chain = _get_provider_chain()
-        assert chain[0] == ("openrouter", sentinel)
+        assert ("openrouter", sentinel) in chain
 
 
 class TestTryPaymentFallback:
@@ -6017,3 +6019,155 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+
+class TestLocalAuxBackend:
+    """Local coder backend (Ollama / MLX / LM-Studio) — task t_2cfa06c1.
+
+    The zero-token aux/cheap tier: a local OpenAI-compatible endpoint that,
+    when enabled + reachable, serves side tasks with no subscription/metered
+    cost, and degrades cleanly (returns no client, callers fall onward) when
+    the server is down.
+    """
+
+    def test_local_runtime_aliases(self):
+        for alias in ("ollama", "mlx", "local-openai", "local-model", "local-coder"):
+            assert _normalize_aux_provider(alias) == "local"
+
+    def test_resolve_runtime_defaults(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        for var in ("HERMES_LOCAL_AUX_BASE_URL", "HERMES_LOCAL_AUX_MODEL",
+                    "HERMES_LOCAL_AUX_ENABLED"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(aux, "load_config", lambda: {}, raising=False)
+        # No config module patch needed — resolver swallows config errors.
+        base_url, model, enabled = aux._resolve_local_aux_runtime()
+        assert base_url == "http://localhost:11434/v1"
+        assert model == "qwen3-coder:30b"
+        assert enabled is False           # opt-in by default
+
+    def test_resolve_runtime_env_overrides(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        monkeypatch.setenv("HERMES_LOCAL_AUX_BASE_URL", "http://box.local:1234/v1")
+        monkeypatch.setenv("HERMES_LOCAL_AUX_MODEL", "qwen2.5-coder:32b")
+        monkeypatch.setenv("HERMES_LOCAL_AUX_ENABLED", "true")
+        base_url, model, enabled = aux._resolve_local_aux_runtime()
+        assert base_url == "http://box.local:1234/v1"
+        assert model == "qwen2.5-coder:32b"
+        assert enabled is True
+
+    def test_reachable_true_against_live_socket(self):
+        import socket as _socket
+        import agent.auxiliary_client as aux
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            aux._local_reachable_cache.clear()
+            assert aux._local_endpoint_reachable(f"http://127.0.0.1:{port}/v1") is True
+        finally:
+            srv.close()
+
+    def test_reachable_false_against_closed_port(self):
+        import agent.auxiliary_client as aux
+        aux._local_reachable_cache.clear()
+        # Port 1 is privileged and not listening — connect fails fast.
+        assert aux._local_endpoint_reachable("http://127.0.0.1:1/v1") is False
+
+    def test_try_local_openai_disabled_returns_none(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "_resolve_local_aux_runtime",
+                            lambda: ("http://localhost:11434/v1", "qwen3-coder:30b", False))
+        assert aux._try_local_openai() == (None, None)
+
+    def test_try_local_openai_enabled_and_reachable(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        sentinel = MagicMock(name="openai-client")
+        monkeypatch.setattr(aux, "_resolve_local_aux_runtime",
+                            lambda: ("http://localhost:11434/v1", "qwen3-coder:30b", True))
+        monkeypatch.setattr(aux, "_local_endpoint_reachable", lambda _b: True)
+        monkeypatch.setattr(aux, "_create_openai_client",
+                            lambda **kw: sentinel)
+        client, model = aux._try_local_openai()
+        assert client is sentinel and model == "qwen3-coder:30b"
+
+    def test_try_local_openai_declines_vision(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "_resolve_local_aux_runtime",
+                            lambda: ("http://localhost:11434/v1", "qwen3-coder:30b", True))
+        assert aux._try_local_openai(vision=True) == (None, None)
+
+    def test_resolve_provider_client_local_reachable(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        captured = {}
+
+        def _fake_create(**kw):
+            captured.update(kw)
+            return MagicMock(name="client")
+
+        monkeypatch.setattr(aux, "_resolve_local_aux_runtime",
+                            lambda: ("http://localhost:11434/v1", "qwen3-coder:30b", True))
+        monkeypatch.setattr(aux, "_local_endpoint_reachable", lambda _b: True)
+        monkeypatch.setattr(aux, "_create_openai_client", _fake_create)
+        client, model = resolve_provider_client("local")
+        assert client is not None
+        assert model == "qwen3-coder:30b"
+        assert captured["api_key"] == "no-key-required"   # local needs no auth
+        assert captured["base_url"] == "http://localhost:11434/v1"
+
+    def test_resolve_provider_client_local_unreachable_returns_none(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "_resolve_local_aux_runtime",
+                            lambda: ("http://localhost:11434/v1", "qwen3-coder:30b", True))
+        monkeypatch.setattr(aux, "_local_endpoint_reachable", lambda _b: False)
+        assert resolve_provider_client("local") == (None, None)
+
+    def test_local_in_provider_chain(self):
+        labels = [label for label, _ in _get_provider_chain()]
+        assert "local" in labels
+        # Local is tried first so its zero-token path preempts paid providers.
+        assert labels[0] == "local"
+
+    def test_resolve_auto_prefers_enabled_local_over_main_provider(self, monkeypatch):
+        """Step-0: an enabled+reachable local box wins ahead of the main provider."""
+        import agent.auxiliary_client as aux
+        sentinel = MagicMock(name="local-client")
+        monkeypatch.setattr(aux, "_try_local_openai",
+                            lambda vision=False: (sentinel, "qwen3-coder:30b"))
+        client, model = _resolve_auto(
+            main_runtime={"provider": "anthropic", "model": "claude-sonnet-5"},
+            task="title_generation",
+        )
+        assert client is sentinel and model == "qwen3-coder:30b"
+
+    def test_resolve_auto_falls_through_when_local_declines(self, monkeypatch):
+        """Disabled/unreachable local must not short-circuit auto resolution."""
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "_try_local_openai", lambda vision=False: (None, None))
+        main_client = MagicMock(name="main-client")
+        called = {}
+
+        def _fake_resolve(provider, model=None, **kw):
+            called["provider"] = provider
+            return main_client, model
+
+        monkeypatch.setattr(aux, "resolve_provider_client", _fake_resolve)
+        client, _model = _resolve_auto(
+            main_runtime={"provider": "anthropic", "model": "claude-sonnet-5"},
+            task="title_generation",
+        )
+        assert client is main_client
+        assert called["provider"] == "anthropic"   # fell through to Step 1
+
+    def test_local_provider_does_not_leak_main_model(self, monkeypatch):
+        """provider=local must not inherit the user's main-chat slug (would 404
+        on Ollama); it resolves its own configured/default model instead."""
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "_read_main_model", lambda: "claude-sonnet-5")
+        monkeypatch.setattr(aux, "_resolve_local_aux_runtime",
+                            lambda: ("http://localhost:11434/v1", "qwen3-coder:30b", True))
+        monkeypatch.setattr(aux, "_local_endpoint_reachable", lambda _b: True)
+        monkeypatch.setattr(aux, "_create_openai_client", lambda **kw: MagicMock())
+        _client, model = resolve_provider_client("local")
+        assert model == "qwen3-coder:30b"
