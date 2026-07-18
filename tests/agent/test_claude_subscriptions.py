@@ -581,6 +581,87 @@ class TestAcquire:
         assert exc.value.earliest_recovery is None
         assert "capacity" in str(exc.value)
 
+    def test_saturation_is_flagged_and_uses_saturated_marker(self, tmp_path, _logged_in):
+        # Fully leased (not cooling): the raise must be flagged ``saturated``
+        # and carry the SATURATED marker, NOT the exhausted one — the executor
+        # keys off this to requeue instead of block (t_4c4dbe64).
+        conn = subs.connect()
+        try:
+            d = tmp_path / "a"
+            d.mkdir()
+            _insert_sub(conn, "a", str(d), max_concurrency=1)
+            _add_lease(conn, "a")
+        finally:
+            conn.close()
+        with pytest.raises(subs.NoSubscriptionAvailable) as exc:
+            subs.acquire("t", wait_seconds=0)
+        assert exc.value.saturated is True
+        assert subs.SUBSCRIPTIONS_SATURATED_MARKER in str(exc.value)
+        assert subs.SUBSCRIPTIONS_EXHAUSTED_MARKER not in str(exc.value)
+
+    def test_cooling_case_is_not_flagged_saturated(self, tmp_path, _logged_in):
+        # Genuine exhaustion (every pocket cooling) must NOT be flagged
+        # saturated — it stays on the block + auto-unblock path.
+        now = time.time()
+        conn = subs.connect()
+        try:
+            a = tmp_path / "a"
+            a.mkdir()
+            _insert_sub(conn, "a", str(a), cooling_until=now + 300)
+        finally:
+            conn.close()
+        with pytest.raises(subs.NoSubscriptionAvailable) as exc:
+            subs.acquire("t", wait_seconds=0)
+        assert exc.value.saturated is False
+
+
+class TestCapacitySnapshot:
+    @pytest.fixture(autouse=True)
+    def _no_disk_discovery(self, monkeypatch):
+        monkeypatch.setattr(subs, "_discover_config_dirs", lambda: {})
+
+    def test_reports_total_and_free_slots(self, tmp_path, _logged_in):
+        conn = subs.connect()
+        try:
+            a = tmp_path / "a"
+            a.mkdir()
+            b = tmp_path / "b"
+            b.mkdir()
+            _insert_sub(conn, "a", str(a), max_concurrency=2)
+            _insert_sub(conn, "b", str(b), max_concurrency=3)
+            _add_lease(conn, "a")  # 1 of a's 2 slots busy
+        finally:
+            conn.close()
+        total, free = subs.capacity_snapshot()
+        assert total == 5      # 2 + 3
+        assert free == 4       # (2-1) + (3-0)
+
+    def test_saturated_pool_reports_zero_free_nonzero_total(self, tmp_path, _logged_in):
+        conn = subs.connect()
+        try:
+            d = tmp_path / "a"
+            d.mkdir()
+            _insert_sub(conn, "a", str(d), max_concurrency=1)
+            _add_lease(conn, "a")
+        finally:
+            conn.close()
+        total, free = subs.capacity_snapshot()
+        assert total == 1
+        assert free == 0
+
+    def test_cooling_pocket_contributes_nothing(self, tmp_path, _logged_in):
+        now = time.time()
+        conn = subs.connect()
+        try:
+            a = tmp_path / "a"
+            a.mkdir()
+            _insert_sub(conn, "a", str(a), max_concurrency=2, cooling_until=now + 300)
+        finally:
+            conn.close()
+        # All capacity is cooling -> total 0 (exhaustion), distinct from
+        # saturation's total>0/free==0.
+        assert subs.capacity_snapshot() == (0, 0)
+
 
 class TestNoSubscriptionAvailable:
     def test_carries_earliest_recovery(self):

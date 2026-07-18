@@ -36,6 +36,12 @@ DEFAULT_SUB_NAME = "default"
 # the moment any subscription recovers.
 SUBSCRIPTIONS_EXHAUSTED_MARKER = "[claude-subscriptions-exhausted]"
 
+# Distinct marker for the *saturation* case: subscriptions are alive and
+# not cooling, every concurrency slot is just momentarily leased. This is
+# "wait for a slot", NOT "pool exhausted" — the executor requeues such a
+# task to ``ready`` instead of blocking it as a capability failure.
+SUBSCRIPTIONS_SATURATED_MARKER = "[claude-subscriptions-saturated]"
+
 # Claude's session quota window. Used as the cooldown fallback when a limit
 # message carries no parseable reset time: back off until the next 5h boundary.
 LIMIT_WINDOW_SECONDS = 5 * 60 * 60
@@ -80,11 +86,24 @@ CREATE INDEX IF NOT EXISTS idx_sub_leases_sub ON subscription_leases(subscriptio
 
 
 class NoSubscriptionAvailable(RuntimeError):
-    """Every registered subscription is cooling (or at capacity past the wait)."""
+    """Every registered subscription is cooling (or at capacity past the wait).
 
-    def __init__(self, message: str, earliest_recovery: Optional[float] = None):
+    ``saturated`` distinguishes the two causes the caller must treat
+    differently: ``False`` = genuine exhaustion (every pocket is cooling on a
+    usage limit) → block the task; ``True`` = mere lease saturation (pockets
+    are alive, all slots busy, the wait deadline elapsed) → requeue to ready.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        earliest_recovery: Optional[float] = None,
+        *,
+        saturated: bool = False,
+    ):
         super().__init__(message)
         self.earliest_recovery = earliest_recovery
+        self.saturated = saturated
 
 
 @dataclass(frozen=True)
@@ -492,6 +511,40 @@ def pool_has_capacity(now: Optional[float] = None) -> bool:
         conn.close()
 
 
+def capacity_snapshot(now: Optional[float] = None) -> tuple[int, int]:
+    """Return ``(total, free)`` lease slots across selectable subscriptions.
+
+    ``total`` sums ``max_concurrency`` over enabled, logged-in, non-cooling
+    subscriptions; ``free`` subtracts the leases currently held on them
+    (dead-PID leases are cleaned up first). A cooling or logged-out pocket
+    contributes to neither, so:
+
+    * ``total == 0`` — the pool is genuinely exhausted (every pocket cooling
+      or absent). A claude-code spawn here SHOULD reach the block +
+      auto-unblock path, so the dispatcher leaves this case uncapped.
+    * ``total > 0 and free == 0`` — mere saturation: all live slots busy.
+      The dispatcher must defer (keep the task ``ready``), not spawn a worker
+      that would only park inside :func:`acquire` and mis-report exhaustion.
+
+    Used by the kanban dispatcher to size claude-code spawns to the pool's
+    real free capacity instead of over-spawning past it.
+    """
+    now = now if now is not None else time.time()
+    conn = connect()
+    try:
+        with conn:
+            _cleanup_stale_leases(conn)
+        total = 0
+        free = 0
+        for row in _selectable_rows(conn, now):
+            cap = max(1, int(row["max_concurrency"]))
+            total += cap
+            free += max(0, cap - int(row["active"]))
+        return total, free
+    finally:
+        conn.close()
+
+
 def _try_acquire(conn: sqlite3.Connection, task_id: str, now: float) -> Optional[Lease]:
     # Login checks shell out to the Keychain — resolve candidates BEFORE
     # taking the write lock, then recheck lease counts atomically inside it.
@@ -568,10 +621,15 @@ def acquire(task_id: str = "", wait_seconds: Optional[float] = None) -> Lease:
                 earliest_recovery=earliest,
             )
         if time.monotonic() >= deadline:
+            # Saturation, NOT exhaustion: selectable subscriptions exist and
+            # are not cooling, every slot is just busy. Carry the saturation
+            # marker + flag so the executor requeues the task to ready instead
+            # of blocking it as a capability failure.
             raise NoSubscriptionAvailable(
-                f"{SUBSCRIPTIONS_EXHAUSTED_MARKER} no Claude Code subscription"
+                f"{SUBSCRIPTIONS_SATURATED_MARKER} no Claude Code subscription"
                 f" capacity freed up within {int(wait_seconds)}s",
                 earliest_recovery=None,
+                saturated=True,
             )
         time.sleep(_CAPACITY_POLL_SECONDS)
 

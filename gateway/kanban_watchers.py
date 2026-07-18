@@ -1426,9 +1426,18 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
+                # A saturated Claude subscription pool legitimately holds
+                # claude-code ready tasks in ``ready`` (deferred, not stuck):
+                # they ARE spawnable but there is no free lease slot. Don't let
+                # that trip the "dispatcher stuck" warning — the pool recovering
+                # (a lease freeing) is exactly what unsticks them.
+                any_capacity_deferred = any(
+                    res is not None and getattr(res, "skipped_capacity", None)
+                    for _slug, res in (results or [])
+                )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                if ready_pending and not any_spawned and not any_capacity_deferred:
                     bad_ticks += 1
                 else:
                     bad_ticks = 0

@@ -2562,6 +2562,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "skipped_board_capped": res.skipped_board_capped,
+            "skipped_capacity": res.skipped_capacity,
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2599,6 +2600,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.skipped_capacity:
+        print(
+            f"Deferred (Claude subscription pool saturated, waiting for a "
+            f"lease slot): {', '.join(res.skipped_capacity)}"
         )
     return 0
 

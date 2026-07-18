@@ -276,6 +276,17 @@ def run_task(*, executor, task_id, workspace, board=None):
             text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
         _report_usage(client,executor,task_id,subscription)
     except Exception as exc:
+        # Lease saturation (pool alive, all slots momentarily busy) is a
+        # transient "wait for a slot", NOT a capability failure: return the
+        # task to ready so the dispatcher — which now sizes claude-code spawns
+        # to the pool's free leases — respawns it once a slot frees, instead
+        # of blocking it with the exhausted marker. Genuine exhaustion (every
+        # pocket cooling) still falls through to the capability block below.
+        from agent.claude_subscriptions import NoSubscriptionAvailable
+        if isinstance(exc, NoSubscriptionAvailable) and getattr(exc, "saturated", False):
+            with kb.connect_closing(board=board) as conn:
+                kb.requeue_capacity_deferred(conn, task_id, reason=str(exc), expected_run_id=run_id)
+            return f"capacity-deferred: {exc}"
         with kb.connect_closing(board=board) as conn: kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)
         raise
     metadata={"executor":executor,"acp_command":command,"provider":f"acp-{executor}","workspace":workspace}

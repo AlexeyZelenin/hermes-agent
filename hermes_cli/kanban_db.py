@@ -5714,6 +5714,59 @@ def block_task(
     return True
 
 
+def requeue_capacity_deferred(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Return a ``running`` task to ``ready`` after it lost the race for a
+    subscription lease (the pool is saturated, not exhausted).
+
+    Distinct from :func:`block_task`: lease saturation is a transient "wait
+    for a slot", not a capability failure. The task drops straight back to
+    ``ready`` WITHOUT counting a failure (no ``consecutive_failures`` bump),
+    WITHOUT a quota-flavored ``last_failure_error`` stamp (so
+    :func:`check_respawn_guard` won't defer it as a quota blocker), and
+    WITHOUT the human ``blocked`` round-trip. The dispatcher's own free-lease
+    cap then holds the task in ``ready`` until a slot frees, so it respawns
+    cheaply instead of bouncing through the blocked lane and mis-reporting the
+    pool as exhausted.
+
+    The run is closed with a neutral ``capacity_deferred`` outcome (like
+    ``rate_limited``, it is not a failure and does not trip the breaker or the
+    protocol-violation streak). Returns True on a successful
+    ``running -> ready`` transition, False when the task wasn't running
+    (already reclaimed/terminal, or a run-id mismatch).
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'ready',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status = 'running'
+            """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+            (task_id,) if expected_run_id is None
+            else (task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="capacity_deferred", status="capacity_deferred",
+            error=reason,
+        )
+        _append_event(
+            conn, task_id, "capacity_deferred",
+            {"reason": reason}, run_id=run_id,
+        )
+    return True
+
 
 def promote_task(
     conn: sqlite3.Connection,
@@ -7410,6 +7463,12 @@ class DispatchResult:
     "task is genuinely stuck"."""
     skipped_board_capped: list[str] = field(default_factory=list)
     """Tasks deferred because the board's persisted agent_limit is full."""
+    skipped_capacity: list[str] = field(default_factory=list)
+    """claude-code tasks deferred this tick because the Claude subscription
+    pool has no free lease slot (saturation, not exhaustion). NOT a failure:
+    the task stays ``ready`` and respawns once a lease frees. Kept distinct
+    from ``skipped_board_capped`` so telemetry can show "waiting for a
+    subscription slot" vs "board agent_limit full"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9126,7 +9185,7 @@ def _dispatch_once_locked(
     # never gets claimed/spawned regardless of how it reached 'ready'. This is
     # the single deterministic eligibility check the design calls for.
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, executor FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL AND paused = 0 "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -9172,6 +9231,38 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Claude-code subscription-lease cap. The subscription pool has a finite
+    # number of concurrent leases; spawning more claude-code workers than
+    # there are free leases just parks the surplus inside ``subs.acquire()``
+    # until it times out and mis-reports the pool as exhausted, blocking the
+    # task. Size claude-code spawns to the pool's real free capacity so
+    # saturation becomes "wait in ready for a slot", not "block as exhausted".
+    #
+    # ``_cc_free is None`` disables the cap and both opt-outs are deliberate:
+    #   * empty pool (``pool_size() == 0``) → the executor's legacy
+    #     single-session fallback, no leases to count;
+    #   * fully-cooling pool (``total == 0``) → genuine exhaustion, which
+    #     SHOULD reach the block + auto-unblock path for operator visibility.
+    # The cap only fires on true saturation (``total > 0 and free == 0``).
+    # ``free`` reflects live leases (cross-board accurate); ``total - running``
+    # covers workers spawned this/last tick that haven't leased yet — the min
+    # is the safe bound against both. Only computed when claude-code work is
+    # actually queued, so the keychain login probes stay off the common path.
+    _cc_free: Optional[int] = None
+    if any((r["executor"] or "") == "claude-code" for r in ready_rows):
+        try:
+            from agent import claude_subscriptions as _subs
+            if _subs.pool_size() > 0:
+                _cc_total, _cc_slots = _subs.capacity_snapshot()
+                if _cc_total > 0:
+                    _cc_running = int(conn.execute(
+                        "SELECT COUNT(*) FROM tasks "
+                        "WHERE status = 'running' AND executor = 'claude-code'"
+                    ).fetchone()[0])
+                    _cc_free = min(_cc_slots, max(0, _cc_total - _cc_running))
+        except Exception:
+            _log.debug("claude-code lease capacity probe failed", exc_info=True)
+            _cc_free = None
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -9271,6 +9362,15 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        # Claude-code subscription-lease cap: defer (don't spawn) a claude-code
+        # task when the pool has no free lease slot. This is saturation, not
+        # exhaustion — the task stays ``ready`` and respawns on a later tick
+        # once a lease frees, instead of a worker parking inside acquire() and
+        # blocking the card as exhausted. See ``_cc_free`` computation above.
+        if (row["executor"] or "") == "claude-code" and _cc_free is not None \
+                and _cc_free <= 0:
+            result.skipped_capacity.append(row["id"])
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -9305,6 +9405,10 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
+            # Consume a virtual lease slot so the cap reflects this would-be
+            # claude-code spawn on subsequent iterations of this dry run.
+            if (row["executor"] or "") == "claude-code" and _cc_free is not None:
+                _cc_free -= 1
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -9361,6 +9465,11 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+            # Consume a lease slot for this claude-code spawn so the cap holds
+            # across the rest of this tick (the worker grabs its lease inside
+            # acquire() shortly after start).
+            if (claimed.executor or "") == "claude-code" and _cc_free is not None:
+                _cc_free -= 1
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
