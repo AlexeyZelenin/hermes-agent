@@ -779,14 +779,91 @@ def _global_model_map() -> dict[str, str]:
     return _clean_model_map(kanban_cfg.get("models"))
 
 
+def claude_pool_alive() -> bool:
+    """True when the Claude Code subscription pool can take a session now.
+
+    Wraps the ACP subscription registry's capacity check. Fail-closed: any
+    error (registry missing, ``agent`` package unavailable) reports *dead*, so
+    a board with a ``models_preferred`` overlay falls through to its non-Claude
+    ladder rather than dispatching work to logged-out / exhausted pockets."""
+    try:
+        from agent.claude_subscriptions import pool_has_capacity
+        return bool(pool_has_capacity())
+    except Exception:
+        return False
+
+
 def resolve_model_map(board: Optional[str] = None,
                       project_models: Any = None) -> dict[str, str]:
-    """Effective model map: config.yaml ``kanban.models`` ← board ← project."""
+    """Effective model map: config.yaml ``kanban.models`` ← board ← project.
+
+    A board may also declare ``models_preferred`` — roles that win *only while
+    the Claude subscription pool is alive*. This keeps Claude entries as the
+    preferred backend when pockets are logged in, while a dead pool falls
+    through to the board's non-Claude ladder in ``models`` automatically (no
+    per-card override). The preferred overlay sits below ``project_models`` so
+    an explicit project map still wins."""
+    meta = read_board_metadata(board if board else get_current_board())
     merged = _global_model_map()
-    merged.update(_clean_model_map(
-        read_board_metadata(board if board else get_current_board()).get("models")))
+    merged.update(_clean_model_map(meta.get("models")))
+    preferred = _clean_model_map(meta.get("models_preferred"))
+    if preferred and claude_pool_alive():
+        merged.update(preferred)
     merged.update(_clean_model_map(project_models))
     return merged
+
+
+# Providers whose models are served through an ACP harness (Claude Code /
+# Codex), NOT through a native ``hermes -p <assignee>`` worker. A model served
+# by one of these has no coupled assignee profile — it dispatches via the
+# board/task executor instead.
+_ACP_PROVIDERS = frozenset({"anthropic", "claude", "claude-code", "codex"})
+
+
+def _native_profile_index() -> dict[str, str]:
+    """Map a native worker profile's default model-id → profile name.
+
+    A native ``hermes-worker`` takes its PROVIDER from the assignee profile
+    (``hermes -p <assignee>`` → that profile's ``model.provider``). So a task
+    that stamps a native model (e.g. ``glm-5.2``) MUST also stamp the matching
+    assignee (``glm``) or the profile's provider won't serve the model. This
+    index lets the planner derive that assignee from a resolved model id.
+
+    Read-only over ``~/.hermes/profiles``; ACP-backed profiles are skipped so a
+    Claude model never resolves to a native assignee. An ambiguous duplicate
+    resolves to the first profile in sorted order (deterministic)."""
+    index: dict[str, str] = {}
+    try:
+        from hermes_cli.profiles import _get_profiles_root, _read_config_model
+    except Exception:
+        return index
+    try:
+        root = _get_profiles_root()
+        if not root.is_dir():
+            return index
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            model, provider = _read_config_model(entry)
+            if not model:
+                continue
+            if str(provider or "").strip().lower() in _ACP_PROVIDERS:
+                continue
+            index.setdefault(str(model).strip(), entry.name)
+    except Exception:
+        return index
+    return index
+
+
+def assignee_for_model(model_id: Optional[str]) -> Optional[str]:
+    """The native worker profile whose provider serves ``model_id``, or None.
+
+    None means the model is served via an ACP executor (Claude / Codex) or has
+    no matching profile — the caller should leave the assignee to the
+    executor's default rather than pinning a native profile."""
+    if not model_id:
+        return None
+    return _native_profile_index().get(str(model_id).strip())
 
 
 # Reasoning-effort levels a board / task may request, keyed by the same roles
@@ -884,6 +961,11 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         # the decomposer assigns to mechanical / balanced / frontier chunks
         # (worker is the implicit "standard" default). Empty = executor default.
         "models": {},
+        # Preferred overlay applied ONLY while the Claude subscription pool can
+        # take a session (see ``resolve_model_map``). Keeps Claude entries as
+        # the preferred backend when pockets are alive; a dead pool falls
+        # through to the non-Claude ladder in ``models`` with no per-card edit.
+        "models_preferred": {},
         # Reasoning-effort defaults per role, same keys as ``models``. Empty =
         # the executor's own default effort. A task's ``effort_override`` wins.
         "models_effort": {},
@@ -917,6 +999,7 @@ def write_board_metadata(
     agent_limit: Optional[int] = None,
     executor: Optional[str] = None,
     models: Optional[dict] = None,
+    models_preferred: Optional[dict] = None,
     models_effort: Optional[dict] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
@@ -924,8 +1007,8 @@ def write_board_metadata(
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
     ``models`` merges role-by-role into the existing map; an empty-string
-    value clears that role. ``models_effort`` merges the same way with an
-    empty / ``default`` value clearing the role.
+    value clears that role. ``models_preferred`` (the Claude-when-alive
+    overlay) and ``models_effort`` merge the same way.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -961,6 +1044,9 @@ def write_board_metadata(
         meta["executor"] = normalized_executor
     if models is not None:
         meta["models"] = _merge_model_map(meta.get("models"), models)
+    if models_preferred is not None:
+        meta["models_preferred"] = _merge_model_map(
+            meta.get("models_preferred"), models_preferred)
     if models_effort is not None:
         meta["models_effort"] = _merge_effort_map(meta.get("models_effort"), models_effort)
     if not meta.get("created_at"):
@@ -6716,14 +6802,19 @@ def decompose_triage_task(
         {
             "title": "...",
             "body": "...",                     # optional
-            "assignee": "profile-name",        # optional; normally None until take
+            "assignee": "profile-name",        # optional; the native worker the
+                                               # tier model is coupled to, else None
             "parents": [0, 2],                 # indices into this same children list
             "model_override": "model-id",      # optional; tier model from the decomposer
+            "executor": "hermes-worker",       # optional; set with a native tier model
         }
 
     Children inherit the root's executor, project link, and — when the
-    child dict has no ``model_override`` of its own — the root's model
-    override.
+    child dict has no ``model_override`` / ``executor`` of its own — the
+    root's. A native tier model (e.g. ``glm-5.2``) is coupled: the child
+    carries both its ``assignee`` (the profile whose provider serves the
+    model) and ``executor: hermes-worker`` so it never runs the model under
+    the wrong provider.
 
     Returns the list of created child task ids (in input order) on
     success. Returns ``None`` when:
@@ -6861,6 +6952,13 @@ def decompose_triage_task(
             else:
                 child_ws_path = None
             child_model = str(child.get("model_override") or "").strip() or root_model
+            # A native tier model (glm/kimi/local) carries its own executor so
+            # the child runs as a hermes-worker under the coupled assignee's
+            # provider — even when the root/board executor is claude-code. An
+            # unset/invalid child executor inherits the root's.
+            child_executor = str(child.get("executor") or "").strip().lower()
+            if child_executor not in {"hermes-worker", "claude-code", "codex"}:
+                child_executor = root_executor
             child_category = str(child.get("category") or "").strip().lower() or None
             if child_category is not None and child_category not in _valid_categories:
                 child_category = None
@@ -6881,7 +6979,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
-                    root_executor,
+                    child_executor,
                     child_model,
                     root_project_id,
                     root_append_prompt,

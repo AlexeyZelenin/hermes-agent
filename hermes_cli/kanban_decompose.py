@@ -32,6 +32,31 @@ Design notes
 * If the LLM picks an assignee that doesn't exist as a profile, we
   rewrite it to the configured ``default_assignee`` (or the default
   profile if unset). A child task NEVER ends up with ``assignee=None``.
+
+Tier ladder (executor tiers, cheapest → most capable)
+-----------------------------------------------------
+
+The decomposer picks a capability *tier* per chunk; the board model map
+resolves each tier to a concrete model, and the planner pins the coupled
+worker so the chunk runs under the right provider:
+
+* ``strong`` → **K3** (Kimi) — planning, review, complex/high-ambiguity
+  features. Native worker profile ``kimi`` (provider ``kimi-coding``).
+* ``standard``/``mid`` → **GLM-5.2** — routine feature implementation.
+  Native worker profile ``glm`` (provider ``zai``).
+* ``cheap`` → **local qwen3.6:35b-a3b** — single-shot mechanical edits with
+  machine-verifiable output. Native worker profile ``local``.
+* **Claude** (when subscription pockets are alive) — final gate + hardest
+  work. Configured as the board's ``models_preferred`` overlay, which wins
+  only while ``claude_pool_alive()``; a dead pool falls through to the
+  ladder above automatically.
+
+CRITICAL COUPLING: for a native worker the PROVIDER comes from the assignee
+profile (``hermes -p <assignee>``), the model from the override/map. So when a
+tier resolves to a native model the planner stamps the trio together —
+``assignee`` (kimi/glm/local), ``model_override``, and ``executor:
+hermes-worker`` — via :func:`hermes_cli.kanban_db.assignee_for_model`. It never
+stamps a native model without its assignee.
 """
 
 from __future__ import annotations
@@ -51,6 +76,17 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CONTEXT_BUDGET_TOKENS = 150_000
 _MIN_CONTEXT_BUDGET_TOKENS = 32_000
+
+# Decomposer tier names → canonical model-map role. "standard" is the Tier-2
+# workhorse, which is the "worker" role in the map — so a standard chunk is
+# coupled to the worker-role model (and its native assignee) rather than left
+# on an implicit inherit.
+_TIER_TO_ROLE = {
+    "cheap": "cheap",
+    "mid": "mid",
+    "standard": "worker",
+    "strong": "strong",
+}
 
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
@@ -132,6 +168,17 @@ Rules:
     "cheap"; a one-line fix in an unfamiliar concurrency path is "strong".
     Prefer "standard"/"mid" for ordinary work and reserve "strong" for chunks
     that genuinely need the frontier tier — it is the most expensive.
+    Executor ladder (which real backend each tier currently maps to on this
+    board; the planner sets the coupled worker automatically, you only pick the
+    tier by the nature of the work):
+      * "strong" → K3 (Kimi) — planning, review, and complex/high-ambiguity
+        features.
+      * "standard"/"mid" → GLM-5.2 — implementation of routine features.
+      * "cheap" → local qwen3.6:35b-a3b — single-shot mechanical edits with
+        machine-verifiable output.
+      * When Claude subscription pockets are alive, the board's preferred
+        overlay routes these tiers to Claude instead (final gate + hardest
+        work); a dead pool falls through to the ladder above with no edit.
   - "model_rationale" is a single short clause (<= 120 chars) justifying the
     tier for THIS chunk (e.g. "cross-cutting refactor, spec must be
     interpreted"). It is recorded on the child task so the assignment is
@@ -342,10 +389,12 @@ def _grid_suggestion(tier: str) -> str:
 
 
 def _format_assignment_comment(tier: str, model: Optional[str],
-                               rationale: str) -> str:
+                               assignee: Optional[str], rationale: str) -> str:
     """One-line, human-readable model-assignment note for a child task."""
     target = model or "board default (standard tier)"
     line = f"Model tier: {tier} → {target}"
+    if assignee:
+        line += f" (native worker: {assignee})"
     if rationale:
         line += f" — {rationale}"
     line += _grid_suggestion(tier)
@@ -367,10 +416,11 @@ def _record_model_assignments(child_ids: list[str], tier_meta: list[dict],
             "title": meta["title"],
             "tier": meta["tier"],
             "model": meta["model"],
+            "assignee": meta.get("assignee"),
             "rationale": meta["rationale"],
         })
         comment = _format_assignment_comment(
-            meta["tier"], meta["model"], meta["rationale"],
+            meta["tier"], meta["model"], meta.get("assignee"), meta["rationale"],
         )
         try:
             with kb.connect_closing() as conn:
@@ -526,13 +576,30 @@ def decompose_task(
             parents = []
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
-        # Tier → model via the board/project map. "standard" (or an
-        # unmapped tier) leaves the child on the default model chain — the
-        # Tier-2 workhorse. cheap/mid/strong resolve to their mapped models.
+        # Tier → (model, assignee, executor) via the board/project map.
+        # A tier that resolves to a NATIVE ladder model (glm/kimi/local) MUST
+        # also pin the coupled assignee + hermes-worker executor: a native
+        # worker's provider comes from its assignee profile (hermes -p
+        # <assignee>), so a model without its assignee would run under the
+        # wrong provider. A tier that resolves to a Claude model (pockets
+        # alive) keeps its explicit tier model but leaves assignee/executor to
+        # the executor default; a "standard" tier with no map entry inherits
+        # the root (unfrozen board resolution at dispatch).
         tier = str(entry.get("model_tier") or "").strip().lower()
         if tier not in ("cheap", "mid", "standard", "strong"):
             tier = "standard"
-        tier_model = model_map.get(tier) if tier in ("cheap", "mid", "strong") else None
+        resolved = model_map.get(_TIER_TO_ROLE[tier])
+        coupled_assignee = kb.assignee_for_model(resolved)
+        child_assignee: Optional[str] = None
+        child_executor: Optional[str] = None
+        if coupled_assignee:
+            tier_model = resolved
+            child_assignee = coupled_assignee
+            child_executor = "hermes-worker"
+        elif tier in ("cheap", "mid", "strong"):
+            tier_model = resolved
+        else:  # standard tier with a Claude / empty map → inherit the root
+            tier_model = None
         rationale = entry.get("model_rationale")
         rationale = rationale.strip()[:200] if isinstance(rationale, str) else ""
         # Planner-assigned category key (managed set). Kept as a lowercase slug;
@@ -542,15 +609,17 @@ def decompose_task(
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
-            "assignee": None,
+            "assignee": child_assignee,
             "parents": clean_parents,
             "model_override": tier_model,
+            "executor": child_executor,
             "category": category,
         })
         tier_meta.append({
             "title": title.strip()[:200],
             "tier": tier,
             "model": tier_model,
+            "assignee": child_assignee,
             "rationale": rationale,
         })
 
