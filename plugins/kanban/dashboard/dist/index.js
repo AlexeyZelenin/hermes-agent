@@ -107,6 +107,20 @@
     return map;
   }
 
+  // 🏁 shown on cards that belong to a milestone (веха). Deliberately a
+  // different glyph from the epic child-progress "N/M" counter so a milestone
+  // (a flat named batch) reads distinctly from an epic (a parent + children).
+  const MILESTONE_ICON = "🏁";
+
+  // Build an {id: {name, status}} lookup from the board's milestone list.
+  function milestoneMap(milestones) {
+    const map = {};
+    for (const m of milestones || []) {
+      if (m && m.id) map[m.id] = { name: m.name || m.id, status: m.status || "forming" };
+    }
+    return map;
+  }
+
   // Split a column's tasks into ordered category groups plus a trailing
   // Paused group. Active cards are grouped by category (catalog order, then
   // Uncategorized last); paused cards are pulled out into their own bottom
@@ -727,6 +741,9 @@
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
+    // When set, the board is filtered to a single milestone (веха) — the
+    // grouped-by-milestone view. Cleared by clicking the active chip again.
+    const [milestoneFilter, setMilestoneFilter] = useState(null);
     const [draggingTaskId, setDraggingTaskId] = useState(null);
     const handleDragStart = useCallback(function (taskId) { setDraggingTaskId(taskId); }, []);
     const handleDragEnd = useCallback(function () { setDraggingTaskId(null); }, []);
@@ -922,6 +939,7 @@
         if (!isPersistentTask(t)) return false;
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
+        if (milestoneFilter && t.milestone_id !== milestoneFilter) return false;
         if (q) {
           const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
@@ -933,7 +951,7 @@
           return Object.assign({}, col, { tasks: col.tasks.filter(filterTask) });
         }),
       });
-    }, [boardData, tenantFilter, assigneeFilter, search]);
+    }, [boardData, tenantFilter, assigneeFilter, search, milestoneFilter]);
 
     // --- actions ------------------------------------------------------------
     const moveTask = useCallback(function (taskId, newStatus) {
@@ -1221,6 +1239,84 @@
       });
     }, [selectedIds, board, clearSelected, loadBoard]);
 
+    // --- milestones (вехи): create batch from selection, then start/release --
+    // "Отметить вехой" — collect the selected cards into a NEW named milestone.
+    const milestoneFromSelection = useCallback(function () {
+      if (selectedIds.size === 0) return;
+      const ids = Array.from(selectedIds);
+      const name = window.prompt(
+        `Собрать веху из ${ids.length} задач(и). Название вехи:`, "");
+      if (name === null) return;
+      if (!name.trim()) { setError("Название вехи не может быть пустым."); return; }
+      SDK.fetchJSON(withBoard(`${API}/milestones`, board), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.trim() }),
+      }).then(function (res) {
+        const mid = res && res.milestone && res.milestone.id;
+        if (!mid) throw new Error("no milestone id returned");
+        return SDK.fetchJSON(withBoard(`${API}/milestones/${encodeURIComponent(mid)}/tasks`, board), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids }),
+        });
+      }).then(function (res) {
+        const errs = (res && res.errors) || [];
+        setError(`Веха «${name.trim()}» создана: ${(res.added || []).length} задач(и) добавлено${errs.length ? `, ${errs.length} с ошибкой` : ""}.`);
+        clearSelected();
+        loadBoard();
+      }).catch(function (e) {
+        setError(`Не удалось создать веху: ${parseApiErrorMessage(e)}`);
+      });
+    }, [selectedIds, board, clearSelected, loadBoard]);
+
+    const startMilestone = useCallback(function (mid) {
+      if (!mid) return;
+      if (!window.confirm("Старт вехи — взять весь батч задач в работу как единицу?")) return;
+      SDK.fetchJSON(withBoard(`${API}/milestones/${encodeURIComponent(mid)}/start`, board), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }).then(function (res) {
+        setError(`Веха запущена: ${(res && res.message) || "ok"}.`);
+        loadBoard();
+      }).catch(function (e) {
+        setError(`Не удалось запустить веху: ${parseApiErrorMessage(e)}`);
+      });
+    }, [board, loadBoard]);
+
+    const releaseMilestone = useCallback(function (mid) {
+      if (!mid) return;
+      if (!window.confirm("Релиз вехи — завершить/зарелизить всю веху целиком?")) return;
+      SDK.fetchJSON(withBoard(`${API}/milestones/${encodeURIComponent(mid)}/release`, board), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }).then(function (res) {
+        setError(`Веха зарелизена: ${(res && res.message) || "ok"}.`);
+        loadBoard();
+      }).catch(function (e) {
+        setError(`Не удалось зарелизить веху: ${parseApiErrorMessage(e)}`);
+      });
+    }, [board, loadBoard]);
+
+    const deleteMilestone = useCallback(function (mid) {
+      if (!mid) return;
+      if (!window.confirm("Удалить веху? Задачи сохранятся, но потеряют принадлежность к вехе.")) return;
+      SDK.fetchJSON(withBoard(`${API}/milestones/${encodeURIComponent(mid)}`, board), {
+        method: "DELETE",
+      }).then(function () {
+        setMilestoneFilter(function (cur) { return cur === mid ? null : cur; });
+        loadBoard();
+      }).catch(function (e) {
+        setError(`Не удалось удалить веху: ${parseApiErrorMessage(e)}`);
+      });
+    }, [board, loadBoard]);
+
+    const toggleMilestoneFilter = useCallback(function (mid) {
+      setMilestoneFilter(function (cur) { return cur === mid ? null : mid; });
+    }, []);
+
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
       if (!nextSlug || nextSlug === board) return;
@@ -1369,11 +1465,20 @@
          count: selectedIds.size,
          assignees: (boardData && boardData.assignees) || [],
          onBatchTake: batchTake,
+         onMilestone: milestoneFromSelection,
          onApply: applyBulk,
          onClear: clearSelected,
          onSelectAllVisible: selectAllVisible,
          onDelete: deleteSelected,
        }) : null,
+        h(MilestoneBar, {
+          milestones: (boardData && boardData.milestones) || [],
+          activeFilter: milestoneFilter,
+          onFilter: toggleMilestoneFilter,
+          onStart: startMilestone,
+          onRelease: releaseMilestone,
+          onDelete: deleteMilestone,
+        }),
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
         h(BoardColumns, {
           board: filteredBoard,
@@ -1395,6 +1500,7 @@
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks.filter(isPersistentTask)); }, []),
           categories: (boardData && boardData.categories) || [],
+          milestones: (boardData && boardData.milestones) || [],
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
@@ -2583,6 +2689,54 @@
   // Bulk action bar (appears when >= 1 card is selected)
   // -------------------------------------------------------------------------
 
+  // Milestone (веха) rail rendered above the board. Shows every milestone as a
+  // chip with its lifecycle status + member count; clicking a chip filters the
+  // board to that milestone (the grouped-by-milestone view). Per-status action
+  // buttons drive the batch lifecycle: Старт (start -> take the batch into work)
+  // and Релиз (release -> complete the whole batch). Distinct from epics, which
+  // render as an inline "N/M child tasks" counter on the parent card.
+  function MilestoneBar(props) {
+    const milestones = props.milestones || [];
+    if (milestones.length === 0) return null;
+    return h("div", { className: "hermes-kanban-milestones" },
+      h("span", { className: "hermes-kanban-milestones-label" }, `${MILESTONE_ICON} Вехи:`),
+      milestones.map(function (m) {
+        const active = props.activeFilter === m.id;
+        return h("div", {
+          key: m.id,
+          className: cn(
+            "hermes-kanban-milestone-chip",
+            "hermes-kanban-milestone-chip--" + (m.status || "forming"),
+            active ? "hermes-kanban-milestone-chip--active" : "",
+          ),
+        },
+          h("button", {
+            type: "button",
+            className: "hermes-kanban-milestone-name",
+            title: active ? "Показать все задачи доски" : "Показать только задачи этой вехи",
+            onClick: function () { props.onFilter(m.id); },
+          }, `${m.name} · ${m.status} · ${m.task_count || 0}`),
+          m.status === "forming" ? h(Button, {
+            size: "sm",
+            title: "Старт вехи — взять весь батч задач в работу как единицу.",
+            onClick: function () { props.onStart(m.id); },
+          }, "Старт") : null,
+          m.status === "active" ? h(Button, {
+            size: "sm",
+            title: "Релиз вехи — завершить/зарелизить всю веху целиком.",
+            onClick: function () { props.onRelease(m.id); },
+          }, "Релиз") : null,
+          h(Button, {
+            size: "sm",
+            variant: "destructive",
+            title: "Удалить веху (задачи сохранятся, принадлежность к вехе очистится).",
+            onClick: function () { props.onDelete(m.id); },
+          }, "✕"),
+        );
+      }),
+    );
+  }
+
   function BulkActionBar(props) {
     const { t } = useI18n();
     const [assignee, setAssignee] = useState("");
@@ -2596,6 +2750,11 @@
         size: "sm",
         title: "Ask the batch planner to order only overlapping tasks, then make the independent work ready in parallel.",
       }, "Plan & take"),
+      h(Button, {
+        onClick: props.onMilestone,
+        size: "sm",
+        title: "Собрать выбранные задачи в именованную веху (батч), которую можно взять в работу и зарелизить целиком.",
+      }, `${MILESTONE_ICON} Отметить вехой`),
       h(Button, {
         onClick: function () { props.onApply({ status: "todo" }); },
         size: "sm",
@@ -2896,6 +3055,7 @@
           onCreate: props.onCreate,
           allTasks: props.allTasks,
           categories: props.categories,
+          milestones: props.milestones,
         });
       }),
       h(TrashDropZone, {
@@ -2981,6 +3141,7 @@
       return h(TaskCard, {
         key: tk.id, task: tk,
         categories: props.categories,
+        milestones: props.milestones,
         selected: props.selectedIds.has(tk.id),
         failed: props.failedIds && props.failedIds.has(tk.id),
         draggingTaskId: props.draggingTaskId,
@@ -3292,6 +3453,22 @@
                 className: "hermes-kanban-category-badge",
                 title: `Category: ${meta.name}`,
               }, meta.icon, " ", meta.name);
+            })(),
+            (function () {
+              // Milestone (веха) badge — distinct from the epic "N/M" child
+              // counter so a named batch reads differently from a parent+children.
+              if (!t.milestone_id) return null;
+              const mm = milestoneMap(props.milestones);
+              const meta = mm[t.milestone_id];
+              if (!meta) return null;
+              return h(Badge, {
+                variant: "outline",
+                className: cn(
+                  "hermes-kanban-milestone-badge",
+                  "hermes-kanban-milestone-badge--" + meta.status,
+                ),
+                title: `Веха: ${meta.name} (${meta.status})`,
+              }, MILESTONE_ICON, " ", meta.name);
             })(),
             progress
               ? h("span", {

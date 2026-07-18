@@ -5221,3 +5221,179 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Milestones (вехи) — named batches: create -> assign -> start -> release
+# ---------------------------------------------------------------------------
+
+def _mk_todo(conn, title, *, assignee=None):
+    """Create a task and force it into an un-started ``todo`` lane for tests."""
+    tid = kb.create_task(conn, title=title)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='todo', assignee=? WHERE id=?", (assignee, tid)
+        )
+    return tid
+
+
+def test_milestone_table_created(kanban_home):
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='milestones'"
+        ).fetchall()
+    assert len(rows) == 1
+
+
+def test_create_and_get_milestone(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Sprint 1")
+        assert m.id.startswith("m_")
+        assert m.name == "Sprint 1"
+        assert m.status == "forming"
+        assert m.task_count == 0
+        fetched = kb.get_milestone(conn, m.id)
+        assert fetched is not None and fetched.name == "Sprint 1"
+
+
+def test_create_milestone_requires_name(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError):
+            kb.create_milestone(conn, "   ")
+
+
+def test_list_milestones_orders_by_sort(kanban_home):
+    with kb.connect() as conn:
+        a = kb.create_milestone(conn, "A")
+        b = kb.create_milestone(conn, "B")
+        names = [m.name for m in kb.list_milestones(conn)]
+        assert names == ["A", "B"]
+        assert a.sort < b.sort
+
+
+def test_set_task_milestone_assign_and_count(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Batch")
+        t1 = kb.create_task(conn, title="one")
+        t2 = kb.create_task(conn, title="two")
+        ok, err = kb.set_task_milestone(conn, t1, m.id)
+        assert ok and err is None
+        ok, err = kb.set_task_milestone(conn, t2, m.id)
+        assert ok
+        assert set(kb.milestone_task_ids(conn, m.id)) == {t1, t2}
+        assert kb.get_milestone(conn, m.id).task_count == 2
+        # idempotent re-assign is a no-op success
+        assert kb.set_task_milestone(conn, t1, m.id) == (True, None)
+
+
+def test_set_task_milestone_unknown_milestone(kanban_home):
+    with kb.connect() as conn:
+        t1 = kb.create_task(conn, title="one")
+        ok, err = kb.set_task_milestone(conn, t1, "m_doesnotexist")
+        assert ok is False
+        assert "unknown milestone" in err
+
+
+def test_set_task_milestone_unknown_task(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Batch")
+        ok, err = kb.set_task_milestone(conn, "t_nope", m.id)
+        assert ok is False and "not found" in err
+
+
+def test_clear_task_milestone(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Batch")
+        t1 = kb.create_task(conn, title="one")
+        kb.set_task_milestone(conn, t1, m.id)
+        kb.set_task_milestone(conn, t1, None)
+        assert kb.milestone_task_ids(conn, m.id) == []
+        assert kb.get_task(conn, t1).milestone_id is None
+
+
+def test_delete_milestone_clears_membership(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Batch")
+        t1 = kb.create_task(conn, title="one")
+        kb.set_task_milestone(conn, t1, m.id)
+        assert kb.delete_milestone(conn, m.id) is True
+        assert kb.get_milestone(conn, m.id) is None
+        # Task survives, membership cleared.
+        assert kb.get_task(conn, t1).milestone_id is None
+        assert kb.delete_milestone(conn, m.id) is False  # already gone
+
+
+def test_start_milestone_assigns_and_promotes(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Sprint")
+        t1 = _mk_todo(conn, "todo one", assignee=None)
+        t2 = _mk_todo(conn, "todo two", assignee=None)
+        kb.set_task_milestone(conn, t1, m.id)
+        kb.set_task_milestone(conn, t2, m.id)
+        ok, msg, detail = kb.start_milestone(conn, m.id, assignee="alice")
+        assert ok, msg
+        assert set(detail["promoted"]) == {t1, t2}
+        # Both are now ready and owned by the batch assignee.
+        for tid in (t1, t2):
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready"
+            assert task.assignee == "alice"
+        assert kb.get_milestone(conn, m.id).status == "active"
+        assert kb.get_milestone(conn, m.id).started_at is not None
+
+
+def test_start_milestone_waits_on_unfinished_parent(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Sprint")
+        parent = kb.create_task(conn, title="parent")  # ready, not done
+        child = kb.create_task(conn, title="child", parents=[parent])  # -> todo
+        assert kb.get_task(conn, child).status == "todo"
+        kb.set_task_milestone(conn, child, m.id)
+        ok, msg, detail = kb.start_milestone(conn, m.id)
+        assert ok, msg
+        assert detail["promoted"] == []
+        assert [w["id"] for w in detail["waiting"]] == [child]
+        # Child stays todo until the parent finishes.
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_start_milestone_empty_is_refused(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Empty")
+        ok, msg, detail = kb.start_milestone(conn, m.id)
+        assert ok is False and "no tasks" in msg
+
+
+def test_release_milestone_completes_all(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Sprint")
+        ready1 = kb.create_task(conn, title="ready one")  # ready
+        todo1 = _mk_todo(conn, "todo one", assignee="bob")  # queued
+        kb.set_task_milestone(conn, ready1, m.id)
+        kb.set_task_milestone(conn, todo1, m.id)
+        ok, msg, detail = kb.release_milestone(conn, m.id)
+        assert ok, msg
+        assert set(detail["completed"]) == {ready1, todo1}
+        for tid in (ready1, todo1):
+            assert kb.get_task(conn, tid).status == "done"
+        released = kb.get_milestone(conn, m.id)
+        assert released.status == "released"
+        assert released.released_at is not None
+
+
+def test_release_milestone_skips_already_done(kanban_home):
+    with kb.connect() as conn:
+        m = kb.create_milestone(conn, "Sprint")
+        t1 = kb.create_task(conn, title="one")
+        kb.set_task_milestone(conn, t1, m.id)
+        kb.complete_task(conn, t1, result="done early")
+        ok, msg, detail = kb.release_milestone(conn, m.id)
+        assert ok, msg
+        assert detail["already_done"] == [t1]
+        assert detail["completed"] == []
+
+
+def test_start_milestone_unknown(kanban_home):
+    with kb.connect() as conn:
+        ok, msg, _ = kb.start_milestone(conn, "m_nope")
+        assert ok is False and "unknown milestone" in msg

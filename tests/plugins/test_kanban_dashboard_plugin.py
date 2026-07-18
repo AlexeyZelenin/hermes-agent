@@ -337,7 +337,7 @@ def test_dashboard_client_side_filtering_includes_tenant_filter():
     js = bundle.read_text()
 
     assert "if (tenantFilter && t.tenant !== tenantFilter) return false;" in js
-    assert "[boardData, tenantFilter, assigneeFilter, search]" in js
+    assert "[boardData, tenantFilter, assigneeFilter, search, milestoneFilter]" in js
 
 
 def test_dashboard_initial_board_uses_backend_current_when_unpinned():
@@ -2800,3 +2800,155 @@ def test_patch_task_unknown_category_rejected(client):
     tid = client.post("/api/plugins/kanban/tasks", json={"title": "t"}).json()["task"]["id"]
     r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"category": "ghost"})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Milestones (вехи) — API surface
+# ---------------------------------------------------------------------------
+
+BASE = "/api/plugins/kanban"
+
+
+def _new_task(client, title="t"):
+    return client.post(f"{BASE}/tasks", json={"title": title}).json()["task"]
+
+
+def test_milestones_empty(client):
+    r = client.get(f"{BASE}/milestones")
+    assert r.status_code == 200
+    assert r.json()["milestones"] == []
+    # /board also exposes the (empty) milestone list.
+    assert client.get(f"{BASE}/board").json()["milestones"] == []
+
+
+def test_create_and_list_milestone(client):
+    r = client.post(f"{BASE}/milestones", json={"name": "Ship v1"})
+    assert r.status_code == 200
+    m = r.json()["milestone"]
+    assert m["id"].startswith("m_")
+    assert m["status"] == "forming"
+    assert m["task_count"] == 0
+    listed = client.get(f"{BASE}/milestones").json()["milestones"]
+    assert [x["id"] for x in listed] == [m["id"]]
+
+
+def test_create_milestone_rejects_blank_name(client):
+    r = client.post(f"{BASE}/milestones", json={"name": "   "})
+    assert r.status_code == 400
+
+
+def test_add_tasks_and_board_shows_membership(client):
+    m = client.post(f"{BASE}/milestones", json={"name": "Batch"}).json()["milestone"]
+    t1 = _new_task(client, "a")
+    t2 = _new_task(client, "b")
+    r = client.post(f"{BASE}/milestones/{m['id']}/tasks", json={"ids": [t1["id"], t2["id"]]})
+    assert r.status_code == 200
+    assert set(r.json()["added"]) == {t1["id"], t2["id"]}
+    # Board cards now carry milestone_id; the milestone shows a count of 2.
+    board = client.get(f"{BASE}/board").json()
+    by_id = {t["id"]: t for col in board["columns"] for t in col["tasks"]}
+    assert by_id[t1["id"]]["milestone_id"] == m["id"]
+    ms = {x["id"]: x for x in board["milestones"]}
+    assert ms[m["id"]]["task_count"] == 2
+
+
+def test_add_tasks_reports_unknown_task(client):
+    m = client.post(f"{BASE}/milestones", json={"name": "Batch"}).json()["milestone"]
+    r = client.post(f"{BASE}/milestones/{m['id']}/tasks", json={"ids": ["t_nope"]})
+    assert r.status_code == 200
+    assert r.json()["added"] == []
+    assert r.json()["errors"][0]["id"] == "t_nope"
+
+
+def test_rename_milestone(client):
+    m = client.post(f"{BASE}/milestones", json={"name": "old"}).json()["milestone"]
+    r = client.patch(f"{BASE}/milestones/{m['id']}", json={"name": "new"})
+    assert r.status_code == 200 and r.json()["milestone"]["name"] == "new"
+    assert client.patch(f"{BASE}/milestones/m_nope", json={"name": "x"}).status_code == 404
+
+
+def test_remove_task_from_milestone(client):
+    m = client.post(f"{BASE}/milestones", json={"name": "Batch"}).json()["milestone"]
+    t1 = _new_task(client, "a")
+    client.post(f"{BASE}/milestones/{m['id']}/tasks", json={"ids": [t1["id"]]})
+    r = client.request("DELETE", f"{BASE}/milestones/{m['id']}/tasks", json={"ids": [t1["id"]]})
+    assert r.status_code == 200
+    assert client.get(f"{BASE}/board").json()["milestones"][0]["task_count"] == 0
+
+
+def test_delete_milestone(client):
+    m = client.post(f"{BASE}/milestones", json={"name": "Batch"}).json()["milestone"]
+    assert client.delete(f"{BASE}/milestones/{m['id']}").status_code == 200
+    assert client.get(f"{BASE}/milestones").json()["milestones"] == []
+    assert client.delete(f"{BASE}/milestones/{m['id']}").status_code == 404
+
+
+def test_start_milestone_endpoint(client):
+    m = client.post(f"{BASE}/milestones", json={"name": "Sprint"}).json()["milestone"]
+    t1 = _new_task(client, "a")
+    client.post(f"{BASE}/milestones/{m['id']}/tasks", json={"ids": [t1["id"]]})
+    r = client.post(f"{BASE}/milestones/{m['id']}/start", json={"assignee": "alice"})
+    assert r.status_code == 200
+    assert r.json()["milestone"]["status"] == "active"
+
+
+def test_start_empty_milestone_is_400(client):
+    m = client.post(f"{BASE}/milestones", json={"name": "Empty"}).json()["milestone"]
+    r = client.post(f"{BASE}/milestones/{m['id']}/start", json={})
+    assert r.status_code == 400
+
+
+def test_release_milestone_endpoint(client):
+    m = client.post(f"{BASE}/milestones", json={"name": "Sprint"}).json()["milestone"]
+    t1 = _new_task(client, "a")
+    client.post(f"{BASE}/milestones/{m['id']}/tasks", json={"ids": [t1["id"]]})
+    r = client.post(f"{BASE}/milestones/{m['id']}/release", json={})
+    assert r.status_code == 200
+    assert r.json()["milestone"]["status"] == "released"
+    # The member task is now done.
+    board = client.get(f"{BASE}/board").json()
+    done = {t["id"] for col in board["columns"] if col["name"] == "done" for t in col["tasks"]}
+    assert t1["id"] in done
+
+
+# ---------------------------------------------------------------------------
+# Milestones — frontend bundle wiring (grep the shipped dist, repo convention)
+# ---------------------------------------------------------------------------
+
+def _dist_js() -> str:
+    repo_root = Path(__file__).resolve().parents[2]
+    return (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+
+def test_dashboard_has_mark_milestone_bulk_action():
+    js = _dist_js()
+    # The "Отметить вехой" bulk action is wired to a real handler, not a no-op.
+    assert "Отметить вехой" in js
+    assert "onMilestone: milestoneFromSelection" in js
+    assert "milestoneFromSelection" in js
+    assert f"{'/milestones'}" in js
+
+
+def test_dashboard_has_milestone_lifecycle_controls():
+    js = _dist_js()
+    # Start + release drive the batch lifecycle through the API.
+    assert "/milestones/${encodeURIComponent(mid)}/start" in js
+    assert "/milestones/${encodeURIComponent(mid)}/release" in js
+    assert "function MilestoneBar" in js
+    assert "Старт" in js and "Релиз" in js
+
+
+def test_dashboard_milestone_badge_distinct_from_epic():
+    js = _dist_js()
+    # Cards render a milestone badge, threaded through the same path as
+    # categories, and grouped/filtered by milestone_id.
+    assert "hermes-kanban-milestone-badge" in js
+    assert "t.milestone_id" in js
+    assert "milestoneMap" in js
+
+
+def test_dashboard_milestone_css_present():
+    repo_root = Path(__file__).resolve().parents[2]
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+    assert ".hermes-kanban-milestone-chip" in css
+    assert ".hermes-kanban-milestone-badge" in css

@@ -133,6 +133,14 @@ UNCATEGORIZED_ICON = "📥"
 
 _CATEGORY_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 
+# Milestone (веха) lifecycle. ``forming`` = being assembled (operator adds/
+# removes tasks); ``active`` = started, the batch has been taken into work as a
+# unit; ``released`` = shipped/closed as a unit. A milestone only ever moves
+# forward through these three.
+VALID_MILESTONE_STATUSES = {"forming", "active", "released"}
+# Icon the dashboard shows for a milestone (distinct from an epic's link glyph).
+MILESTONE_ICON = "🏁"
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -1139,6 +1147,10 @@ class Task:
     # the dashboard drawer above the description so opening a card gives the
     # reader the why without digging.
     context: Optional[str] = None
+    # Milestone (веха) this task belongs to, or None. References
+    # ``milestones.id``. Set/cleared via ``set_task_milestone``; drives the
+    # dashboard's grouped-by-milestone view and the batch start/release actions.
+    milestone_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1235,6 +1247,9 @@ class Task:
             context=(
                 row["context"] if "context" in keys and row["context"] else None
             ),
+            milestone_id=(
+                row["milestone_id"] if "milestone_id" in keys and row["milestone_id"] else None
+            ),
         )
 
 
@@ -1315,6 +1330,44 @@ class Category:
             icon=row["icon"],
             sort=int(row["sort"]) if row["sort"] is not None else 0,
             created_at=int(row["created_at"]) if row["created_at"] is not None else 0,
+        )
+
+
+@dataclass
+class Milestone:
+    """In-memory view of a ``milestones`` row — one named batch/sprint (веха).
+
+    ``status`` walks ``forming`` -> ``active`` -> ``released`` (see
+    ``VALID_MILESTONE_STATUSES``). ``task_count`` is a convenience the list
+    query fills in (members pointing at this milestone via
+    ``tasks.milestone_id``); it is ``None`` when not computed.
+    """
+
+    id: str
+    name: str
+    status: str
+    sort: int
+    created_at: int
+    started_at: Optional[int] = None
+    released_at: Optional[int] = None
+    task_count: Optional[int] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Milestone":
+        keys = set(row.keys())
+        return cls(
+            id=row["id"],
+            name=row["name"],
+            status=row["status"],
+            sort=int(row["sort"]) if row["sort"] is not None else 0,
+            created_at=int(row["created_at"]) if row["created_at"] is not None else 0,
+            started_at=row["started_at"] if "started_at" in keys else None,
+            released_at=row["released_at"] if "released_at" in keys else None,
+            task_count=(
+                int(row["task_count"])
+                if "task_count" in keys and row["task_count"] is not None
+                else None
+            ),
         )
 
 
@@ -1510,7 +1563,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- (the work description). NULL = none. Human-facing context shown on the
     -- dashboard drawer above the description so a reader gets the why without
     -- digging. Editable via ``set_task_context`` / the dashboard.
-    context              TEXT
+    context              TEXT,
+    -- Optional membership in a MILESTONE (веха) — a named batch/sprint of tasks
+    -- assembled, taken into work, and released TOGETHER. References
+    -- ``milestones.id``. A task belongs to at most one milestone; NULL = not
+    -- part of any (the common case). Deliberately distinct from an EPIC (a
+    -- parent task decomposed into ``task_links`` children): a milestone is a
+    -- flat, named, lifecycle-bearing SET, not a dependency DAG. Set/cleared via
+    -- ``set_task_milestone`` / the dashboard "Отметить вехой" bulk action.
+    milestone_id         TEXT
 );
 
 -- Per-board CATALOG of task categories (name + icon). A task's ``category``
@@ -1524,6 +1585,24 @@ CREATE TABLE IF NOT EXISTS task_categories (
     icon       TEXT NOT NULL,
     sort       INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
+);
+
+-- MILESTONES (вехи) — named batches/sprints of tasks with their own lifecycle,
+-- SEPARATE from the ``task_links`` epic DAG. An operator assembles a milestone
+-- ("Отметить вехой" on selected cards), then takes the whole batch into work
+-- ("старт вехи") and releases it as a unit ("релиз вехи"). Tasks point back
+-- here via ``tasks.milestone_id``. ``status`` walks forming -> active ->
+-- released; ``started_at`` / ``released_at`` stamp those transitions. Unlike
+-- ``task_categories`` (a bounded label vocabulary) a milestone is created
+-- on demand and carries state, so it is its own table rather than a catalog.
+CREATE TABLE IF NOT EXISTS milestones (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'forming',
+    sort        INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    started_at  INTEGER,
+    released_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2389,6 +2468,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # NULL (no context) — no behaviour change for rows predating the column.
         _add_column_if_missing(conn, "tasks", "context", "context TEXT")
 
+    if "milestone_id" not in cols:
+        # Milestone (веха) membership. Existing rows get NULL (no milestone) —
+        # no behaviour change for rows predating the column. The ``milestones``
+        # table itself is created by SCHEMA_SQL just above.
+        _add_column_if_missing(conn, "tasks", "milestone_id", "milestone_id TEXT")
+
     # Seed the category catalog on first creation only. ``task_categories`` is
     # created by SCHEMA_SQL just above; seed the operator's original icon groups
     # when it is still empty so a fresh board starts curated. A non-empty
@@ -2409,6 +2494,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_milestone ON tasks(milestone_id)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2768,6 +2856,15 @@ def _new_task_id() -> str:
     :func:`create_task` rather than rely on id uniqueness.
     """
     return "t_" + secrets.token_hex(4)
+
+
+def _new_milestone_id() -> str:
+    """Generate a short, URL-safe milestone id (``m_`` + 4 hex bytes).
+
+    Same collision profile as :func:`_new_task_id`; milestones are far rarer
+    than tasks so 4 bytes is comfortable.
+    """
+    return "m_" + secrets.token_hex(4)
 
 
 def _claimer_id() -> str:
@@ -5984,6 +6081,302 @@ def set_task_context(
             {"field": "context", "actor": actor},
         )
     return True, None
+
+
+# ---------------------------------------------------------------------------
+# Milestones (вехи) — named batches/sprints: create -> assign -> start -> release
+#
+# A milestone is a flat, named SET of tasks with its own lifecycle, distinct
+# from an epic (a parent task decomposed into ``task_links`` children). The
+# operator assembles one ("Отметить вехой"), starts it to take the whole batch
+# into work as a unit ("старт вехи"), and releases it to close the batch
+# together ("релиз вехи"). Membership lives on ``tasks.milestone_id``.
+# ---------------------------------------------------------------------------
+
+def create_milestone(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    milestone_id: Optional[str] = None,
+    sort: Optional[int] = None,
+) -> Milestone:
+    """Create a milestone in the ``forming`` state and return it.
+
+    ``sort`` defaults to one past the current max so new milestones append to
+    the end of the rail. ``name`` is required and capped at 120 chars.
+    """
+    label = (name or "").strip()
+    if not label:
+        raise ValueError("milestone name is required")
+    mid = (milestone_id or "").strip() or _new_milestone_id()
+    now = int(time.time())
+    if sort is None:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sort), -1) + 1 AS n FROM milestones"
+        ).fetchone()
+        sort = int(row["n"]) if row else 0
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO milestones (id, name, status, sort, created_at) "
+            "VALUES (?, ?, 'forming', ?, ?)",
+            (mid, label[:120], int(sort), now),
+        )
+    return get_milestone(conn, mid)  # type: ignore[return-value]
+
+
+def get_milestone(conn: sqlite3.Connection, milestone_id: str) -> Optional[Milestone]:
+    """Return one milestone (with its member ``task_count``) or ``None``."""
+    mid = (milestone_id or "").strip()
+    if not mid:
+        return None
+    row = conn.execute(
+        "SELECT m.*, "
+        "(SELECT COUNT(*) FROM tasks t WHERE t.milestone_id = m.id) AS task_count "
+        "FROM milestones m WHERE m.id = ?",
+        (mid,),
+    ).fetchone()
+    return Milestone.from_row(row) if row else None
+
+
+def list_milestones(conn: sqlite3.Connection) -> list[Milestone]:
+    """Return every milestone with member counts, ordered by ``sort`` then age."""
+    rows = conn.execute(
+        "SELECT m.*, "
+        "(SELECT COUNT(*) FROM tasks t WHERE t.milestone_id = m.id) AS task_count "
+        "FROM milestones m ORDER BY m.sort ASC, m.created_at ASC"
+    ).fetchall()
+    return [Milestone.from_row(r) for r in rows]
+
+
+def rename_milestone(
+    conn: sqlite3.Connection, milestone_id: str, name: str
+) -> Optional[Milestone]:
+    """Rename a milestone. Returns the updated row, or ``None`` if unknown."""
+    label = (name or "").strip()
+    if not label:
+        raise ValueError("milestone name is required")
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE milestones SET name = ? WHERE id = ?", (label[:120], milestone_id)
+        )
+    if cur.rowcount != 1:
+        return None
+    return get_milestone(conn, milestone_id)
+
+
+def delete_milestone(conn: sqlite3.Connection, milestone_id: str) -> bool:
+    """Delete a milestone, clearing ``milestone_id`` off members in the same txn.
+
+    The member tasks themselves are untouched apart from losing the membership
+    pointer — deleting a milestone disbands the batch, it does not delete work.
+    """
+    mid = (milestone_id or "").strip()
+    if not mid:
+        return False
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET milestone_id = NULL WHERE milestone_id = ?", (mid,)
+        )
+        cur = conn.execute("DELETE FROM milestones WHERE id = ?", (mid,))
+    return cur.rowcount > 0
+
+
+def milestone_task_ids(conn: sqlite3.Connection, milestone_id: str) -> list[str]:
+    """Return member task ids, highest priority / oldest first."""
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE milestone_id = ? "
+        "ORDER BY priority DESC, created_at ASC",
+        (milestone_id,),
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def list_milestone_tasks(conn: sqlite3.Connection, milestone_id: str) -> list[Task]:
+    """Return member Task rows, highest priority / oldest first."""
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE milestone_id = ? "
+        "ORDER BY priority DESC, created_at ASC",
+        (milestone_id,),
+    ).fetchall()
+    return [Task.from_row(r) for r in rows]
+
+
+def set_task_milestone(
+    conn: sqlite3.Connection,
+    task_id: str,
+    milestone_id: Optional[str],
+    *,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Add a task to a milestone (or remove it with ``milestone_id=None``).
+
+    Validates the target milestone exists (the same managed-reference discipline
+    ``set_task_category`` uses). Returns ``(True, None)`` on success or
+    ``(False, reason)`` if the task or milestone is unknown. Idempotent.
+    """
+    mid: Optional[str] = None
+    if milestone_id is not None:
+        mid = (milestone_id or "").strip() or None
+    row = conn.execute(
+        "SELECT milestone_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    if mid is not None and get_milestone(conn, mid) is None:
+        return False, (
+            f"unknown milestone {milestone_id!r}; create it first "
+            "(`kanban milestone create`)"
+        )
+    if row["milestone_id"] == mid:
+        return True, None  # idempotent no-op
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET milestone_id = ? WHERE id = ?", (mid, task_id)
+        )
+        _append_event(
+            conn, task_id, "milestone_set", {"milestone_id": mid, "actor": actor}
+        )
+    return True, None
+
+
+def _take_member_into_work(
+    conn: sqlite3.Connection, task: Task, *, actor: str, assignee: str
+) -> tuple[str, str, Optional[str]]:
+    """Assign + promote one milestone member on start.
+
+    Returns ``(bucket, task_id, reason)`` where ``bucket`` is one of
+    ``promoted`` / ``already_ready`` / ``waiting`` / ``skipped``.
+    """
+    if task.status in ("done", "archived", "triage", "scheduled"):
+        return "skipped", task.id, f"status {task.status!r}"
+    if not task.assignee:
+        try:
+            assign_task(conn, task.id, assignee)
+        except RuntimeError as exc:
+            return "skipped", task.id, str(exc)
+    if task.status == "ready":
+        return "already_ready", task.id, None
+    if task.status in ("todo", "blocked"):
+        ok, reason = promote_task(conn, task.id, actor=actor, reason="milestone start")
+        return ("promoted", task.id, None) if ok else ("waiting", task.id, reason)
+    return "skipped", task.id, f"status {task.status!r}"
+
+
+def start_milestone(
+    conn: sqlite3.Connection,
+    milestone_id: str,
+    *,
+    actor: str = "operator",
+    assignee: str = "default",
+) -> tuple[bool, str, dict]:
+    """Take a whole milestone into work as a unit ("старт вехи").
+
+    For every member: assign ``assignee`` if unassigned, then promote a
+    ``todo``/``blocked`` card to ``ready`` when its parents are all done (cards
+    still waiting on dependencies stay ``todo`` and are auto-promoted later by
+    ``recompute_ready``). Already-``ready`` cards are counted as-is;
+    done/archived/triage cards are reported as skipped. Flips the milestone to
+    ``active`` and stamps ``started_at``. Returns ``(ok, message, detail)``.
+    """
+    milestone = get_milestone(conn, milestone_id)
+    if milestone is None:
+        return False, f"unknown milestone {milestone_id!r}", {}
+    if milestone.status == "released":
+        return False, "milestone already released", {}
+    members = list_milestone_tasks(conn, milestone_id)
+    if not members:
+        return False, "milestone has no tasks to start", {}
+    buckets: dict[str, list] = {
+        "promoted": [], "already_ready": [], "waiting": [], "skipped": [],
+    }
+    for task in members:
+        bucket, tid, reason = _take_member_into_work(
+            conn, task, actor=actor, assignee=assignee
+        )
+        if reason is None:
+            buckets[bucket].append(tid)
+        else:
+            buckets[bucket].append({"id": tid, "reason": reason})
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE milestones SET status = 'active', started_at = ? "
+            "WHERE id = ? AND status != 'released'",
+            (int(time.time()), milestone_id),
+        )
+    msg = (
+        f"started: {len(buckets['promoted'])} promoted, "
+        f"{len(buckets['already_ready'])} already ready, "
+        f"{len(buckets['waiting'])} waiting on deps, {len(buckets['skipped'])} skipped"
+    )
+    return True, msg, buckets
+
+
+def _force_complete_for_release(
+    conn: sqlite3.Connection, task_id: str, note: str, actor: str
+) -> bool:
+    """Directly close a queued (todo/triage/scheduled) member on milestone
+    release. Returns True if a row moved to ``done``."""
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', result = ?, completed_at = ? "
+            "WHERE id = ? AND status NOT IN ('done', 'archived')",
+            (note, now, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "completed", {"via": "milestone_release", "actor": actor}
+        )
+    return True
+
+
+def release_milestone(
+    conn: sqlite3.Connection,
+    milestone_id: str,
+    *,
+    actor: str = "operator",
+    result: Optional[str] = None,
+) -> tuple[bool, str, dict]:
+    """Release a whole milestone as a unit ("релиз вехи").
+
+    Completes every non-terminal member, then flips the milestone to
+    ``released`` and stamps ``released_at``. Members already done/archived are
+    left alone; running/ready/blocked members go through :func:`complete_task`
+    (proper run closing); queued members are closed directly. Returns
+    ``(ok, message, detail)``.
+    """
+    milestone = get_milestone(conn, milestone_id)
+    if milestone is None:
+        return False, f"unknown milestone {milestone_id!r}", {}
+    members = list_milestone_tasks(conn, milestone_id)
+    note = (result or "").strip() or f"released with milestone «{milestone.name}»"
+    completed: list[str] = []
+    already_done: list[str] = []
+    failed: list[dict] = []
+    for task in members:
+        if task.status in ("done", "archived"):
+            already_done.append(task.id)
+            continue
+        if task.status in ("running", "ready", "blocked"):
+            ok = complete_task(conn, task.id, result=note)
+        else:
+            ok = _force_complete_for_release(conn, task.id, note, actor)
+        if ok:
+            completed.append(task.id)
+        else:
+            failed.append({"id": task.id, "reason": f"could not complete from {task.status!r}"})
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE milestones SET status = 'released', released_at = ? WHERE id = ?",
+            (int(time.time()), milestone_id),
+        )
+    detail = {"completed": completed, "already_done": already_done, "failed": failed}
+    msg = (
+        f"released: {len(completed)} completed, {len(already_done)} already done, "
+        f"{len(failed)} failed"
+    )
+    return True, msg, detail
 
 
 def list_task_decisions(

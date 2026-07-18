@@ -1778,3 +1778,75 @@
 .hermes-kanban-context-menu-item--danger:hover {
   background: color-mix(in srgb, var(--color-destructive, #d14a4a) 12%, transparent);
 }
+
+/* ---- Milestones (вехи) ------------------------------------------------ */
+
+/* Milestone rail above the board — one chip per milestone with lifecycle
+   actions. Visually related to the bulk bar but colour-keyed to milestones. */
+.hermes-kanban-milestones {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  padding: 0.35rem 0.75rem;
+}
+.hermes-kanban-milestones-label {
+  font-weight: 600;
+  font-size: 0.72rem;
+  opacity: 0.85;
+}
+.hermes-kanban-milestone-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.3rem 0.1rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--color-ring) 45%, var(--color-border));
+  background: color-mix(in srgb, var(--color-ring) 8%, var(--color-card));
+  font-size: 0.7rem;
+}
+.hermes-kanban-milestone-chip--active {
+  outline: 2px solid var(--color-ring);
+}
+.hermes-kanban-milestone-chip--active .hermes-kanban-milestone-name {
+  font-weight: 700;
+}
+/* forming = neutral, active = accent, released = muted/struck. */
+.hermes-kanban-milestone-chip--active,
+.hermes-kanban-milestone-chip--active.hermes-kanban-milestone-chip {
+  border-color: color-mix(in srgb, var(--color-ring) 70%, var(--color-border));
+}
+.hermes-kanban-milestone-chip--released {
+  opacity: 0.6;
+}
+.hermes-kanban-milestone-name {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  white-space: nowrap;
+}
+.hermes-kanban-milestone-chip > button {
+  height: 1.4rem !important;
+  padding: 0 0.4rem !important;
+  font-size: 0.65rem !important;
+  border: 1px solid var(--color-border);
+  cursor: pointer;
+}
+
+/* On-card milestone badge — 🏁 + name, colour-keyed by lifecycle status and
+   deliberately distinct from the epic child-progress counter. */
+.hermes-kanban-milestone-badge {
+  font-size: 0.62rem;
+  white-space: nowrap;
+  border-color: color-mix(in srgb, var(--color-ring) 55%, var(--color-border));
+}
+.hermes-kanban-milestone-badge--active {
+  background: color-mix(in srgb, var(--color-ring) 14%, transparent);
+}
+.hermes-kanban-milestone-badge--released {
+  opacity: 0.65;
+  text-decoration: line-through;
+}

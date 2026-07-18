@@ -747,6 +747,48 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_setcat.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    # --- milestones (вехи): named batches — create / assign / start / release ---
+    p_ms = sub.add_parser(
+        "milestone",
+        aliases=["milestones"],
+        help="Manage milestones (вехи): named batches taken into work and released together",
+    )
+    ms_sub = p_ms.add_subparsers(dest="milestone_action")
+    m_list = ms_sub.add_parser("list", aliases=["ls"], help="List milestones")
+    m_list.add_argument("--json", action="store_true", help="Emit JSON output")
+    m_create = ms_sub.add_parser("create", aliases=["new"], help="Create a milestone")
+    m_create.add_argument("name", help="Milestone name")
+    m_create.add_argument("--json", action="store_true", help="Emit JSON output")
+    m_rm = ms_sub.add_parser(
+        "rm", aliases=["remove", "delete"],
+        help="Delete a milestone (member tasks survive, membership cleared)",
+    )
+    m_rm.add_argument("milestone_id")
+    m_add = ms_sub.add_parser("add", help="Add task(s) to a milestone")
+    m_add.add_argument("milestone_id")
+    m_add.add_argument("task_ids", nargs="+", help="Task ids to add to the milestone")
+    m_drop = ms_sub.add_parser(
+        "drop", aliases=["unassign"], help="Remove task(s) from their milestone",
+    )
+    m_drop.add_argument("task_ids", nargs="+", help="Task ids to detach")
+    m_show = ms_sub.add_parser("show", help="Show a milestone and its tasks")
+    m_show.add_argument("milestone_id")
+    m_show.add_argument("--json", action="store_true", help="Emit JSON output")
+    m_start = ms_sub.add_parser(
+        "start", help="Take the whole milestone into work as a unit (старт вехи)",
+    )
+    m_start.add_argument("milestone_id")
+    m_start.add_argument("--assignee", default=None,
+                         help="Owner assigned to unassigned members (default: board default)")
+    m_start.add_argument("--json", action="store_true", help="Emit JSON output")
+    m_release = ms_sub.add_parser(
+        "release", help="Release/complete the whole milestone as a unit (релиз вехи)",
+    )
+    m_release.add_argument("milestone_id")
+    m_release.add_argument("--result", default=None,
+                           help="Result note recorded on completed members")
+    m_release.add_argument("--json", action="store_true", help="Emit JSON output")
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -1093,6 +1135,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "category": _cmd_category,
             "categories": _cmd_category,
             "set-category": _cmd_set_category,
+            "milestone": _cmd_milestone,
+            "milestones": _cmd_milestone,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -2447,6 +2491,150 @@ def _cmd_set_category(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared category of {args.task_id}")
     return 0
+
+
+def _ms_json(m: "kb.Milestone") -> dict:
+    """Serialise a Milestone for CLI ``--json`` output."""
+    return {
+        "id": m.id, "name": m.name, "status": m.status,
+        "task_count": m.task_count, "created_at": m.created_at,
+        "started_at": m.started_at, "released_at": m.released_at,
+    }
+
+
+def _ms_list(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        milestones = kb.list_milestones(conn)
+    if getattr(args, "json", False):
+        print(json.dumps([_ms_json(m) for m in milestones], indent=2, ensure_ascii=False))
+        return 0
+    if not milestones:
+        print("(no milestones — create one with `kanban milestone create <name>`)")
+        return 0
+    for m in milestones:
+        count = m.task_count if m.task_count is not None else 0
+        print(f"{kb.MILESTONE_ICON} {m.id}  [{m.status:8s}] {count:>3} tasks  {m.name}")
+    return 0
+
+
+def _ms_create(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        m = kb.create_milestone(conn, args.name)
+    if getattr(args, "json", False):
+        print(json.dumps(_ms_json(m), indent=2, ensure_ascii=False))
+    else:
+        print(f"Created milestone {m.id} «{m.name}»")
+    return 0
+
+
+def _ms_delete(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok = kb.delete_milestone(conn, args.milestone_id)
+    if not ok:
+        print(f"kanban: unknown milestone {args.milestone_id!r}", file=sys.stderr)
+        return 1
+    print(f"Deleted milestone {args.milestone_id} (member tasks kept, membership cleared)")
+    return 0
+
+
+def _ms_add(args: argparse.Namespace) -> int:
+    author = _profile_author()
+    failed: list[tuple[str, str]] = []
+    with kb.connect_closing() as conn:
+        for tid in args.task_ids:
+            ok, err = kb.set_task_milestone(conn, tid, args.milestone_id, actor=author)
+            if not ok:
+                failed.append((tid, err or "failed"))
+    for tid, err in failed:
+        print(f"kanban: {tid}: {err}", file=sys.stderr)
+    added = len(args.task_ids) - len(failed)
+    print(f"Added {added} task(s) to {args.milestone_id}")
+    return 1 if failed else 0
+
+
+def _ms_drop(args: argparse.Namespace) -> int:
+    author = _profile_author()
+    with kb.connect_closing() as conn:
+        for tid in args.task_ids:
+            kb.set_task_milestone(conn, tid, None, actor=author)
+    print(f"Removed {len(args.task_ids)} task(s) from their milestone")
+    return 0
+
+
+def _ms_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        m = kb.get_milestone(conn, args.milestone_id)
+        if m is None:
+            print(f"kanban: unknown milestone {args.milestone_id!r}", file=sys.stderr)
+            return 1
+        tasks = kb.list_milestone_tasks(conn, m.id)
+    if getattr(args, "json", False):
+        payload = _ms_json(m)
+        payload["tasks"] = [
+            {"id": t.id, "status": t.status, "title": t.title} for t in tasks
+        ]
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    print(f"{kb.MILESTONE_ICON} {m.id} «{m.name}»  [{m.status}]  {len(tasks)} tasks")
+    for t in tasks:
+        print(f"  {t.id}  [{t.status:8s}] {t.title}")
+    return 0
+
+
+def _ms_start(args: argparse.Namespace) -> int:
+    assignee = getattr(args, "assignee", None)
+    with kb.connect_closing() as conn:
+        if not assignee:
+            assignee = kb.configured_default_assignee() or "default"
+        ok, msg, detail = kb.start_milestone(
+            conn, args.milestone_id, actor=_profile_author(), assignee=assignee
+        )
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": ok, "message": msg, "detail": detail},
+                         indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+    if not ok:
+        print(f"kanban: {msg}", file=sys.stderr)
+        return 1
+    print(f"Milestone {args.milestone_id} {msg}")
+    return 0
+
+
+def _ms_release(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok, msg, detail = kb.release_milestone(
+            conn, args.milestone_id, actor=_profile_author(),
+            result=getattr(args, "result", None),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": ok, "message": msg, "detail": detail},
+                         indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+    if not ok:
+        print(f"kanban: {msg}", file=sys.stderr)
+        return 1
+    print(f"Milestone {args.milestone_id} {msg}")
+    return 0
+
+
+def _cmd_milestone(args: argparse.Namespace) -> int:
+    """Handle ``hermes kanban milestone <list|create|rm|add|drop|show|start|release>``."""
+    action = getattr(args, "milestone_action", None) or "list"
+    handlers = {
+        "list": _ms_list, "ls": _ms_list,
+        "create": _ms_create, "new": _ms_create,
+        "rm": _ms_delete, "remove": _ms_delete, "delete": _ms_delete,
+        "add": _ms_add,
+        "drop": _ms_drop, "unassign": _ms_drop,
+        "show": _ms_show,
+        "start": _ms_start,
+        "release": _ms_release,
+    }
+    fn = handlers.get(action)
+    if fn is None:
+        print(f"kanban milestone: unknown action {action!r}", file=sys.stderr)
+        return 2
+    return fn(args)
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:

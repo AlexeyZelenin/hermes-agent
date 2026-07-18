@@ -177,6 +177,20 @@ def _task_dict(
     return d
 
 
+def _milestone_dict(m: kanban_db.Milestone) -> dict[str, Any]:
+    """Serialise a Milestone for the board/list responses."""
+    return {
+        "id": m.id,
+        "name": m.name,
+        "status": m.status,
+        "task_count": m.task_count if m.task_count is not None else 0,
+        "sort": m.sort,
+        "created_at": m.created_at,
+        "started_at": m.started_at,
+        "released_at": m.released_at,
+    }
+
+
 def _board_token_costs(
     task_ids: list[str],
     children_map: dict[str, list[str]],
@@ -548,6 +562,11 @@ def get_board(
             for c in kanban_db.list_categories(conn)
         ]
 
+        # Milestones (вехи) for the grouped-by-milestone view + lifecycle bar.
+        # Cards carry ``milestone_id``; the frontend joins to this list for the
+        # name/status/count and the start/release affordances.
+        milestones = [_milestone_dict(m) for m in kanban_db.list_milestones(conn)]
+
         return {
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
@@ -555,6 +574,7 @@ def get_board(
             "tenants": tenants,
             "assignees": assignees,
             "categories": categories,
+            "milestones": milestones,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
@@ -2222,6 +2242,167 @@ def delete_category(key: str, board: Optional[str] = Query(None)):
         if not ok:
             raise HTTPException(status_code=404, detail=f"unknown category {key!r}")
         return {"ok": True}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Milestones (вехи) — named batches: create -> assign -> start -> release
+# ---------------------------------------------------------------------------
+
+class MilestoneBody(BaseModel):
+    name: str
+
+
+class MilestoneTasksBody(BaseModel):
+    ids: list[str]
+
+
+class MilestoneStartBody(BaseModel):
+    assignee: Optional[str] = None
+
+
+class MilestoneReleaseBody(BaseModel):
+    result: Optional[str] = None
+
+
+@router.get("/milestones")
+def list_milestones(board: Optional[str] = Query(None)):
+    """Return every milestone with member counts, ordered by sort then age."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return {
+            "milestones": [
+                _milestone_dict(m) for m in kanban_db.list_milestones(conn)
+            ]
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/milestones")
+def create_milestone(payload: MilestoneBody, board: Optional[str] = Query(None)):
+    """Create a milestone (state ``forming``)."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        m = kanban_db.create_milestone(conn, payload.name)
+        return {"milestone": _milestone_dict(m)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+@router.patch("/milestones/{milestone_id}")
+def rename_milestone(
+    milestone_id: str, payload: MilestoneBody, board: Optional[str] = Query(None)
+):
+    """Rename a milestone."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        m = kanban_db.rename_milestone(conn, milestone_id, payload.name)
+        if m is None:
+            raise HTTPException(status_code=404, detail=f"unknown milestone {milestone_id!r}")
+        return {"milestone": _milestone_dict(m)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+@router.delete("/milestones/{milestone_id}")
+def delete_milestone(milestone_id: str, board: Optional[str] = Query(None)):
+    """Delete a milestone; member tasks survive with their membership cleared."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ok = kanban_db.delete_milestone(conn, milestone_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"unknown milestone {milestone_id!r}")
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@router.post("/milestones/{milestone_id}/tasks")
+def add_milestone_tasks(
+    milestone_id: str, payload: MilestoneTasksBody, board: Optional[str] = Query(None)
+):
+    """Add tasks to a milestone (the "Отметить вехой" bulk action target)."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        added: list[str] = []
+        errors: list[dict[str, str]] = []
+        for tid in payload.ids:
+            ok, err = kanban_db.set_task_milestone(
+                conn, tid, milestone_id, actor="dashboard"
+            )
+            (added.append(tid) if ok else errors.append({"id": tid, "error": err or "failed"}))
+        return {"added": added, "errors": errors}
+    finally:
+        conn.close()
+
+
+@router.delete("/milestones/{milestone_id}/tasks")
+def remove_milestone_tasks(
+    milestone_id: str, payload: MilestoneTasksBody, board: Optional[str] = Query(None)
+):
+    """Detach tasks from their milestone (``milestone_id`` is ignored beyond routing)."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        for tid in payload.ids:
+            kanban_db.set_task_milestone(conn, tid, None, actor="dashboard")
+        return {"removed": list(payload.ids)}
+    finally:
+        conn.close()
+
+
+@router.post("/milestones/{milestone_id}/start")
+def start_milestone(
+    milestone_id: str,
+    payload: MilestoneStartBody = MilestoneStartBody(),
+    board: Optional[str] = Query(None),
+):
+    """Take the whole milestone into work as a unit ("старт вехи")."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        assignee = (payload.assignee or "").strip() or None
+        if assignee is None:
+            assignee = kanban_db.configured_default_assignee() or "default"
+        ok, message, detail = kanban_db.start_milestone(
+            conn, milestone_id, actor="dashboard", assignee=assignee
+        )
+        if not ok:
+            raise HTTPException(status_code=400, detail=message)
+        return {"ok": True, "message": message, "detail": detail,
+                "milestone": _milestone_dict(kanban_db.get_milestone(conn, milestone_id))}
+    finally:
+        conn.close()
+
+
+@router.post("/milestones/{milestone_id}/release")
+def release_milestone(
+    milestone_id: str,
+    payload: MilestoneReleaseBody = MilestoneReleaseBody(),
+    board: Optional[str] = Query(None),
+):
+    """Release/complete the whole milestone as a unit ("релиз вехи")."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ok, message, detail = kanban_db.release_milestone(
+            conn, milestone_id, actor="dashboard", result=payload.result,
+        )
+        if not ok:
+            raise HTTPException(status_code=400, detail=message)
+        return {"ok": True, "message": message, "detail": detail,
+                "milestone": _milestone_dict(kanban_db.get_milestone(conn, milestone_id))}
     finally:
         conn.close()
 
