@@ -50,7 +50,10 @@ EXEMPT_PROTOCOL_TOOLS = frozenset(
 
 # Providers whose spend is covered by a flat-rate subscription/OAuth plan rather
 # than metered per-token API-key billing. Spend on these never hard-stops.
-_SUBSCRIPTION_PROVIDERS = frozenset({"openai-codex", "xai-oauth"})
+# "local" is the on-device model server (Ollama/vLLM): flat-rate $0 spend.
+# Classifying it as metered would flag every turn as an unpriced api-key
+# call and fail-close the guard with budget_metering_dead.
+_SUBSCRIPTION_PROVIDERS = frozenset({"openai-codex", "xai-oauth", "local"})
 
 
 def classify_spend_source(
