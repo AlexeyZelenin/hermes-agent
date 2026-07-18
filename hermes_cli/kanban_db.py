@@ -3132,8 +3132,10 @@ def create_task(
                             project_repo, ".worktrees", task_id
                         )
                     if not branch_name:
-                        # _pdb was imported above when project_obj was resolved.
+                        # Re-import locally: the earlier import sits behind a
+                        # conditional, so the name isn't statically bound here.
                         try:
+                            from hermes_cli import projects_db as _pdb
                             branch_name = _pdb.branch_name_for(
                                 project_obj, task_id, title=title or ""
                             )
@@ -3840,7 +3842,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection, failure_limit: int | None = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -5538,7 +5540,6 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -5589,7 +5590,6 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
-            routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -5649,7 +5649,6 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            routed_to = "triage"
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -6065,7 +6064,9 @@ def record_log(
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (source, severity, category, event, task_id, session_id, pl, now),
         )
-        return int(cur.lastrowid)
+        log_id = cur.lastrowid  # set after a successful INSERT
+        assert log_id is not None
+        return log_id
 
 
 def record_client_logs(
@@ -6459,7 +6460,9 @@ def decompose_triage_task(
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
     for idx, child in enumerate(children):
-        if not isinstance(child, dict):
+        # Defensive: callers pass JSON-decoded input that may violate the
+        # annotated ``list[dict]`` shape at runtime.
+        if not isinstance(child, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError(f"child[{idx}] is not a dict")
         title = child.get("title")
         if not isinstance(title, str) or not title.strip():
@@ -7933,7 +7936,6 @@ def detect_stale_running(
 
 
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     reclaimed: list[str] = []
 
     rows = conn.execute(
@@ -8454,7 +8456,7 @@ def _record_task_failure(
     error: str,
     *,
     outcome: str,
-    failure_limit: int = None,
+    failure_limit: int | None = None,
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
@@ -8514,7 +8516,6 @@ def _record_task_failure(
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
-        cur_status = row["status"]
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -8619,7 +8620,7 @@ def _record_spawn_failure(
     task_id: str,
     error: str,
     *,
-    failure_limit: int = None,
+    failure_limit: int | None = None,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -10502,8 +10503,9 @@ def task_age(task: Task) -> dict:
     _co = _to_epoch(task.completed_at)
     age_since_created = now - _c if _c is not None else None
     age_since_started = now - _s if _s is not None else None
+    _start = _s or _c
     time_to_complete = (
-        _co - (_s or _c) if _co is not None else None
+        _co - _start if _co is not None and _start is not None else None
     )
     return {
         "created_age_seconds": age_since_created,

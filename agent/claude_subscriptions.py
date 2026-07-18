@@ -559,7 +559,9 @@ def _try_acquire(conn: sqlite3.Connection, task_id: str, now: float) -> Optional
                 (row["name"], task_id, os.getpid(), now),
             )
             conn.commit()
-            return Lease(id=int(cur.lastrowid), name=row["name"],
+            lease_id = cur.lastrowid  # set after a successful INSERT
+            assert lease_id is not None
+            return Lease(id=lease_id, name=row["name"],
                          config_dir=row["config_dir"])
         conn.commit()
         return None

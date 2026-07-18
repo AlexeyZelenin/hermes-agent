@@ -1,0 +1,58 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/pyright/main/packages/vscode-pyright/schemas/pyright-configuration.schema.json",
+
+  "//": "Strict type-check GATE for the Python codebase. See docs/type-checking.md",
+  "//include": "`include` IS the gated zone: bare `pyright` checks exactly these",
+  "//include2": "paths and CI fails on any error. Expand strict coverage by adding",
+  "//include3": "paths here (goal: agent, hermes_cli, plugins in full). Import",
+  "//include4": "resolution uses the repo root regardless of what is included.",
+  "include": [
+    "agent/acp_task_executor.py",
+    "agent/claude_subscriptions.py",
+    "hermes_cli/zeus_pacing.py",
+    "hermes_cli/kanban_db.py"
+  ],
+
+  "exclude": [
+    "**/__pycache__",
+    "**/node_modules",
+    "**/.venv",
+    "**/venv",
+    "**/.worktrees"
+  ],
+
+  "extraPaths": ["."],
+  "venvPath": ".",
+  "venv": ".venv",
+  "//pythonVersion": "match the CI floor so newer-only syntax/stdlib is caught",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "All",
+
+  "typeCheckingMode": "strict",
+
+  "//reportMissingModuleSource": "third-party stub-less packages: not a type error",
+  "reportMissingModuleSource": false,
+
+  "//relaxed": "The reportUnknown*/reportMissing*Type family fires on every value",
+  "//relaxed2": "flowing in from an untyped import. Until the whole transitive",
+  "//relaxed3": "import graph is typed these are unactionable noise that would bury",
+  "//relaxed4": "real bugs, so they are relaxed here. Every high-value SOUNDNESS",
+  "//relaxed5": "rule (optional access, arg/return/assignment types, call/index",
+  "//relaxed6": "issues, unreachable, redeclaration, ...) stays a hard error.",
+  "//relaxed7": "Re-enable these per module as its imports gain types - see",
+  "//relaxed8": "docs/type-checking.md 'Tightening toward full strict'.",
+  "reportUnknownMemberType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownParameterType": false,
+  "reportUnknownLambdaType": false,
+  "reportMissingParameterType": false,
+  "reportMissingTypeArgument": false,
+  "reportUntypedFunctionDecorator": false,
+  "reportUntypedBaseClass": false,
+  "reportUntypedClassDecorator": false,
+  "reportUntypedNamedTuple": false,
+  "reportPrivateUsage": false,
+  "reportPrivateImportUsage": false,
+  "reportConstantRedefinition": false
+}
