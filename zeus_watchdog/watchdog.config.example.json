@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to ~/.hermes/zeus/watchdog.config.json and edit. All keys are optional; omit any to keep the default. Paths default under $HERMES_HOME (~/.hermes). The bot token defaults to reading TELEGRAM_BOT_TOKEN from ~/.hermes/.env; set bot_token inline only if you must.",
+
+  "dispatcher_log_stale_sec": 600,
+  "ready_no_run_sec": 600,
+  "_heartbeat_note": "Must exceed the slowest executor's heartbeat cadence. ACP/claude-code workers heartbeat ~hourly, so keep this >= 7200 (2h) unless you run only fast-heartbeat hermes-workers.",
+  "heartbeat_timeout_sec": 7200,
+  "resume_grace_sec": 300,
+  "recent_limit_window_sec": 21600,
+  "debounce_sec": 1800,
+  "interval_sec": 120,
+
+  "kanban_db": "~/.hermes/kanban/boards/ra/kanban.db",
+  "zeus_db": "~/.hermes/zeus/zeus.db",
+  "gateway_pid_file": "~/.hermes/gateway.pid",
+  "gateway_log": "~/.hermes/logs/gateway.log",
+  "chat_id_file": "~/.hermes/zeus/telegram_chat_id",
+  "bot_token_env_file": "~/.hermes/.env",
+  "bot_token_key": "TELEGRAM_BOT_TOKEN"
+}

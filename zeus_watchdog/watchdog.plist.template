@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Zeus mechanical watchdog launchd agent.
+
+  Runs OUTSIDE the gateway on a fixed interval (StartInterval), one pass per
+  launch, so it survives a dead or wedged gateway. Not KeepAlive: each pass is a
+  short-lived one-shot; launchd relaunches it every interval regardless of how
+  the previous pass exited. Generated from this template by install.sh — the
+  __PLACEHOLDER__ tokens are substituted with absolute paths at install time.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.hermes.zeus-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>-m</string>
+        <string>zeus_watchdog</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__REPO__</string>
+        <key>HERMES_HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>__INTERVAL__</integer>
+
+    <key>StandardOutPath</key>
+    <string>__STDOUT__</string>
+
+    <key>StandardErrorPath</key>
+    <string>__STDERR__</string>
+</dict>
+</plist>
