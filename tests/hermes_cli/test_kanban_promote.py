@@ -252,3 +252,39 @@ def test_cli_promote_dedupes_duplicate_ids(kanban_home, capsys):
             (child,),
         ).fetchone()["n"]
     assert n == 1
+
+
+def test_cli_promote_paused_card_warns(kanban_home, capsys):
+    """Promoting a PAUSED card must warn (t_32daf7f3): the card lands in
+    'ready' but the dispatcher's paused gate keeps skipping it, so without
+    the warning the operator is left wondering why it never dispatches."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        child = kb.create_task(conn, title="c", parents=[parent], created_by="test")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        ok, err = kb.pause_task(conn, child, actor="op", reason="hold")
+        assert ok, err
+    rc = kb_cli._cmd_promote(_promote_ns(child))
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "PAUSED" in captured.err
+    assert child in captured.err
+    assert "resume" in captured.err
+    # Still promoted to ready, but the pause hold survives — the whole point
+    # of the warning: it will not dispatch until resumed.
+    with kb.connect() as conn:
+        t = kb.get_task(conn, child)
+        assert t.status == "ready"
+        assert t.paused is True
+
+
+def test_cli_promote_unpaused_card_no_warning(kanban_home, capsys):
+    """The warning is scoped to paused cards — a normal promote stays quiet."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        child = kb.create_task(conn, title="c", parents=[parent], created_by="test")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    rc = kb_cli._cmd_promote(_promote_ns(child))
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "PAUSED" not in captured.err

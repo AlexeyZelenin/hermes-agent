@@ -498,6 +498,23 @@ def test_board_stats(kanban_home):
         conn.close()
 
 
+def test_board_stats_ready_skips(kanban_home, monkeypatch):
+    """board_stats surfaces the per-card ready-skip reasons so the status
+    snapshot can show WHY a ready queue is stalled — a paused card reads
+    ``paused``, a dispatchable one is omitted (t_32daf7f3)."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    conn = kb.connect()
+    try:
+        parked = kb.create_task(conn, title="parked", assignee="daily")
+        kb.create_task(conn, title="ready-to-go", assignee="daily")
+        kb.pause_task(conn, parked, actor="op", reason="cooling")
+        stats = kb.board_stats(conn)
+        assert stats["ready_skips"] == [{"task_id": parked, "reason": "paused"}]
+    finally:
+        conn.close()
+
+
 def test_task_age_helper(kanban_home):
     conn = kb.connect()
     try:

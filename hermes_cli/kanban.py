@@ -2325,6 +2325,22 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # Pre-promotion pause warning (t_32daf7f3): a paused card promoted
+            # to 'ready' keeps its pause flag and the dispatcher's ``paused = 0``
+            # spawn gate skips it — so it lands in 'ready' but never dispatches.
+            # Surface that before the promote so the operator isn't left
+            # wondering why the "promoted" card just sits there.
+            prow = conn.execute(
+                "SELECT paused FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            is_paused = bool(prow["paused"]) if prow is not None else False
+            if is_paused:
+                print(
+                    f"warning: {tid} is PAUSED — promoting it to 'ready' will "
+                    f"NOT make it dispatch (the dispatcher skips paused cards). "
+                    f"Run `hermes kanban resume {tid}` to clear the hold.",
+                    file=sys.stderr,
+                )
             ok, err = kb.promote_task(
                 conn,
                 tid,
@@ -2339,6 +2355,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 "dry_run": bool(args.dry_run),
                 "forced": bool(args.force),
                 "reason": reason,
+                "paused": is_paused,
                 "error": err,
             })
 
@@ -2850,6 +2867,19 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    # Distinct section: every 'ready' card that is NOT being dispatched, with
+    # its specific reason — paused holds called out first (t_32daf7f3). Lets an
+    # operator diagnose a stalled ready queue at a glance instead of wondering
+    # why "promoted" cards just sit there.
+    ready_skips = stats.get("ready_skips") or []
+    if ready_skips:
+        paused = sum(1 for e in ready_skips if e["reason"] == "paused")
+        header = f"\nReady but NOT dispatched: {len(ready_skips)}"
+        if paused:
+            header += f" ({paused} paused)"
+        print(header)
+        for entry in ready_skips:
+            print(f"  {entry['task_id']:14s}  {entry['reason']}")
     return 0
 
 

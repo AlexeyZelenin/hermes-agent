@@ -10419,14 +10419,20 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
 
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
+    ``paused = 0`` mirrors the hard spawn gate in :func:`dispatch_once`: a
+    paused task is deterministically skipped and never spawned, so a queue
+    that is 100% paused is "correctly parked", NOT "stuck". Without this the
+    stuck-warn screams every tick a deliberately-parked queue sits idle
+    (t_32daf7f3) — the dispatcher is behaving exactly as asked.
+
+    Falls back to "any ready+assigned+unpaused" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND paused = 0"
     ).fetchall()
     if not rows:
         return False
@@ -10464,6 +10470,72 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+# Order of precedence for the stable, config-free ready-skip reasons. A card
+# can technically match several (a paused card also has no live lease); the
+# first match wins so the operator sees the dominant cause.
+READY_SKIP_REASON_PAUSED = "paused"
+READY_SKIP_REASON_LEASE_HELD = "lease-held"
+READY_SKIP_REASON_NO_ASSIGNEE = "no-assignee"
+READY_SKIP_REASON_NO_PROFILE = "no-profile"
+
+
+def ready_skip_reasons(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Read-only: why is each ``ready`` card NOT being dispatched right now?
+
+    Returns ``(task_id, reason)`` pairs for every ``status = 'ready'`` card
+    that the dispatcher will not spawn this instant, using ONLY the stable
+    gates derivable from the tasks table (no config, no live pacing state) so
+    the classification is deterministic and side-effect free — a pure
+    observability probe for ``gateway.log`` / status output (t_32daf7f3).
+
+    Reasons (first match wins, see the precedence constants above):
+
+    * ``paused`` — the pause hold is set; the dispatcher's ``paused = 0``
+      spawn gate skips it deterministically. Resume to make it eligible.
+    * ``lease-held`` — a worker currently owns the claim (``claim_lock`` set);
+      the card is in flight or awaiting TTL-reclaim, not stuck.
+    * ``no-assignee`` — no owner to spawn for. (An operator-configured
+      ``kanban.default_assignee`` may still adopt it at dispatch time; that
+      config is intentionally not consulted here.)
+    * ``no-profile`` — the assignee names a control-plane lane / missing
+      profile (e.g. ``orion-cc``) that is pulled by a terminal via
+      ``claim_task`` rather than auto-spawned. Expected steady state.
+
+    Cards that pass all four gates are genuinely dispatchable and omitted —
+    if they still aren't running, the cause is a transient capacity / pacing
+    cap already surfaced in :class:`DispatchResult` (``skipped_board_capped``,
+    ``skipped_per_profile_capped``, ``skipped_pacing_*``).
+    """
+    rows = conn.execute(
+        "SELECT id, assignee, paused, claim_lock FROM tasks "
+        "WHERE status = 'ready' "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    if not rows:
+        return []
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        if row["paused"]:
+            out.append((row["id"], READY_SKIP_REASON_PAUSED))
+            continue
+        if row["claim_lock"] is not None:
+            out.append((row["id"], READY_SKIP_REASON_LEASE_HELD))
+            continue
+        assignee = (row["assignee"] or "").strip()
+        if not assignee:
+            out.append((row["id"], READY_SKIP_REASON_NO_ASSIGNEE))
+            continue
+        if profile_exists is not None and not profile_exists(assignee):
+            out.append((row["id"], f"{READY_SKIP_REASON_NO_PROFILE}:{assignee}"))
+            continue
+        # Dispatchable under its own gates — not a stall reason.
+    return out
 
 
 def _auto_unblock_subscription_blocked(conn: sqlite3.Connection) -> list[str]:
@@ -12152,10 +12224,22 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    # Per-card reason for every ``ready`` card the dispatcher will NOT spawn
+    # right now — paused holds, expired/held leases, missing owner/profile
+    # (t_32daf7f3). Surfacing this in the status snapshot lets an operator see
+    # WHY a ready queue is stalled (a 100%-paused queue is "parked", not
+    # "stuck") instead of inferring it from generic spawn failures. The ready
+    # queue is small, so the extra per-card classification is cheap.
+    ready_skips = [
+        {"task_id": tid, "reason": reason}
+        for tid, reason in ready_skip_reasons(conn)
+    ]
+
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "ready_skips": ready_skips,
         "now": now,
     }
 

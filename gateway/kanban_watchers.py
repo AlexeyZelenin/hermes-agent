@@ -980,6 +980,14 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        # Per-board skip-reason report state (t_32daf7f3): maps slug ->
+        # (last_emit_epoch, signature). Emit the structured "why is each ready
+        # card not dispatched" breakdown when the reason-set changes or at most
+        # once per SKIP_REPORT_INTERVAL, so a newly-stalled card surfaces
+        # promptly while a steady-state parked queue stays bounded in the log.
+        SKIP_REPORT_INTERVAL = 300
+        SKIP_REPORT_MAX_CARDS = 25
+        skip_report_last: dict[str, tuple[int, str]] = {}
 
         # --- session supervisor (task t_cbf67d89): detect worker/dispatcher
         # anomalies and escalate to a triage card + operator push. Gated by
@@ -1219,6 +1227,69 @@ class GatewayKanbanWatchersMixin:
                             pass
             return False
 
+        def _skip_reasons_for_board(slug: str, res) -> "list[tuple[str, str]]":
+            """One reason per undispatched ready card on ``slug``.
+
+            Combines the stable, config-free classifier (paused / lease-held /
+            no-assignee / no-profile) with the transient capacity & pacing caps
+            the dispatcher recorded on ``res`` this tick. The config-free reason
+            wins when a card appears in both — a paused or unowned card won't
+            dispatch even if capacity frees up, so that is the reason to show.
+            """
+            reasons: "dict[str, str]" = {}
+            conn = None
+            try:
+                conn = _kb.connect(board=slug)
+                for tid, reason in _kb.ready_skip_reasons(conn):
+                    reasons.setdefault(tid, reason)
+            except Exception:
+                pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            if res is not None:
+                for tid in getattr(res, "skipped_board_capped", None) or []:
+                    reasons.setdefault(tid, "capacity-full:board")
+                for tid, who, cur in getattr(res, "skipped_per_profile_capped", None) or []:
+                    reasons.setdefault(tid, f"capacity-full:profile:{who}:{cur}")
+                for tid, who, _r in getattr(res, "skipped_pacing_throttled", None) or []:
+                    reasons.setdefault(tid, f"pacing-throttled:{who}")
+                for tid, who, _r in getattr(res, "skipped_pacing_admission", None) or []:
+                    reasons.setdefault(tid, f"pacing-admission:{who}")
+                for tid in getattr(res, "skipped_empty_anonymous", None) or []:
+                    reasons.setdefault(tid, "empty-anonymous")
+            return sorted(reasons.items())
+
+        def _emit_skip_report(slug: str, res) -> None:
+            """Log the structured skip-reason breakdown for one board, rate-
+            limited per board (on-change or every SKIP_REPORT_INTERVAL). Gives
+            operators an at-a-glance reason for every ready card that is NOT
+            being dispatched — paused holds included (t_32daf7f3)."""
+            pairs = _skip_reasons_for_board(slug, res)
+            if not pairs:
+                skip_report_last.pop(slug, None)
+                return
+            signature = ";".join(f"{tid}={reason}" for tid, reason in pairs)
+            now = int(time.time())
+            prev = skip_report_last.get(slug)
+            if prev is not None:
+                prev_at, prev_sig = prev
+                if prev_sig == signature and now - prev_at < SKIP_REPORT_INTERVAL:
+                    return
+            shown = pairs[:SKIP_REPORT_MAX_CARDS]
+            more = len(pairs) - len(shown)
+            detail = ", ".join(f"{tid}={reason}" for tid, reason in shown)
+            if more > 0:
+                detail += f", (+{more} more)"
+            logger.warning(
+                "kanban dispatcher [%s]: %d ready card(s) not dispatched — %s",
+                slug, len(pairs), detail,
+            )
+            skip_report_last[slug] = (now, signature)
+
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
@@ -1443,6 +1514,13 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+                # Structured skip-reason report per board (t_32daf7f3): surface
+                # every ready card that isn't dispatched — paused holds
+                # included — in gateway.log with its exact reason, so operators
+                # can diagnose a stalled ready queue at a glance instead of
+                # inferring it from generic spawn failures.
+                for slug, res in (results or []):
+                    await asyncio.to_thread(_emit_skip_report, slug, res)
                 # Session supervisor: one supervision pass per tick, off the
                 # event loop (DB IO + a blocking psutil CPU sample per suspected
                 # run). Never raises into the caller (see hermes_supervisor).

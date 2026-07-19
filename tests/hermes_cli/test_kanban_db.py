@@ -2009,6 +2009,77 @@ def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
         assert kb.has_spawnable_ready(conn) is False
 
 
+def test_has_spawnable_ready_false_when_all_paused(kanban_home, monkeypatch):
+    """A queue that is 100% paused is "correctly parked", not "stuck":
+    the dispatcher's ``paused = 0`` spawn gate skips every card, so the
+    health probe must not treat them as spawnable work (t_32daf7f3)."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="parked", assignee="daily")
+        assert kb.has_spawnable_ready(conn) is True
+        ok, err = kb.pause_task(conn, t, actor="op", reason="cooling")
+        assert ok, err
+        assert kb.has_spawnable_ready(conn) is False
+
+
+def test_ready_skip_reasons_paused(kanban_home, monkeypatch):
+    """Paused ready card is classified ``paused`` (the dominant hold)."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="parked", assignee="daily")
+        kb.pause_task(conn, t, actor="op", reason="cooling")
+        assert kb.ready_skip_reasons(conn) == [(t, "paused")]
+
+
+def test_ready_skip_reasons_no_assignee(kanban_home):
+    """A ready card with no owner is ``no-assignee`` (needs routing)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="orphan", created_by="op")
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.ready_skip_reasons(conn) == [(t, "no-assignee")]
+
+
+def test_ready_skip_reasons_no_profile(kanban_home, monkeypatch):
+    """A ready card assigned to a control-plane lane is ``no-profile:<lane>``."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="lane", assignee="orion-cc")
+        assert kb.ready_skip_reasons(conn) == [(t, "no-profile:orion-cc")]
+
+
+def test_ready_skip_reasons_lease_held(kanban_home, monkeypatch):
+    """A ready card a worker still holds the claim on is ``lease-held``."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="claimed", assignee="daily")
+        conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?", ("held", t))
+        assert kb.ready_skip_reasons(conn) == [(t, "lease-held")]
+
+
+def test_ready_skip_reasons_paused_beats_lease(kanban_home, monkeypatch):
+    """Precedence: a paused card that also carries a claim reads ``paused``."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="both", assignee="daily")
+        kb.pause_task(conn, t, actor="op", reason="hold")
+        conn.execute("UPDATE tasks SET claim_lock = ? WHERE id = ?", ("held", t))
+        assert kb.ready_skip_reasons(conn) == [(t, "paused")]
+
+
+def test_ready_skip_reasons_omits_dispatchable(kanban_home, monkeypatch):
+    """A ready card that passes every gate is dispatchable — not a skip."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        kb.create_task(conn, title="ready-to-go", assignee="daily")
+        assert kb.ready_skip_reasons(conn) == []
+
+
 def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable):
     spawns = []
 
