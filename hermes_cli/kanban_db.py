@@ -2338,6 +2338,7 @@ def _attempt_index_reindex_repair(resolved: Path, problems: list[str]) -> bool:
         _PENDING_REPAIR_ALERTS[str(resolved)] = {
             "problems": problems[:20],
             "backup": str(backup) if backup is not None else None,
+            "detected_at": int(time.time()),
         }
     return True
 
@@ -2354,18 +2355,19 @@ def _drain_repair_alert(conn: sqlite3.Connection, resolved: str) -> None:
     if alert is None:
         return
     try:
-        record_log(
+        from hermes_cli import corruption_forensics
+
+        # The connection is healthy again post-REINDEX, so we can correlate the
+        # writers that were active around the detection moment and enrich the
+        # self_heal breadcrumb + surface the episode card (task t_f135b0b6).
+        corruption_forensics.record_episode(
             conn,
-            source="operator",
             event="kanban.db auto-repaired: REINDEX fixed index corruption",
             severity="error",
-            category="self_heal",
-            payload={
-                "path": resolved,
-                "problems": alert["problems"],
-                "pre_repair_backup": alert["backup"],
-                "root_cause": "concurrent task_events writers (t_dfb4205b)",
-            },
+            problems=alert["problems"],
+            path=resolved,
+            at=alert.get("detected_at"),
+            backup=alert["backup"],
         )
     except Exception:
         _log.debug("kanban auto-repair: engine_log alert failed", exc_info=True)
@@ -2426,6 +2428,22 @@ def sweep_reindex_index_corruption(conn: sqlite3.Connection) -> Optional[list[st
             "fix (%s); operator recovery needed.",
             resolved, "; ".join(problems)[:400],
         )
+        # Surface the episode as a Проблема card (best-effort; the findings store
+        # is a separate healthy DB). No engine_log write — kanban.db is corrupt.
+        # Suspects come from a best-effort read of the corrupt conn (task
+        # t_f135b0b6).
+        try:
+            from hermes_cli import corruption_forensics
+
+            at = int(time.time())
+            corruption_forensics.emit_episode_finding(
+                corruption_class=corruption_forensics.CLASS_STRUCTURAL,
+                at=at, path=resolved, problems=problems,
+                suspects=corruption_forensics.snapshot_suspects(conn, at=at),
+                healed=False,
+            )
+        except Exception:
+            _log.debug("kanban proactive sweep: episode card failed", exc_info=True)
         return None
     try:
         conn.execute("REINDEX")
@@ -2446,17 +2464,16 @@ def sweep_reindex_index_corruption(conn: sqlite3.Connection) -> Optional[list[st
         resolved, "; ".join(problems)[:400],
     )
     try:
-        record_log(
+        from hermes_cli import corruption_forensics
+
+        # Connection is healthy again post-REINDEX — correlate the writers active
+        # around detection and enrich the breadcrumb + episode card (t_f135b0b6).
+        corruption_forensics.record_episode(
             conn,
-            source="operator",
             event="kanban.db auto-repaired: proactive REINDEX (dispatcher sweep)",
             severity="error",
-            category="self_heal",
-            payload={
-                "path": resolved,
-                "problems": problems[:20],
-                "root_cause": "concurrent task_events writers (t_dfb4205b)",
-            },
+            problems=problems,
+            path=resolved,
         )
     except Exception:
         _log.debug("kanban proactive sweep: engine_log alert failed", exc_info=True)
@@ -2535,6 +2552,20 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     ):
         return
     backup = _backup_corrupt_db(resolved)
+    # Structural corruption fails closed here (connect() will raise). Still surface
+    # the episode as a Проблема card so the operator sees the class + backup path
+    # even when the board is quarantined; the findings store is a separate healthy
+    # DB (task t_f135b0b6). Best-effort — must never mask the corruption raise.
+    try:
+        from hermes_cli import corruption_forensics
+
+        corruption_forensics.emit_episode_finding(
+            corruption_class=corruption_forensics.CLASS_STRUCTURAL,
+            at=int(time.time()), path=str(resolved), problems=problems,
+            suspects=[], healed=False,
+        )
+    except Exception:
+        _log.debug("kanban open-path guard: episode card failed", exc_info=True)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
