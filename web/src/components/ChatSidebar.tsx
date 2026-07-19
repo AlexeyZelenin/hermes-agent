@@ -31,6 +31,7 @@ import { ModelPickerDialog } from "@/components/ModelPickerDialog";
 import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
+import { GatewayReconnectLoop } from "@/lib/gateway-reconnect";
 import { api, buildWsUrl } from "@/lib/api";
 import { titleFromSessionInfoPayload } from "@/lib/chat-title";
 
@@ -162,7 +163,6 @@ export function ChatSidebar({
       setInfo({});
       setError(null);
     });
-    const offState = gw.onState(setState);
 
     const offSessionInfo = gw.on<SessionInfo>("session.info", (ev) => {
       if (ev.payload) {
@@ -178,34 +178,42 @@ export function ChatSidebar({
       }
     });
 
-    // Create the sidecar session so the gateway surfaces session-scoped
-    // signals (connection state, credential warnings). It's independent of the
-    // PTY pane's session by design. The model picker no longer rides this
-    // session — it writes config.yaml over REST — so we don't track its id.
-    gw.connect()
-      .then(() => {
-        if (cancelled) {
-          return;
-        }
-        // close_on_disconnect: the gateway reaps this sidecar session (and its
-        // slash_worker subprocess) when the WS drops, instead of leaking it.
-        return gw.request<{ session_id: string }>("session.create", {
+    // Resilient reconnect: exponential backoff on drop, resync on recovery,
+    // and a route-preserving full-page reload only when the sidecar can't
+    // recover within the attempt/time budget (a dead gateway that long has
+    // usually taken the PTY child with it, so a clean reload is warranted).
+    const loop = new GatewayReconnectLoop({
+      gateway: gw,
+      onState: setState,
+      onOpen: async ({ reconnected }) => {
+        // Recreate the sidecar session on every (re)connect so the gateway
+        // surfaces session-scoped signals. close_on_disconnect lets the
+        // gateway reap the session (and its slash_worker) when the WS drops
+        // instead of leaking it. The model picker rides REST, not this
+        // session, so we don't track the id.
+        await gw.request<{ session_id: string }>("session.create", {
           close_on_disconnect: true,
           source: "tool",
           ...(profile ? { profile } : {}),
         });
-      })
-      .catch((e: Error) => {
-        if (!cancelled) {
-          setError(e.message);
-        }
-      });
+        if (cancelled) return;
+        // Reconnected: the badge/tools feed is live again — clear the banner
+        // and re-read the effective model in case it changed while we were
+        // disconnected.
+        setError(null);
+        if (reconnected) refreshEffectiveModel();
+      },
+      onError: (e) => {
+        if (!cancelled) setError(e.message);
+      },
+    });
+    loop.start();
 
     return () => {
       cancelled = true;
-      offState();
       offSessionInfo();
       offError();
+      loop.stop();
       gw.close();
     };
     // `profile` is read from render; scope changes bump `version` → new `gw`.
