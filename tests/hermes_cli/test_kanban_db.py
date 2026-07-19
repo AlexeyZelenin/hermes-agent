@@ -3585,12 +3585,19 @@ class TestSharedBoardPaths:
 
 class TestLiveBoardGuard:
     """The kanban core must make it *impossible* for a pytest run to touch
-    the real shared board without an isolation override (task t_ecacc87b).
+    the real shared board (task t_ecacc87b, hardened in t_42ec4d5e).
 
     ``PYTEST_CURRENT_TEST`` is already set by pytest while these run, so the
     guard is armed. The guard keys on the *real* ``HOME`` env (not the
     monkeypatched ``Path.home``), so these tests point ``HOME`` at a tempdir
     and treat ``<HOME>/.hermes`` as the stand-in "live" board.
+
+    Invariant: the guard is purely **path-based** — it trips whenever the
+    resolved kanban path lands under the real ``~/.hermes``, regardless of
+    which env var pointed there. ``HERMES_KANBAN_HOME`` / ``HERMES_KANBAN_DB``
+    being *set* is NOT treated as proof of isolation, because the dispatcher
+    injects ``HERMES_KANBAN_DB=<live board db>`` into every worker's env
+    (t_42ec4d5e).
     """
 
     def _point_home_at(self, monkeypatch, tmp_path):
@@ -3611,7 +3618,9 @@ class TestLiveBoardGuard:
             kb.kanban_db_path()
         assert (live / "kanban.db").parent == live  # documents the blocked path
 
-    def test_kanban_home_override_bypasses_guard(self, tmp_path, monkeypatch):
+    def test_kanban_home_override_to_tempdir_is_allowed(self, tmp_path, monkeypatch):
+        # An override to an ISOLATED tempdir resolves outside the real home,
+        # so the path-based guard stays silent.
         self._point_home_at(monkeypatch, tmp_path)
         isolated = tmp_path / "isolated-board"
         isolated.mkdir()
@@ -3620,7 +3629,7 @@ class TestLiveBoardGuard:
 
         assert kb.kanban_db_path() == isolated / "kanban.db"
 
-    def test_kanban_db_pin_bypasses_guard(self, tmp_path, monkeypatch):
+    def test_kanban_db_pin_to_tempdir_is_allowed(self, tmp_path, monkeypatch):
         self._point_home_at(monkeypatch, tmp_path)
         pinned = tmp_path / "pinned" / "board.db"
         pinned.parent.mkdir(parents=True)
@@ -3628,6 +3637,32 @@ class TestLiveBoardGuard:
         monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
 
         assert kb.kanban_db_path() == pinned
+
+    def test_inherited_kanban_db_pin_at_live_board_trips_guard(
+        self, tmp_path, monkeypatch
+    ):
+        # t_42ec4d5e: the dispatcher injects HERMES_KANBAN_DB=<live board db>
+        # into every worker's env, so a worker that shells out `pytest`
+        # inherits a pin pointing straight at the LIVE board. A stale pin under
+        # the real home must NOT be trusted as isolation — it must trip the
+        # guard, not silently bypass it (the old early-return did the latter).
+        live = self._point_home_at(monkeypatch, tmp_path)
+        monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(live / "kanban.db"))
+
+        with pytest.raises(RuntimeError, match="live-board guard"):
+            kb.kanban_db_path()
+
+    def test_inherited_kanban_home_at_live_board_trips_guard(
+        self, tmp_path, monkeypatch
+    ):
+        # Same leak vector via HERMES_KANBAN_HOME pinned at the real home.
+        live = self._point_home_at(monkeypatch, tmp_path)
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(live))
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+
+        with pytest.raises(RuntimeError, match="live-board guard"):
+            kb.kanban_db_path()
 
     def test_isolated_tempdir_home_does_not_trip_guard(self, tmp_path, monkeypatch):
         # The common case: HERMES_HOME is an isolated tempdir that is NOT
