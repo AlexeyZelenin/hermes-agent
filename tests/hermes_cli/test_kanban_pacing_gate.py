@@ -24,10 +24,20 @@ kimi free -> glm trickles (cap), kimi spawns freely.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 
 import pytest
+
+
+def _hermes_module(mod):
+    """True for modules whose identity depends on HERMES_HOME at import time."""
+    return (
+        mod.startswith("hermes_cli")
+        or mod.startswith("hermes_state")
+        or mod == "hermes_constants"
+    )
 
 
 # --- pure fold logic: zeus_pacing.pocket_admission / throttled_pockets --------
@@ -190,15 +200,22 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for prof in ("glm", "kimi", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if (
-            mod.startswith("hermes_cli")
-            or mod.startswith("hermes_state")
-            or mod == "hermes_constants"
-        ):
-            del sys.modules[mod]
+    # Snapshot the real modules so we can restore sys.modules exactly on
+    # teardown. Without this the fresh import below leaks into the global
+    # module table: other test files bind `from hermes_cli import kanban_db`
+    # at import time, so a swapped-out module makes their string-path patches
+    # (patch("hermes_cli.kanban_db...")) hit an object they never call.
+    saved = {mod: sys.modules[mod] for mod in list(sys.modules) if _hermes_module(mod)}
+    for mod in saved:
+        del sys.modules[mod]
     from hermes_cli import kanban_db
-    yield kanban_db
+    try:
+        yield kanban_db
+    finally:
+        for mod in [m for m in sys.modules if _hermes_module(m)]:
+            del sys.modules[mod]
+        sys.modules.update(saved)
+        shutil.rmtree(test_home, ignore_errors=True)
 
 
 def _fake_spawn(*args, **kwargs):
