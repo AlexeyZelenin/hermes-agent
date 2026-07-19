@@ -129,6 +129,19 @@ def _conn(board: Optional[str] = None):
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
+    # Auto-vivify guard: a read (or any request) referencing an unknown
+    # non-default slug must 404, not materialize a ghost board on disk.
+    # Stale browser tabs holding removed/foreign slugs used to re-create
+    # boards forever through the /events reconnect loop; board creation
+    # belongs exclusively to POST /boards / `hermes kanban boards create`.
+    if board and board != "default":
+        try:
+            board_dir = kanban_db.boards_root() / board
+        except Exception:
+            board_dir = None
+        if board_dir is not None and not board_dir.is_dir():
+            raise HTTPException(
+                status_code=404, detail=f"unknown board '{board}'")
     try:
         kanban_db.init_db(board=board)
     except Exception as exc:
