@@ -568,6 +568,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--allow-dirty", dest="allow_dirty", default=None,
+                            metavar="REASON",
+                            help="Override the DoD commit gate: complete even with an "
+                                 "uncommitted workspace / no commit. Pass a short reason; "
+                                 "it is recorded on the task for audit.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -2139,16 +2144,30 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+    allow_dirty_reason = getattr(args, "allow_dirty", None)
+    allow_dirty = bool(allow_dirty_reason)
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    allow_dirty=allow_dirty,
+                    allow_dirty_reason=allow_dirty_reason,
+                )
+            except kb.UncommittedWorkError as dod_err:
+                failed.append(tid)
+                print(
+                    f"cannot complete {tid}: DoD commit gate — {dod_err.detail} "
+                    f"(commit your work, or pass --allow-dirty \"<reason>\")",
+                    file=sys.stderr,
+                )
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

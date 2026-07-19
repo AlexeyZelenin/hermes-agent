@@ -532,6 +532,16 @@ def _handle_complete(args: dict, **kw) -> str:
             pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
+    # DoD commit-gate override. Accept a reason string (preferred — it is
+    # recorded for audit) or a bare bool. A non-empty string implies True.
+    _allow_dirty_raw = args.get("allow_dirty")
+    allow_dirty = False
+    allow_dirty_reason: Optional[str] = None
+    if isinstance(_allow_dirty_raw, str):
+        allow_dirty_reason = _allow_dirty_raw.strip() or None
+        allow_dirty = allow_dirty_reason is not None
+    elif isinstance(_allow_dirty_raw, bool):
+        allow_dirty = _allow_dirty_raw
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -678,6 +688,29 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    allow_dirty=allow_dirty,
+                    allow_dirty_reason=allow_dirty_reason,
+                )
+            except kb.UncommittedWorkError as dod_err:
+                # DoD commit gate refused: the task is still in-flight (no
+                # state change). Tell the worker exactly how to recover so it
+                # commits + retries instead of treating this as terminal.
+                if dod_err.kind == "dirty_tree":
+                    changed = "\n".join(f"  {e}" for e in dod_err.dirty[:20])
+                    return tool_error(
+                        f"kanban_complete blocked by the DoD commit gate: "
+                        f"{dod_err.detail}\n"
+                        f"Uncommitted changes:\n{changed}\n"
+                        f"Fix: git add + git commit your work in {dod_err.repo_root}, "
+                        f"then call kanban_complete again with the same handoff. "
+                        f"If there is a real reason not to commit, retry with "
+                        f"allow_dirty=\"<reason>\"."
+                    )
+                return tool_error(
+                    f"kanban_complete blocked by the DoD commit gate: "
+                    f"{dod_err.detail}\n"
+                    f"Fix: commit your work in {dod_err.repo_root} then retry, "
+                    f"or pass allow_dirty=\"<reason>\" if no commit was warranted."
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1353,6 +1386,19 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "allow_dirty": {
+                "type": "string",
+                "description": (
+                    "Escape hatch for the DoD commit gate. Normally a code "
+                    "task cannot complete while its git workspace has "
+                    "uncommitted changes or the run landed no commit — commit "
+                    "your work first. Only if there is a genuine reason not to "
+                    "commit, set this to a short reason string (e.g. "
+                    "\"investigation only, no code changes\"); the override and "
+                    "its reason are recorded on the task for audit. Omit it in "
+                    "the normal case."
                 ),
             },
             "board": _board_schema_prop(),

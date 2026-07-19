@@ -131,6 +131,15 @@ DEFAULT_CATEGORIES: tuple[tuple[str, str, str], ...] = (
 # Icon shown for tasks whose ``category`` is NULL / unknown.
 UNCATEGORIZED_ICON = "📥"
 
+# Categories whose completion does NOT require a git commit. Research, domain
+# modeling, and doc tasks legitimately produce prose / findings / scratch notes
+# rather than a repo commit, so the DoD commit gate (see ``_dod_commit_gate``)
+# skips them entirely. Everything else that touches an isolated git-repo
+# workspace must land a commit or pass an explicit ``allow_dirty`` override.
+COMMIT_EXEMPT_CATEGORIES = frozenset(
+    {"research", "domain-map", "domain-cards", "docs", "doc"}
+)
+
 _CATEGORY_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -1829,7 +1838,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Git HEAD sha of the task's repo workspace at claim time. Lets the DoD
+    -- commit gate tell "this run landed a commit" from "nothing committed"
+    -- (see ``_dod_commit_gate``). NULL when the workspace is not a git repo.
+    base_commit         TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2867,6 +2880,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # NULL (no context) — no behaviour change for rows predating the column.
         _add_column_if_missing(conn, "tasks", "context", "context TEXT")
 
+    # DoD commit gate: run-start git HEAD sha, recorded at claim so completion
+    # can tell "landed a commit" from "committed nothing". Idempotent
+    # (``_add_column_if_missing`` no-ops when present); legacy runs get NULL and
+    # simply skip the no-commit half of the gate. Guarded on the table existing
+    # — some synthetic test schemas migrate a bare ``tasks`` table only.
+    if conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None:
+        _add_column_if_missing(conn, "task_runs", "base_commit", "base_commit TEXT")
+
     if "updated_at" not in cols:
         # Last-meaningful-change timestamp (t_3f79b87d). Bumped by the trigger
         # below on real edits; seeded to ``created_at`` for existing rows.
@@ -3073,7 +3096,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, base_commit TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -4594,6 +4617,10 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    # Snapshot the workspace repo HEAD before the write txn (subprocess must not
+    # run under the SQLite write lock) so the DoD gate can later tell whether
+    # this run landed a commit. NULL for non-repo workspaces.
+    base_commit = _run_base_commit(conn, task_id)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -4667,8 +4694,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, base_commit
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4678,6 +4705,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                base_commit,
             ),
         )
         run_id = run_cur.lastrowid
@@ -4723,6 +4751,7 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    base_commit = _run_base_commit(conn, task_id)
     with write_txn(conn):
         cur = conn.execute(
             """
@@ -4749,8 +4778,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, base_commit
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4760,6 +4789,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                base_commit,
             ),
         )
         run_id = run_cur.lastrowid
@@ -5232,6 +5262,34 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class UncommittedWorkError(RuntimeError):
+    """Raised by ``complete_task`` when a code task's isolated git workspace is
+    left with uncommitted changes, or the run landed no commit at all.
+
+    ``kind`` is ``"dirty_tree"`` (working tree has changes inside the declared
+    workspace) or ``"no_commit"`` (clean tree but the run added no commit over
+    its claim-time base). ``dirty`` carries the offending ``"XY path"`` porcelain
+    lines. The task is NOT mutated — the gate runs before any state change — so
+    the worker can commit (or retry with ``allow_dirty`` + a reason) and call
+    ``kanban_complete`` again. Kept a ``RuntimeError`` so it surfaces as a
+    recoverable tool error, mirroring ``ArtifactPreservationError``.
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        detail: str,
+        *,
+        repo_root: Optional[Path] = None,
+        dirty: Optional[Iterable[str]] = None,
+    ):
+        self.kind = kind
+        self.detail = detail
+        self.repo_root = str(repo_root) if repo_root else None
+        self.dirty = list(dirty or [])
+        super().__init__(detail)
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5241,6 +5299,8 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    allow_dirty: bool = False,
+    allow_dirty_reason: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5263,6 +5323,13 @@ def complete_task(
     ``completion_blocked_hallucination`` event is emitted so the rejected
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
+
+    Before the transition, the DoD commit gate (:func:`_dod_commit_gate`)
+    runs for tasks with an isolated git-repo workspace: an uncommitted
+    working tree or a run that landed no commit raises
+    :class:`UncommittedWorkError` (the task stays in-flight). ``allow_dirty``
+    with ``allow_dirty_reason`` is the explicit, audited override; research /
+    domain / doc categories are exempt.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -5298,6 +5365,20 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # DoD commit gate (t_91f91fe8): a code task cannot reach ``done`` with
+    # uncommitted work in its isolated repo workspace. Runs BEFORE the write
+    # txn — a refused completion leaves the task in-flight so the worker can
+    # commit (or pass ``allow_dirty`` + reason) and retry. Best-effort on
+    # infrastructure errors: only a genuine dirty-tree / no-commit finding
+    # raises; anything unknowable fails open.
+    gate_run_id = expected_run_id if expected_run_id is not None else (
+        _current_run_id(conn, task_id)
+    )
+    _dod_commit_gate(
+        conn, task_id, gate_run_id,
+        allow_dirty=allow_dirty, allow_dirty_reason=allow_dirty_reason,
+    )
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -5922,6 +6003,274 @@ def _git_status_porcelain_entries(repo_root: Path) -> Optional[list[tuple[str, s
         if rest:
             entries.append((code, rest))
     return entries
+
+
+def _git_head_sha(path: Path) -> Optional[str]:
+    """Return the current ``HEAD`` sha for the repo containing ``path``.
+
+    ``None`` when git can't be queried or the repo has no commits yet (a fresh
+    ``git init`` with an unborn HEAD) — either way there is no base to compare a
+    run's commits against.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    return out or None
+
+
+def _git_has_new_commit(repo_root: Path, base_commit: str) -> Optional[bool]:
+    """True when ``HEAD`` is ahead of ``base_commit`` (the run landed a commit).
+
+    Returns ``None`` when git can't answer (base sha gone after a rebase, git
+    unavailable, non-zero exit) so the caller can fail open on the no-commit
+    check rather than block on an unknowable.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-list", "--count",
+             f"{base_commit}..HEAD"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int((result.stdout or "0").strip()) > 0
+    except ValueError:
+        return None
+
+
+def _run_base_commit(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Resolve the git ``HEAD`` sha of a task's isolated repo workspace.
+
+    Only ``dir`` / ``worktree`` workspaces carry an attributable checkout; other
+    kinds (scratch, or a workspace outside any repo) return ``None`` so the
+    no-commit gate stays inert for them. Best-effort — any failure yields
+    ``None`` and never blocks a claim.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        kind = row["workspace_kind"]
+        path = row["workspace_path"]
+        if kind not in ("dir", "worktree") or not path:
+            return None
+        workspace = Path(path).expanduser()
+        if not workspace.is_dir():
+            return None
+        repo_root = _git_toplevel(workspace)
+        if repo_root is None:
+            return None
+        return _git_head_sha(repo_root)
+    except Exception:
+        return None
+
+
+# Event kinds emitted by the DoD commit gate (Definition-of-Done: a code task
+# cannot reach ``done`` with uncommitted work). Kept as named constants so the
+# reviewer stage / dashboard can filter on them.
+_DOD_BLOCK_EVENTS = {
+    "dirty_tree": "completion_blocked_dirty_tree",
+    "no_commit": "completion_blocked_no_commit",
+}
+
+
+def _record_dod_block(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    *,
+    kind: str,
+    repo_root: Path,
+    dirty: list[str],
+) -> None:
+    """Record a DoD-gate refusal as an auditable event + a card comment.
+
+    The comment is the worker-facing half (spec point 3): the rejected worker
+    reads it, commits (or retries with ``allow_dirty``), and re-completes.
+    """
+    listed = dirty[:_JANITOR_MAX_LISTED_PATHS]
+    payload = {
+        "gate": "dod_commit",
+        "reason": kind,
+        "repo_root": str(repo_root),
+        "dirty_count": len(dirty),
+        "dirty": listed,
+        "truncated": len(dirty) > len(listed),
+    }
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, _DOD_BLOCK_EVENTS[kind], payload, run_id=run_id
+        )
+    if kind == "dirty_tree":
+        lines = [
+            f"⛔ DoD gate: refused completion — {len(dirty)} uncommitted "
+            "change(s) in the task workspace. Commit your work (or explain "
+            "with allow_dirty=\"<reason>\"), then call kanban_complete again.",
+            f"repo: {repo_root}",
+        ]
+        if listed:
+            lines.append("")
+            lines.append("Uncommitted:")
+            lines.extend(f"  {e}" for e in listed)
+        if len(dirty) > len(listed):
+            lines.append(f"  ... {len(dirty) - len(listed)} more.")
+    else:
+        lines = [
+            "⛔ DoD gate: refused completion — the run landed no commit in the "
+            "task workspace. A code task must commit its work; if there was "
+            "genuinely nothing to commit, retry with allow_dirty=\"<reason>\".",
+            f"repo: {repo_root}",
+        ]
+    try:
+        add_comment(conn, task_id, "dod-gate", "\n".join(lines))
+    except Exception:
+        pass
+
+
+def _dod_commit_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    *,
+    allow_dirty: bool,
+    allow_dirty_reason: Optional[str],
+) -> None:
+    """Definition-of-Done commit gate — the primary, deterministic fix.
+
+    A code task cannot reach ``done`` while its isolated git workspace is dirty
+    or produced no commit. Raises :class:`UncommittedWorkError` (before any state
+    change, so the task stays in-flight and the worker can fix + retry).
+
+    Scope, deliberately conservative so it never blocks worker A for worker B's
+    mess:
+
+    * Only ``dir`` / ``worktree`` workspaces that resolve to a git repo are
+      gated — those are attributable to one task. Scratch workspaces (usually
+      not a repo, auto-cleaned) and a shared ``dir`` checkout at the repo root
+      (other workers' changes indistinguishable) are left to the post-completion
+      janitor, which detects + routes without blocking.
+    * ``COMMIT_EXEMPT_CATEGORIES`` (research / domain / docs) skip the gate.
+    * ``allow_dirty`` is the explicit escape hatch: the override + its reason are
+      recorded for audit and completion proceeds.
+    * The no-commit half only fires when a claim-time ``base_commit`` was
+      recorded AND git can confirm no commit landed; anything unknowable fails
+      open. Only the dirty-tree half depends on the live working tree.
+
+    Enforced only for an active worker run (``run_id`` set). A runless / manual
+    ``hermes kanban complete`` is an operator action the post-completion janitor
+    already covers (detect + route, never block), so the hard gate stays out of
+    its way.
+    """
+    if run_id is None:
+        return
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, category FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return
+    kind = row["workspace_kind"]
+    path = row["workspace_path"]
+    category = (row["category"] or "").strip().lower()
+
+    if category in COMMIT_EXEMPT_CATEGORIES:
+        return
+    if kind not in ("dir", "worktree") or not path:
+        return
+    workspace = Path(path).expanduser()
+    if not workspace.is_dir():
+        return
+    repo_root = _git_toplevel(workspace)
+    if repo_root is None:
+        return
+    try:
+        workspace_resolved = workspace.resolve(strict=False)
+    except OSError:
+        workspace_resolved = workspace
+    # A shared checkout at the repo root reflects every worker's uncommitted
+    # changes — unattributable, so never hard-block on it (janitor handles it).
+    if kind == "dir" and workspace_resolved == repo_root:
+        return
+
+    entries = _git_status_porcelain_entries(repo_root)
+    in_workspace: list[str] = []
+    if entries:
+        for code, rel in entries:
+            abs_path = (repo_root / rel).resolve(strict=False)
+            try:
+                inside = abs_path.is_relative_to(workspace_resolved)
+            except ValueError:
+                inside = False
+            if inside:
+                in_workspace.append(f"{code} {rel}")
+
+    base_commit: Optional[str] = None
+    if run_id is not None:
+        rrow = conn.execute(
+            "SELECT base_commit FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if rrow is not None:
+            base_commit = rrow["base_commit"]
+    has_new_commit: Optional[bool] = None
+    if base_commit:
+        has_new_commit = _git_has_new_commit(repo_root, base_commit)
+
+    if allow_dirty:
+        # Explicit override — record it (who, why, what was dirty) and allow.
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_dod_override",
+                {
+                    "gate": "dod_commit",
+                    "reason": (allow_dirty_reason or "").strip() or None,
+                    "repo_root": str(repo_root),
+                    "dirty_count": len(in_workspace),
+                    "dirty": in_workspace[:_JANITOR_MAX_LISTED_PATHS],
+                    "had_new_commit": has_new_commit,
+                },
+                run_id=run_id,
+            )
+        return
+
+    if in_workspace:
+        _record_dod_block(
+            conn, task_id, run_id,
+            kind="dirty_tree", repo_root=repo_root, dirty=in_workspace,
+        )
+        n = len(in_workspace)
+        raise UncommittedWorkError(
+            "dirty_tree",
+            f"{n} uncommitted change(s) in the task workspace ({repo_root}). "
+            "Commit your work, then retry kanban_complete — or pass "
+            "allow_dirty=\"<reason>\" to complete without committing.",
+            repo_root=repo_root, dirty=in_workspace,
+        )
+
+    if base_commit and has_new_commit is False:
+        _record_dod_block(
+            conn, task_id, run_id,
+            kind="no_commit", repo_root=repo_root, dirty=[],
+        )
+        raise UncommittedWorkError(
+            "no_commit",
+            f"the run landed no commit in the task workspace ({repo_root}). "
+            "A code task must commit its work; if there was genuinely nothing "
+            "to commit, retry with allow_dirty=\"<reason>\".",
+            repo_root=repo_root,
+        )
 
 
 def _janitor_dir_workspace(
