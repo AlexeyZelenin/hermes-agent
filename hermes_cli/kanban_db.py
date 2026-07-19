@@ -1959,6 +1959,16 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    # Tolerate already-corrupt UTF-8 in TEXT columns. The default text factory
+    # decodes TEXT strictly, so a SINGLE row with undecodable bytes (e.g. a
+    # comment carrying mojibake from a non-UTF-8 writer, kanban UTF-8 crash
+    # class — t_bad68065) raises ``sqlite3.OperationalError: Could not decode
+    # to UTF-8`` at fetch time and takes the whole worker down inside
+    # ``list_comments`` / ``build_worker_context``. Replacing undecodable bytes
+    # with U+FFFD keeps every reader alive; valid data is byte-identical
+    # (``errors='replace'`` only rewrites bytes that are ALREADY invalid
+    # UTF-8), so this can never corrupt a healthy value.
+    conn.text_factory = lambda raw: raw.decode("utf-8", "replace")
     return conn
 
 
@@ -4098,6 +4108,14 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
+def _scrub_unencodable(text: str) -> str:
+    """Replace code points that can't round-trip through UTF-8 (lone
+    surrogates) with U+FFFD, so stored text always encodes cleanly and can
+    never become the undecodable byte sequence that crashes DB readers. Clean
+    text is returned unchanged."""
+    return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str
 ) -> int:
@@ -4105,6 +4123,14 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    # Guard the WRITE path so a body carrying lone surrogates (e.g. a worker
+    # piping cp1251/binary output decoded with surrogateescape) can't raise
+    # ``UnicodeEncodeError: surrogates not allowed`` at INSERT — which would
+    # crash the commenter — or land undecodable bytes that later break every
+    # reader (kanban UTF-8 crash class). The round-trip replaces only the
+    # unencodable code points with U+FFFD; clean text is unchanged.
+    body = _scrub_unencodable(body)
+    author = _scrub_unencodable(author)
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(

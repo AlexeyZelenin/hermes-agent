@@ -1128,6 +1128,64 @@ def test_orphan_with_live_owning_dispatcher_still_counts_as_crash(
         )
 
 
+# ---------------------------------------------------------------------------
+# UTF-8 crash class (t_bad68065, resolved under t_e5997536): a single comment
+# row with undecodable bytes must NOT crash readers (list_comments /
+# build_worker_context), and the write path must never introduce such a row.
+# ---------------------------------------------------------------------------
+
+
+def test_corrupt_utf8_comment_row_does_not_crash_readers(kanban_home):
+    """A pre-existing comment row with invalid UTF-8 bytes (mojibake from a
+    non-UTF-8 writer) is read back with U+FFFD replacement instead of raising
+    ``sqlite3.OperationalError`` and taking the whole worker down."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="utf8", assignee="a")
+        kb.add_comment(conn, tid, "worker", "clean comment")
+        # Inject an undecodable-UTF-8 TEXT cell exactly like the corrupt row
+        # the overseer had to scrub — CAST(bytes AS TEXT) stores the raw bytes
+        # with TEXT storage class, which the strict default factory can't
+        # decode.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, CAST(? AS TEXT), ?)",
+            (tid, "badwriter", b"mojibake \xff\xfe report", int(time.time())),
+        )
+        conn.commit()
+
+        # Neither reader raises; the bad row survives with a replacement glyph.
+        comments = kb.list_comments(conn, tid)
+        bodies = [c.body for c in comments]
+        assert "clean comment" in bodies
+        assert any("�" in b for b in bodies), "bad bytes → U+FFFD"
+
+        ctx = kb.build_worker_context(conn, tid)
+        assert isinstance(ctx, str) and ctx  # did not crash
+
+
+def test_add_comment_scrubs_unencodable_surrogates(kanban_home):
+    """The write path replaces lone surrogates (which would raise
+    UnicodeEncodeError at INSERT and crash the commenter) with U+FFFD, so the
+    stored comment always round-trips through UTF-8."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="surrogates", assignee="a")
+        # A lone surrogate as produced by surrogateescape-decoding raw bytes.
+        dirty = "before \udcff\udcfe after"
+        cid = kb.add_comment(conn, tid, "w", dirty)
+        assert cid > 0  # insert did not raise
+
+        stored = kb.list_comments(conn, tid)[0].body
+        stored.encode("utf-8")  # encodes cleanly now (would raise if not)
+        assert "before" in stored and "after" in stored
+        assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in stored), (
+            "no lone surrogates should survive the scrub"
+        )
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
