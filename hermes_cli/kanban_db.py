@@ -4498,9 +4498,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      ``"gave_up"``, *not* ``"blocked"``.  A ``gave_up`` block is TERMINAL
+      and is kept blocked by the separate ``_has_terminal_gave_up`` guard
+      (t_b4f868e2); this sticky-block predicate deliberately ignores it so
+      the two failure sources stay independently classified.
 
     The cheapest signal that distinguishes the two is the most recent
     ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
@@ -4522,6 +4523,42 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _has_terminal_gave_up(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the circuit breaker gave up on ``task_id`` and no
+    explicit operator/planner action has re-promoted it since (t_b4f868e2).
+
+    ``_record_task_failure`` emits ``"gave_up"`` ONLY when the breaker
+    trips — either because ``consecutive_failures`` reached the effective
+    limit, or because a bounded retry budget was ``force_trip``-ed (e.g. the
+    protocol-violation streak in ``detect_crashed_workers``).  In both cases
+    the task has exhausted its retry budget and must be treated as TERMINAL
+    until a human or planner intervenes with a changed strategy.
+
+    The counter-based guard in ``recompute_ready``
+    (``consecutive_failures >= effective_limit``) catches the first case but
+    MISSES the force-tripped one: there ``consecutive_failures`` can sit below
+    the dispatcher limit, so the guard lets ``recompute_ready`` auto-promote
+    the task straight back to ``ready`` — the infinite respawn loop observed
+    on t_8dafcc86 (``gave_up`` at failures=1/2 with limit=3, promoted seconds
+    later).  Keying off the ``gave_up`` event instead of the counter closes
+    that gap.
+
+    Only an explicit ``"promoted_manual"`` (``promote_task``) or
+    ``"unblocked"`` (``unblock_task``) event clears the terminal state; the
+    automatic ``"promoted"`` event that ``recompute_ready`` itself emits does
+    NOT — that is exactly the loop being prevented.  Mirrors
+    ``_has_sticky_block``'s most-recent-event discriminator.
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? "
+        "AND kind IN ('gave_up', 'promoted_manual', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(row) and row["kind"] == "gave_up"
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int | None = None,
 ) -> int:
@@ -4538,7 +4575,16 @@ def recompute_ready(
        ``kanban_block`` — those stay blocked until an explicit
        ``kanban_unblock`` (#28712).
 
-    2. The task's ``consecutive_failures`` has reached the effective
+    2. The circuit breaker already gave up on the task (its most recent
+       give-up event is ``gave_up``, un-cleared by an explicit
+       ``promoted_manual`` / ``unblocked``).  ``gave_up`` is TERMINAL:
+       re-promotion needs a deliberate operator/planner action with a
+       changed strategy, never an automatic tick (t_8dafcc86).  See
+       ``_has_terminal_gave_up`` — this catches force-tripped give-ups
+       whose ``consecutive_failures`` sits below the limit, which the
+       counter guard (3) misses.
+
+    3. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
        repeatedly exhausts its iteration budget: without this guard the
        counter would reset on every recovery cycle and the circuit
@@ -4572,6 +4618,21 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            if cur_status == "blocked" and _has_terminal_gave_up(conn, task_id):
+                # Circuit breaker gave up (retry budget or a force-tripped
+                # bounded retry exhausted).  Terminal until an operator or
+                # planner re-promotes with a changed strategy (t_b4f868e2).
+                # Without this the force-tripped case — where
+                # ``consecutive_failures`` sits below the effective limit —
+                # slips past the counter guard below and spins a respawn
+                # loop (observed on t_8dafcc86).
+                _log.info(
+                    "kanban: gave_up is terminal — leaving %s blocked "
+                    "(consecutive_failures=%s); re-promote explicitly with a "
+                    "changed strategy to retry",
+                    task_id, row["consecutive_failures"],
+                )
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -6989,6 +7050,12 @@ def promote_task(
     on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
+
+    Re-promoting a task the circuit breaker gave up on is a terminal-state
+    override (t_b4f868e2): it REQUIRES a non-empty ``reason`` describing the
+    changed strategy, resets the dispatcher retry budget
+    (``consecutive_failures``) so the changed strategy gets a fresh run, and
+    records ``from_gave_up`` on the ``promoted_manual`` audit event.
     """
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -7001,6 +7068,17 @@ def promote_task(
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
+        )
+
+    # A ``gave_up`` block is terminal: the circuit breaker exhausted the
+    # task's retry budget. Re-promotion stays possible but must be a
+    # deliberate operator/planner action with a CHANGED STRATEGY — enforced
+    # by requiring a non-empty reason, which lands on the audit event.
+    gave_up = cur_status == "blocked" and _has_terminal_gave_up(conn, task_id)
+    if gave_up and not (reason and reason.strip()):
+        return False, (
+            f"task {task_id} gave up (circuit breaker tripped); re-promotion "
+            f"requires an explicit reason describing the changed strategy"
         )
 
     if not force:
@@ -7028,9 +7106,19 @@ def promote_task(
         # can still carry a live claim_lock (e.g. blocked mid-run); promoting it
         # to 'ready' with the lock intact makes it invisible to the dispatcher,
         # whose candidate query requires ``claim_lock IS NULL``. RCA: t_eeba1321.
+        # A gave_up override also clears the exhausted retry budget so the
+        # changed strategy starts fresh (mirrors ``unblock_task``: a
+        # deliberate action is a clean start for the dispatcher counter).
+        # The ``extra_set`` fragment is a constant literal — no user data is
+        # interpolated into the SQL.
+        extra_set = (
+            ", consecutive_failures = 0, last_failure_error = NULL"
+            if gave_up else ""
+        )
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready', "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL"
+            f"{extra_set} "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
             (task_id,),
         )
@@ -7040,8 +7128,14 @@ def promote_task(
             conn,
             task_id,
             "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
+            {"actor": actor, "reason": reason, "forced": force,
+             "from_gave_up": gave_up},
         )
+        if gave_up:
+            _log.info(
+                "kanban: gave_up override — %s re-promoted %s to ready with a "
+                "changed strategy (reason: %s)", actor, task_id, reason,
+            )
 
     return True, None
 

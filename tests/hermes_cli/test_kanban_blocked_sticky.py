@@ -13,9 +13,11 @@ These tests pin down:
 
 * Worker / operator-initiated blocks are sticky and survive
   ``recompute_ready``.
-* Circuit-breaker blocks (``gave_up`` event, status flipped via
-  ``_record_task_failure``) still auto-recover — the original intent
-  of #40c1decb3 is preserved.
+* Circuit-breaker *give-ups* (``gave_up`` event, status flipped via
+  ``_record_task_failure``) are TERMINAL and also survive
+  ``recompute_ready`` (t_b4f868e2) — a bare status='blocked' flip with no
+  ``gave_up`` event still auto-recovers, preserving #40c1decb3's intent for
+  genuinely transient triage.
 * An explicit ``kanban_unblock`` clears the sticky state.
 * The full block → promote → crash → ``gave_up`` loop is broken after
   this fix: subsequent ticks leave the task blocked.
@@ -143,20 +145,24 @@ def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
         assert task.consecutive_failures == 1
 
 
-def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
-    """The circuit-breaker emits ``gave_up`` (not ``blocked``).  Make
-    sure ``_has_sticky_block`` doesn't accidentally treat ``gave_up``
-    as sticky — otherwise we'd regress the safety net for genuinely
-    transient crashes."""
+def test_gave_up_event_makes_block_terminal(kanban_home: Path) -> None:
+    """The circuit-breaker emits ``gave_up`` (not ``blocked``) when it
+    trips.  ``gave_up`` is TERMINAL (t_b4f868e2): ``recompute_ready`` must
+    leave the task blocked regardless of the ``consecutive_failures`` value,
+    even when every parent is done.  This closes the force-tripped gap the
+    counter guard missed (``gave_up`` at failures < limit auto-promoted →
+    respawn loop on t_8dafcc86)."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", created_by="test")
         child = kb.create_task(conn, title="child", parents=[parent], created_by="test")
         kb.complete_task(conn, parent, result="ok")
 
         # Status + event match what _record_task_failure writes when
-        # the breaker trips.
+        # the breaker force-trips: blocked, a gave_up event, and a counter
+        # (1) that sits BELOW the default failure limit.
         conn.execute(
-            "UPDATE tasks SET status='blocked' WHERE id=?", (child,),
+            "UPDATE tasks SET status='blocked', consecutive_failures=1 "
+            "WHERE id=?", (child,),
         )
         conn.execute(
             "INSERT INTO task_events (task_id, kind, payload, created_at) "
@@ -165,9 +171,10 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
         )
         conn.commit()
 
-        promoted = kb.recompute_ready(conn)
-        assert promoted == 1
-        assert kb.get_task(conn, child).status == "ready"
+        # Multiple ticks must never promote it — no cycling.
+        for _ in range(5):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, child).status == "blocked"
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +276,107 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
             promoted = kb.recompute_ready(conn)
             assert promoted == 0
             assert kb.get_task(conn, tid).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# gave_up is terminal — force-tripped respawn loop (t_8dafcc86 / t_b4f868e2)
+# ---------------------------------------------------------------------------
+
+
+def _force_trip_gave_up(conn, tid: str) -> None:
+    """Reproduce a force-tripped give-up: the protocol-violation streak in
+    ``detect_crashed_workers`` calls ``_record_task_failure(force_trip=True)``
+    with the task already at ``ready``, tripping the breaker at a
+    ``consecutive_failures`` value BELOW the dispatcher limit."""
+    kb._record_task_failure(
+        conn, tid,
+        error="worker exited without a terminal tool call",
+        outcome="crashed",
+        failure_limit=1,
+        force_trip=True,
+        release_claim=False,
+        end_run=False,
+    )
+
+
+def test_force_tripped_gave_up_is_not_auto_promoted(kanban_home: Path) -> None:
+    """The exact t_8dafcc86 loop: a force-tripped ``gave_up`` lands the task
+    in ``blocked`` with ``consecutive_failures`` below the dispatcher limit,
+    so the counter guard (failures >= limit) never fires.  The event-based
+    terminal guard must still keep it blocked across ticks."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="a")
+        # Force-trip precondition: the release path already left it at ready.
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        _force_trip_gave_up(conn, tid)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        # Below the default dispatcher limit — the counter guard alone would
+        # have auto-promoted this.
+        assert task.consecutive_failures < kb.DEFAULT_FAILURE_LIMIT
+
+        for _ in range(5):
+            assert kb.recompute_ready(conn, failure_limit=kb.DEFAULT_FAILURE_LIMIT) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_manual_promote_clears_terminal_gave_up(kanban_home: Path) -> None:
+    """An explicit ``promote_task`` with a changed-strategy reason is the
+    legitimate exit: it clears the terminal state (``promoted_manual`` is the
+    most recent give-up event), resets the retry budget, and leaves an audit
+    trail flagged ``from_gave_up``."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="a")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        _force_trip_gave_up(conn, tid)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # No reason → refused (must carry a changed strategy).
+        ok, err = kb.promote_task(conn, tid, actor="op")
+        assert not ok
+        assert "changed strategy" in (err or "")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # With a reason → promoted, budget reset, audit flagged.
+        ok, err = kb.promote_task(
+            conn, tid, actor="op", reason="switch to smaller-scope subtask",
+        )
+        assert ok, err
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='promoted_manual' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        import json
+        payload = json.loads(ev["payload"])
+        assert payload["from_gave_up"] is True
+        assert payload["reason"] == "switch to smaller-scope subtask"
+
+        # Terminal state is cleared — a later recompute leaves the (now
+        # ready) task alone and does not re-trip anything.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_unblock_clears_terminal_gave_up(kanban_home: Path) -> None:
+    """``unblock_task`` (operator unblock) also clears the terminal give-up:
+    it emits ``unblocked`` and resets the counter, so a subsequent
+    ``recompute_ready`` no longer treats the task as given-up."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="loop", assignee="a")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        _force_trip_gave_up(conn, tid)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
 
 
 # ---------------------------------------------------------------------------
