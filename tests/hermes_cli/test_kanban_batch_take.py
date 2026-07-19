@@ -30,9 +30,9 @@ def _response(payload: dict):
 
 def test_batch_take_orders_only_model_selected_conflict(kanban_home):
     with kb.connect() as conn:
-        first = kb.create_task(conn, title="Change shared API", body="Edit api.py")
-        second = kb.create_task(conn, title="Update API callers", body="Edit clients")
-        independent = kb.create_task(conn, title="Write release notes", body="Docs only")
+        first = kb.create_task(conn, title="Change shared API", body="Edit api.py", created_by="test")
+        second = kb.create_task(conn, title="Update API callers", body="Edit clients", created_by="test")
+        independent = kb.create_task(conn, title="Write release notes", body="Docs only", created_by="test")
 
     plan = {"edges": [{"before": first, "after": second, "reason": "shared API"}]}
     with patch("agent.auxiliary_client.call_llm", return_value=_response(plan)):
@@ -52,7 +52,7 @@ def test_batch_take_orders_only_model_selected_conflict(kanban_home):
 
 def test_batch_take_does_not_change_cards_when_planner_output_is_bad(kanban_home):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="Keep independent")
+        task_id = kb.create_task(conn, title="Keep independent", created_by="test")
 
     with patch("agent.auxiliary_client.call_llm", return_value=_response({"wrong": []})):
         outcome = batch.plan_and_take([task_id])
@@ -66,8 +66,8 @@ def test_batch_take_does_not_change_cards_when_planner_output_is_bad(kanban_home
 
 def test_incomplete_parents_ignores_archived_historical_link(kanban_home):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="trashed parent")
+        parent = kb.create_task(conn, title="trashed parent", created_by="test")
         assert kb.archive_task(conn, parent) is True
-        child = kb.create_task(conn, title="child", parents=[parent])
+        child = kb.create_task(conn, title="child", parents=[parent], created_by="test")
 
         assert batch._incomplete_parents(conn, child) is False

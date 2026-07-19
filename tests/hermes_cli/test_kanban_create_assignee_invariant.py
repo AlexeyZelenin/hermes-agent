@@ -138,10 +138,15 @@ def test_decompose_children_stay_unassigned_without_default(kanban_home, monkeyp
 
 def test_dispatch_warns_on_unassigned_ready(kanban_home, monkeypatch, caplog):
     """A ready task that reached the dispatcher unowned (no default fallback)
-    must emit a visible WARNING, not a silent skip."""
+    must emit a visible WARNING, not a silent skip.
+
+    The task is given a body so the create-gate (t_d5a8eafe) does not
+    route it to triage — the gate is about anonymous *empty* junk, this
+    test is about a real task that simply has no assignee.
+    """
     monkeypatch.setattr(kb, "configured_default_assignee", lambda: None)
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="orphan", assignee=None)
+        tid = kb.create_task(conn, title="orphan", body="real spec", assignee=None)
         assert _assignee(conn, tid) is None
         with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
             res = kb.dispatch_once(conn, spawn_fn=lambda *_: 1234, dry_run=False)

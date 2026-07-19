@@ -56,7 +56,7 @@ def test_specify_with_open_parent_lands_in_todo_not_ready(kanban_home):
     # Parent-gated specified tasks must not jump the dispatcher — they go
     # to todo and wait for parent completion like any other gated task.
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent work")
+        parent = kb.create_task(conn, title="parent work", created_by="test")
         child = _create_triage(conn, title="child idea")
         kb.link_tasks(conn, parent, child)
         # After linking with an open parent, triage status should still be
@@ -78,7 +78,7 @@ def test_specify_with_open_parent_lands_in_todo_not_ready(kanban_home):
 
 def test_specify_refuses_non_triage_task(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="normal task")
+        tid = kb.create_task(conn, title="normal task", created_by="test")
         assert kb.get_task(conn, tid).status == "ready"
     with kb.connect() as conn:
         ok = kb.specify_triage_task(conn, tid, body="won't apply")

@@ -58,8 +58,8 @@ def kanban_home(tmp_path, monkeypatch):
 def test_idempotency_key_returns_existing_task(kanban_home):
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="first", idempotency_key="abc")
-        b = kb.create_task(conn, title="second attempt", idempotency_key="abc")
+        a = kb.create_task(conn, title="first", idempotency_key="abc", created_by="test")
+        b = kb.create_task(conn, title="second attempt", idempotency_key="abc", created_by="test")
         assert a == b, "same idempotency_key should return the same task id"
         # And body wasn't overwritten — first create wins.
         task = kb.get_task(conn, a)
@@ -71,9 +71,9 @@ def test_idempotency_key_returns_existing_task(kanban_home):
 def test_idempotency_key_ignored_for_archived(kanban_home):
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="first", idempotency_key="abc")
+        a = kb.create_task(conn, title="first", idempotency_key="abc", created_by="test")
         kb.archive_task(conn, a)
-        b = kb.create_task(conn, title="second", idempotency_key="abc")
+        b = kb.create_task(conn, title="second", idempotency_key="abc", created_by="test")
         assert a != b, "archived task shouldn't block a fresh create with same key"
     finally:
         conn.close()
@@ -82,8 +82,8 @@ def test_idempotency_key_ignored_for_archived(kanban_home):
 def test_no_idempotency_key_never_collides(kanban_home):
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b")
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", created_by="test")
         assert a != b
     finally:
         conn.close()
@@ -205,7 +205,7 @@ def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assign
     ``failure_limit`` (gateway config) and the hardcoded default.
 
     Three-tier resolution order:
-      1. ``task.max_retries`` (set via ``create_task(max_retries=N)`` /
+      1. ``task.max_retries`` (set via ``create_task(max_retries=N, created_by="test")`` /
          ``hermes kanban create --max-retries N``)
       2. ``failure_limit`` kwarg passed by the caller (gateway threads
          this from ``kanban.failure_limit`` config)
@@ -501,7 +501,7 @@ def test_board_stats(kanban_home):
 def test_task_age_helper(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", created_by="test")
         task = kb.get_task(conn, tid)
         age = kb.task_age(task)
         assert age["created_age_seconds"] is not None
@@ -518,7 +518,7 @@ def test_task_age_helper(kanban_home):
 def test_notify_sub_crud(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", created_by="test")
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123", user_id="u1",
             notifier_profile="default",
@@ -740,9 +740,9 @@ def test_read_worker_log_tail(kanban_home):
 def test_cli_complete_bulk(kanban_home):
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b")
-        c = kb.create_task(conn, title="c")
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", created_by="test")
+        c = kb.create_task(conn, title="c", created_by="test")
     finally:
         conn.close()
     out = run_slash(f"complete {a} {b} {c} --result all-done")
@@ -758,8 +758,8 @@ def test_cli_complete_bulk(kanban_home):
 def test_cli_archive_bulk(kanban_home):
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b")
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", created_by="test")
     finally:
         conn.close()
     out = run_slash(f"archive {a} {b}")
@@ -775,7 +775,7 @@ def test_cli_archive_bulk(kanban_home):
 def test_cli_archive_rm_deletes_archived_tasks(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="gone")
+        tid = kb.create_task(conn, title="gone", created_by="test")
         assert kb.archive_task(conn, tid)
     finally:
         conn.close()
@@ -791,7 +791,7 @@ def test_cli_archive_rm_deletes_archived_tasks(kanban_home):
 def test_cli_archive_rm_rejects_live_tasks(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="still-live")
+        tid = kb.create_task(conn, title="still-live", created_by="test")
     finally:
         conn.close()
     out = run_slash(f"archive --rm {tid}")
@@ -806,8 +806,8 @@ def test_cli_archive_rm_rejects_live_tasks(kanban_home):
 def test_cli_unblock_bulk(kanban_home):
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b")
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", created_by="test")
         kb.block_task(conn, a)
         kb.block_task(conn, b)
     finally:
@@ -819,8 +819,8 @@ def test_cli_unblock_bulk(kanban_home):
 def test_cli_block_bulk_via_ids_flag(kanban_home):
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b")
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", created_by="test")
     finally:
         conn.close()
     out = run_slash(f"block {a} need input --ids {b}")
@@ -878,7 +878,7 @@ def test_cli_log_missing_task(kanban_home):
 def test_cli_gc_reports_counts(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", created_by="test")
         kb.archive_task(conn, tid)
     finally:
         conn.close()
@@ -896,8 +896,8 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home):
     # Set up a pair of tasks to reference.
     conn = kb.connect()
     try:
-        tid_a = kb.create_task(conn, title="a")
-        tid_b = kb.create_task(conn, title="b", parents=[tid_a])
+        tid_a = kb.create_task(conn, title="a", created_by="test")
+        tid_b = kb.create_task(conn, title="b", parents=[tid_a], created_by="test")
     finally:
         conn.close()
 
@@ -1058,7 +1058,7 @@ def test_max_runtime_none_means_no_cap(kanban_home):
 def test_create_task_persists_max_runtime(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", max_runtime_seconds=600)
+        tid = kb.create_task(conn, title="x", max_runtime_seconds=600, created_by="test")
         task = kb.get_task(conn, tid)
         assert task.max_runtime_seconds == 600
     finally:
@@ -1144,7 +1144,7 @@ def test_heartbeat_on_running_task(kanban_home):
 def test_heartbeat_refused_when_not_running(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")   # lands in ready, not running
+        tid = kb.create_task(conn, title="x", created_by="test")   # lands in ready, not running
         ok = kb.heartbeat_worker(conn, tid)
         assert ok is False
         task = kb.get_task(conn, tid)
@@ -1182,8 +1182,8 @@ def test_cli_heartbeat_verb(kanban_home):
 def test_recompute_ready_emits_promoted_not_ready(kanban_home):
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="p")
-        child = kb.create_task(conn, title="c", parents=[parent])
+        parent = kb.create_task(conn, title="p", created_by="test")
+        child = kb.create_task(conn, title="c", created_by="test", parents=[parent])
         kb.complete_task(conn, parent, result="ok")
         # recompute_ready runs inside complete_task too, but call it again
         # defensively.
@@ -1241,7 +1241,7 @@ def test_migration_renames_legacy_event_kinds(tmp_path, monkeypatch):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", created_by="test")
         # Inject legacy event kinds directly.
         now = int(time.time())
         with kb.write_txn(conn):
@@ -1813,7 +1813,7 @@ def test_forward_compat_columns_writable(kanban_home):
     schema changes."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", created_by="test")
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET workflow_template_id = ?, current_step_key = ? "
@@ -2010,7 +2010,7 @@ def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanba
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", created_by="test")
         # Force to todo for the sake of the test.
         conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
         conn.commit()
@@ -2293,7 +2293,7 @@ def test_connect_auto_inits_fresh_db(tmp_path, monkeypatch):
     # Direct connect() without init_db() — used to raise "no such table".
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", created_by="test")
         assert tid is not None
         assert kb.get_task(conn, tid).title == "x"
     finally:
@@ -2461,7 +2461,7 @@ def test_build_worker_context_role_history_skipped_when_no_assignee(kanban_home)
     """If task has no assignee, the role-history section is omitted."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="orphan task")
+        tid = kb.create_task(conn, title="orphan task", created_by="test")
         # Force no assignee (create_task already defaults to None).
         ctx = kb.build_worker_context(conn, tid)
         assert "## Recent work by" not in ctx
@@ -2546,7 +2546,7 @@ def test_task_ids_dont_collide_at_scale(kanban_home):
         # over 500 creates was ~1.3%; over 10000 the old generator
         # would fail reliably. We don't need the full 10k run to prove
         # the regression; distribution check is sufficient.
-        ids = [kb.create_task(conn, title=f"scale-{i}") for i in range(500)]
+        ids = [kb.create_task(conn, title=f"scale-{i}", created_by="test") for i in range(500)]
         assert len(ids) == len(set(ids)), "ID collision at N=500"
         # Sanity: every id matches the expected format
         for tid in ids[:10]:
