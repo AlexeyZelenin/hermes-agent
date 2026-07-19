@@ -4829,6 +4829,263 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     assert "still here" in titles
 
 
+# ---------------------------------------------------------------------------
+# Auto-repair: index-only corruption of the hot event indexes (t_dfb4205b)
+#
+# The board repeatedly desynced idx_events_task / idx_events_run under ~10
+# concurrent task_events writers. These tests pin (1) the classifier, (2) the
+# open-path REINDEX self-heal covering idx_events_run specifically, (3) the
+# fail-closed contract for structural corruption, and (4) the proactive
+# dispatcher-tick sweep that heals a long-lived connection mid-life.
+# ---------------------------------------------------------------------------
+
+def _seed_events_board(db_path: Path, n_events: int = 6) -> None:
+    """Create a real kanban DB with a task and ``n_events`` task_events rows so
+    the event indexes hold entries, then checkpoint WAL into the main file."""
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_at) VALUES('t_x','x','ready',1000)"
+        )
+        for i in range(n_events):
+            conn.execute(
+                "INSERT INTO task_events(task_id,run_id,kind,payload,created_at) "
+                "VALUES('t_x',?, 'tool_call','{}',?)",
+                (i % 2, 1000 + i),
+            )
+        conn.commit()
+        # Fold WAL frames into the main DB file so raw-byte page edits below
+        # target the authoritative pages, not stale ones behind the WAL.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+
+def _zero_index_root_page(db_path: Path, index_name: str) -> None:
+    """Overwrite an index's b-tree root with a valid-but-empty index leaf page.
+
+    Produces exactly the incident signature — ``wrong # of entries in index``
+    plus ``row N missing from index`` — with the base table left intact, which
+    is the logical index/table desync that REINDEX rebuilds.
+    """
+    probe = sqlite3.connect(str(db_path))
+    try:
+        root = probe.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name=?", (index_name,)
+        ).fetchone()[0]
+        page_size = probe.execute("PRAGMA page_size").fetchone()[0]
+    finally:
+        probe.close()
+    page = bytearray(page_size)
+    page[0] = 0x0A  # index-leaf page type
+    page[5:7] = (page_size if page_size < 65536 else 0).to_bytes(2, "big")
+    with open(db_path, "r+b") as handle:
+        handle.seek((root - 1) * page_size)
+        handle.write(page)
+
+
+def test_integrity_rows_are_index_only_classifies_messages():
+    """Only index-content mismatches are REINDEX-fixable; anything else isn't."""
+    assert kb._integrity_rows_are_index_only(
+        ["wrong # of entries in index idx_events_run"]
+    )
+    assert kb._integrity_rows_are_index_only(
+        [
+            "wrong # of entries in index idx_events_run",
+            "row 3 missing from index idx_events_task",
+        ]
+    )
+    assert kb._integrity_rows_are_index_only(
+        ["non-unique entry in index idx_tasks_idempotency"]
+    )
+    # Structural / non-index problems must NOT be treated as auto-repairable.
+    assert not kb._integrity_rows_are_index_only(["database disk image is malformed"])
+    # The observed structural signature: a table b-tree with out-of-order rowids.
+    assert not kb._integrity_rows_are_index_only(
+        ["Tree 9 page 448 cell 20: Rowid 18792 out of order"]
+    )
+    assert not kb._integrity_rows_are_index_only(["NULL value in tasks.status"])
+    # A mix of index + structural must fail closed (any unrecognised row → False).
+    assert not kb._integrity_rows_are_index_only(
+        [
+            "wrong # of entries in index idx_events_run",
+            "database disk image is malformed",
+        ]
+    )
+    # Healthy / empty input is not "index-only" (nothing to repair).
+    assert not kb._integrity_rows_are_index_only([])
+    assert not kb._integrity_rows_are_index_only(["ok"])
+
+
+def test_connect_auto_reindexes_idx_events_run_corruption(tmp_path):
+    """A desynced idx_events_run self-heals on connect: REINDEX + re-verify,
+    data intact, pre-repair backup kept, operator engine_log alert written."""
+    db_path = tmp_path / "kanban.db"
+    _seed_events_board(db_path, n_events=6)
+    _zero_index_root_page(db_path, "idx_events_run")
+
+    # Sanity: the file really is corrupt in the index-only way before connect.
+    probe = sqlite3.connect(str(db_path))
+    pre = [r[0] for r in probe.execute("PRAGMA integrity_check").fetchall()]
+    probe.close()
+    assert any("index idx_events_run" in m for m in pre)
+
+    conn = kb.connect(db_path=db_path)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 6
+        alerts = conn.execute(
+            "SELECT severity, event FROM engine_log WHERE category='self_heal'"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert len(alerts) == 1
+    assert alerts[0]["severity"] == "error"
+    assert "auto-repaired" in alerts[0]["event"]
+    backups = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(backups) == 1
+
+
+def test_connect_refuses_structural_corruption_without_reindex(tmp_path):
+    """Structural (non-index) corruption still fails closed — no in-place
+    REINDEX, and the original file is preserved for recovery."""
+    db_path = tmp_path / "kanban.db"
+    _seed_events_board(db_path)
+
+    probe = sqlite3.connect(str(db_path))
+    root = probe.execute(
+        "SELECT rootpage FROM sqlite_master WHERE name='tasks'"
+    ).fetchone()[0]
+    page_size = probe.execute("PRAGMA page_size").fetchone()[0]
+    probe.close()
+    with open(db_path, "r+b") as handle:
+        handle.seek((root - 1) * page_size)
+        handle.write(b"\x00" * page_size)
+
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db_path)
+    assert db_path.exists()
+    assert list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+
+
+def test_attempt_index_reindex_repair_returns_false_when_reindex_fails(
+    tmp_path, monkeypatch
+):
+    """If REINDEX cannot clear the corruption, the repair reports failure so the
+    caller falls back to quarantine+raise (never a false 'repaired')."""
+    db_path = tmp_path / "kanban.db"
+    _seed_events_board(db_path)
+    _zero_index_root_page(db_path, "idx_events_run")
+
+    real_connect = kb._sqlite_connect
+
+    class _StillCorrupt:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *a):
+            if sql.strip().upper().startswith("PRAGMA INTEGRITY_CHECK"):
+                class _Cur:
+                    def fetchone(self_inner):
+                        return ("row 1 missing from index idx_events_run",)
+                return _Cur()
+            return self._inner.execute(sql, *a)
+
+        def close(self):
+            self._inner.close()
+
+    monkeypatch.setattr(
+        kb, "_sqlite_connect", lambda p: _StillCorrupt(real_connect(p))
+    )
+    assert (
+        kb._attempt_index_reindex_repair(db_path.resolve(), ["wrong # of entries"])
+        is False
+    )
+
+
+def test_proactive_sweep_reindexes_live_connection(tmp_path):
+    """The dispatcher sweep heals index desync on an already-open connection —
+    the open-path guard only fires on first connect, so a long-lived gateway
+    needs this to self-heal mid-life without a restart."""
+    kb._LAST_INDEX_SWEEP.clear()
+    db_path = tmp_path / "kanban.db"
+    _seed_events_board(db_path)
+    _zero_index_root_page(db_path, "idx_events_run")
+
+    # Open WITHOUT kb.connect() so the open-path guard doesn't pre-repair it —
+    # this models the gateway's cached, mid-life connection.
+    conn = kb._sqlite_connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        pre = [r[0] for r in conn.execute("PRAGMA integrity_check").fetchall()]
+        assert any("index idx_events_run" in m for m in pre)
+
+        repaired = kb.sweep_reindex_index_corruption(conn)
+        assert repaired is not None
+        assert any("idx_events_run" in m for m in repaired)
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == 6
+        alerts = conn.execute(
+            "SELECT event FROM engine_log WHERE category='self_heal'"
+        ).fetchall()
+        assert len(alerts) == 1
+        assert "proactive REINDEX" in alerts[0]["event"]
+    finally:
+        conn.close()
+
+
+def test_proactive_sweep_is_rate_limited(tmp_path):
+    """A recent stamp must short-circuit the sweep before the ~50ms integrity
+    scan; clearing the stamp lets the next call scan + heal."""
+    kb._LAST_INDEX_SWEEP.clear()
+    db_path = tmp_path / "kanban.db"
+    _seed_events_board(db_path)
+    _zero_index_root_page(db_path, "idx_events_run")
+
+    conn = kb._sqlite_connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Pre-stamp "just ran" → the sweep must skip and leave the DB corrupt.
+        kb._LAST_INDEX_SWEEP[str(db_path.resolve())] = time.monotonic()
+        assert kb.sweep_reindex_index_corruption(conn) is None
+        still = [r[0] for r in conn.execute("PRAGMA integrity_check").fetchall()]
+        assert any("idx_events_run" in m for m in still)
+        # Clear the stamp → the sweep now scans and heals.
+        kb._LAST_INDEX_SWEEP.clear()
+        assert kb.sweep_reindex_index_corruption(conn) is not None
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        conn.close()
+
+
+def test_proactive_sweep_leaves_structural_corruption_for_operator(tmp_path):
+    """The sweep must not REINDEX structural damage — it returns None and leaves
+    the file for the open-path guard / operator recovery."""
+    kb._LAST_INDEX_SWEEP.clear()
+    db_path = tmp_path / "kanban.db"
+    _seed_events_board(db_path)
+
+    probe = sqlite3.connect(str(db_path))
+    root = probe.execute(
+        "SELECT rootpage FROM sqlite_master WHERE name='task_events'"
+    ).fetchone()[0]
+    page_size = probe.execute("PRAGMA page_size").fetchone()[0]
+    probe.close()
+    with open(db_path, "r+b") as handle:
+        handle.seek((root - 1) * page_size)
+        handle.write(b"\x00" * page_size)
+
+    conn = kb._sqlite_connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert kb.sweep_reindex_index_corruption(conn) is None
+    finally:
+        conn.close()
+
+
 def test_init_db_allows_missing_then_healthy(tmp_path):
     db_path = tmp_path / "fresh.db"
     assert not db_path.exists()
