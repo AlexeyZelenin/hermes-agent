@@ -4,6 +4,7 @@ Doctor command for hermes CLI.
 Diagnoses issues with Hermes Agent setup.
 """
 
+import json
 import os
 import sys
 import subprocess
@@ -508,6 +509,113 @@ def managed_scope_check() -> None:
     )
     if os.environ.get("HERMES_MANAGED_DIR", "").strip():
         check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")
+
+
+def _zeus_doctor_script(name: str) -> Path | None:
+    """Locate a Zeus doctor script under ``<hermes-root>/zeus``, or None if absent.
+
+    Resolved from the ROOT hermes home (``get_default_hermes_root``), not the
+    profile-scoped ``get_hermes_home`` — the supervised-boot doctor is a
+    host-level concern that lives once at ``~/.hermes/zeus``, shared across
+    profiles. These are operator-side scripts installed by the VPS boot
+    pipeline; a plain dev checkout won't have them, so the caller no-ops.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        script = Path(get_default_hermes_root()) / "zeus" / name
+    except Exception:  # noqa: BLE001 — diagnostics must never crash
+        return None
+    return script if script.is_file() else None
+
+
+def _run_zeus_doctor(script: Path, *args: str, timeout: int = 25) -> tuple[int, str]:
+    """Run a Zeus doctor bash script; return ``(rc, combined output)``.
+
+    ``HERMES_HOME`` is pinned to the script's root (``<root>/zeus/..``) so the
+    host-level scripts probe the base gateway's paths, never the profile-scoped
+    home the doctor may have inherited (which would misreport keys/state).
+
+    Never raises: a missing bash, a timeout, or a crash all degrade to a
+    non-zero rc with a human-readable message so doctor reports and moves on.
+    """
+    env = {**os.environ, "HERMES_HOME": str(script.parent.parent)}
+    try:
+        proc = subprocess.run(
+            ["bash", str(script), *args],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        return proc.returncode, (proc.stdout + proc.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"{script.name} timed out after {timeout}s"
+    except Exception as e:  # noqa: BLE001 — diagnostics must never crash
+        return 1, f"{script.name} failed to run: {e}"
+
+
+def _check_self_redeploy_pending() -> None:
+    """Read-only: surface a pending self-redeploy from the running gateway.
+
+    Reads the host gateway's persisted ``pending_reload`` (written each dispatcher
+    tick by the self-redeploy controller, t_42950fee) from
+    ``<root>/gateway_state.json``. This is the running gateway's OWN boot-vs-disk
+    determination — a detached CLI has no boot fingerprint of its own to compare,
+    so recomputing skew locally would be meaningless. Never raises.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        state_path = Path(get_default_hermes_root()) / "gateway_state.json"
+        data = json.loads(state_path.read_text())
+    except Exception:  # noqa: BLE001 — diagnostics must never crash
+        return
+    pending = data.get("pending_reload") if isinstance(data, dict) else None
+    if not pending:
+        check_ok("No pending self-redeploy (running engine matches disk)")
+        return
+    boot_rev = pending.get("boot_rev", "?") if isinstance(pending, dict) else "?"
+    disk_rev = pending.get("disk_rev", "?") if isinstance(pending, dict) else "?"
+    check_warn(
+        f"Self-redeploy pending: gateway booted {boot_rev} but engine on disk is "
+        f"{disk_rev} — restart to load the merged code"
+    )
+
+
+def _check_startup_doctor(issues: list[str], should_fix: bool) -> None:
+    """Report the Zeus supervised startup doctor: pre-flight + live smoke.
+
+    Shells out to the ``$HERMES_HOME/zeus`` scripts. No-op when they aren't
+    installed (dev checkout). ``check``/``status`` are read-only; only ``--fix``
+    invokes the mutating ``preflight`` cures.
+    """
+    heal = _zeus_doctor_script("heal_kanban.sh")
+    boot = _zeus_doctor_script("boot_supervisor.sh")
+    if heal is None or boot is None:
+        return
+    _section("Supervised Startup Doctor")
+
+    _, sigs = _run_zeus_doctor(heal, "check")
+    failing = sigs.split()
+    if not failing:
+        check_ok("Pre-flight: all 6 checks pass")
+    elif should_fix:
+        _run_zeus_doctor(heal, "preflight", timeout=90)
+        _, after = _run_zeus_doctor(heal, "check")
+        still = after.split()
+        if still:
+            check_warn("Pre-flight faults remain after healing", ", ".join(still))
+            issues.append(f"Zeus pre-flight needs manual fix: {', '.join(still)}")
+        else:
+            check_ok(f"Pre-flight: healed {', '.join(failing)}")
+    else:
+        check_warn("Pre-flight faults detected", ", ".join(failing))
+        issues.append("Run `hermes doctor --fix` to auto-heal Zeus pre-flight faults")
+
+    rc, out = _run_zeus_doctor(boot, "status")
+    if rc == 0 and "UNHEALTHY" not in out:
+        check_ok(out or "Gateway smoke tests pass (pid + http + state + tick)")
+    else:
+        check_fail("Gateway supervised smoke failed", out)
+        issues.append("Supervised boot smoke failed — see `zeus/boot_supervisor.sh status`")
+
+    _check_self_redeploy_pending()
 
 
 def run_doctor(args):
@@ -1356,6 +1464,7 @@ def run_doctor(args):
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)
+    _check_startup_doctor(issues, should_fix)
 
     if sys.platform != "win32":
         _section("Command Installation")
