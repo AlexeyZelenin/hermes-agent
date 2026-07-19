@@ -3725,6 +3725,32 @@ def _ensure_vision_reconcile_cron() -> None:
         logger.debug("vision-reconcile cron ensure skipped: %s", exc)
 
 
+_ecosystem_scout_crons_ensured = False
+
+
+def _ensure_ecosystem_scout_crons() -> None:
+    """Self-establish the ecosystem-scout regulars once per process.
+
+    Two weekly cards (task t_bad68065): an agent SCAN that drops a "стоит
+    поставить" triage short-list, and a no_agent VERDICT that measures the
+    effect of installs on task efficiency and pushes findings. Idempotent and
+    best-effort — a failure just retries on the next tick and never blocks job
+    dispatch.
+    """
+    global _ecosystem_scout_crons_ensured
+    if _ecosystem_scout_crons_ensured:
+        return
+    try:
+        from hermes_cli.ecosystem_scout import (
+            ensure_scout_scan_job, ensure_scout_verdict_job)
+        scan = ensure_scout_scan_job()
+        verdict = ensure_scout_verdict_job()
+        if scan is not None and verdict is not None:
+            _ecosystem_scout_crons_ensured = True
+    except Exception as exc:  # never let seeding break the ticker
+        logger.debug("ecosystem-scout cron ensure skipped: %s", exc)
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -3773,6 +3799,9 @@ def tick(
         # Same for the vision-reconcile cron (reflection): keeps the backlog↔
         # vision sverka running without nightly manual oversight.
         _ensure_vision_reconcile_cron()
+        # Same for the ecosystem-scout regulars: weekly scan short-list + a
+        # verdict that measures the effect of installs on task efficiency.
+        _ensure_ecosystem_scout_crons()
 
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
