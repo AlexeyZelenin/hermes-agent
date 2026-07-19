@@ -1840,7 +1840,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     profile             TEXT,
     step_key            TEXT,
     status              TEXT NOT NULL,
-    -- status: running | done | blocked | crashed | timed_out | failed | released
+    -- status: running | done | blocked | crashed | timed_out | failed |
+    --         released | rate_limited | killed_by_restart
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
@@ -1850,7 +1851,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     ended_at            INTEGER,
     outcome             TEXT,
     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    --          gave_up | reclaimed | rate_limited | killed_by_restart |
+    --          (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT,
@@ -8713,6 +8715,14 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    restart_killed: list[str] = field(default_factory=list)
+    """Task ids whose workers died because the gateway/overseer that owned
+    the claim was itself restarted (its dispatcher PID is gone, so the
+    orphaned worker is reaped here as an unknown exit). These are released
+    back to ``ready`` WITHOUT counting a failure — a service bounce is not
+    the task's fault, so it must not increment ``consecutive_failures`` or
+    trip the give-up breaker. Distinct from ``crashed`` (a worker whose
+    OWNING dispatcher is still alive — a genuine task-level crash)."""
     auto_unblocked: list[str] = field(default_factory=list)
     """Capability-blocked task ids auto-unblocked this tick because the
     Claude subscription pool recovered (a cooling window elapsed or a
@@ -8906,6 +8916,37 @@ def _pid_alive(pid: Optional[int]) -> bool:
             # If the secondary probe fails, keep the kill(0) answer.
             pass
     return True
+
+
+def _claim_owner_alive(claim_lock: Optional[str]) -> Optional[bool]:
+    """Is the dispatcher/gateway process that owns ``claim_lock`` alive?
+
+    ``claim_lock`` is a ``host:pid`` string (see ``_claimer_id``) where the
+    pid is the *dispatcher* that claimed the task and spawned its worker —
+    NOT the worker pid (that's ``tasks.worker_pid``). When the gateway or
+    overseer hosting the dispatcher is restarted, its pid changes; any task
+    still ``running`` under the old pid was killed by the service bounce,
+    not by a task-level fault.
+
+    Returns:
+      * ``True``  — the owning dispatcher pid is still alive (host-local).
+      * ``False`` — the owning dispatcher pid is gone (host-local): its
+        workers are orphaned, so this is a service-restart kill.
+      * ``None``  — undeterminable (foreign host or malformed lock). Callers
+        treat ``None`` as "assume alive" and do NOT suppress the failure —
+        we only skip counting a failure when we have positive evidence the
+        whole service went down.
+    """
+    if not claim_lock or ":" not in claim_lock:
+        return None
+    host, _, pid_str = claim_lock.rpartition(":")
+    if host != _claimer_id().split(":", 1)[0]:
+        return None  # foreign host — its pids are meaningless here.
+    try:
+        owner_pid = int(pid_str)
+    except (TypeError, ValueError):
+        return None
+    return _pid_alive(owner_pid)
 
 
 def _terminate_reclaimed_worker(
@@ -9479,9 +9520,25 @@ def detect_crashed_workers(
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    When a worker's exit is ``unknown`` (not in THIS dispatcher's reap
+    registry, i.e. it was not our child) AND the dispatcher/gateway that
+    owned the claim is itself gone (``_claim_owner_alive`` returns False),
+    the worker died because the gateway/overseer was restarted — the bounce
+    took its worker children down and a fresh dispatcher now finds the
+    orphaned ``running`` rows. This is a *service-restart kill*, not a
+    task-level failure: the task is released to ``ready`` for immediate
+    respawn WITHOUT counting a failure (skipping ``_record_task_failure``
+    entirely), so a gateway bounce can never increment
+    ``consecutive_failures`` or trip the give-up breaker. A distinct
+    ``killed_by_restart`` event/run-outcome is recorded and the ids are
+    returned via the ``_last_restart_killed`` function attribute. A genuine
+    worker crash — whose owning dispatcher is still alive — keeps the old
+    ``crashed`` + ``_record_task_failure`` path.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    restart_killed: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9515,6 +9572,7 @@ def detect_crashed_workers(
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            restart_killed_exit = False
             # Read the worker log tail once so an abnormal death can (a) carry a
             # human-readable reason instead of a bare exit code and (b) attach
             # the tail to the ``gave_up`` comment. Best-effort file I/O.
@@ -9570,6 +9628,34 @@ def detect_crashed_workers(
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif (
+                kind == "unknown"
+                and _claim_owner_alive(row["claim_lock"]) is False
+            ):
+                # The worker was NOT reaped by this dispatcher (unknown exit)
+                # AND the dispatcher/gateway that owned the claim is itself
+                # gone. That is the signature of a gateway/overseer restart:
+                # the service bounce took its worker children down with it,
+                # and a fresh dispatcher (empty reap registry) now finds the
+                # orphaned ``running`` rows. This is NOT a task-level failure,
+                # so — exactly like the rate-limited path — release the task
+                # back to ``ready`` WITHOUT counting a failure, so a service
+                # restart can never increment ``consecutive_failures`` or trip
+                # the give-up breaker. Contrast a genuine crash, whose owning
+                # dispatcher is still alive (owner-alive is True/None).
+                protocol_violation = False
+                restart_killed_exit = True
+                error_text = (
+                    f"killed by service restart — owning dispatcher "
+                    f"({row['claim_lock']}) is gone; requeued without "
+                    f"counting a failure"
+                )
+                event_kind = "killed_by_restart"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "service_restart": True,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -9600,10 +9686,16 @@ def detect_crashed_workers(
                 (row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited requeues and service-restart kills are clean
+                # releases, not crashes — record a matching run outcome so the
+                # board history doesn't show a phantom crash for a quota wall
+                # or a gateway bounce.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif restart_killed_exit:
+                    _run_outcome = "killed_by_restart"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9626,6 +9718,19 @@ def detect_crashed_workers(
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif restart_killed_exit:
+                    # Service-restart kill: stamp a NON-quota, NON-auth error
+                    # string (so ``check_respawn_guard``'s blocker regex won't
+                    # trap it) purely so the card badge tooltip and the retry
+                    # worker's context can show why the prior run vanished. The
+                    # task stays at ``ready`` for immediate respawn and — the
+                    # whole point — ``consecutive_failures`` is left untouched,
+                    # so a gateway/overseer bounce can never trip the breaker.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    restart_killed.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -9743,6 +9848,11 @@ def detect_crashed_workers(
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # And for service-restart kills — orphaned workers whose owning dispatcher
+    # is gone. Also NOT counted as a failure and NOT crashes; released to
+    # ``ready`` for immediate respawn. Kept off the ``crashed`` return so no
+    # caller mistakes a gateway bounce for a task-level crash.
+    detect_crashed_workers._last_restart_killed = restart_killed  # type: ignore[attr-defined]
     return crashed
 
 
@@ -10498,6 +10608,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Service-restart kills (orphaned workers whose owning dispatcher is gone,
+    # no failure counted) — surface for telemetry / tests. These tasks went
+    # back to ``ready`` for immediate respawn without touching the breaker.
+    _crash_restart_killed = getattr(
+        detect_crashed_workers, "_last_restart_killed", []
+    )
+    if _crash_restart_killed:
+        result.restart_killed.extend(_crash_restart_killed)
     result.timed_out = enforce_max_runtime(conn)
     result.auto_unblocked = _auto_unblock_subscription_blocked(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)

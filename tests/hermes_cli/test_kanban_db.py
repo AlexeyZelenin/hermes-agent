@@ -983,6 +983,151 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
         )
 
 
+# ---------------------------------------------------------------------------
+# Service-restart kill: an orphaned worker whose OWNING dispatcher/gateway is
+# itself gone was killed by a service bounce, not by a task-level fault. It
+# must be released back to ``ready`` WITHOUT counting a failure, so a gateway
+# or overseer restart can never increment ``consecutive_failures`` or trip the
+# give-up breaker. The carve-out is surgical: an orphan whose owning
+# dispatcher is still alive is a genuine crash and still counts. Regression
+# coverage for task t_e5997536.
+# ---------------------------------------------------------------------------
+
+
+def test_claim_owner_alive_liveness_and_edge_cases(kanban_home, monkeypatch):
+    """``_claim_owner_alive`` reports the liveness of the dispatcher pid inside
+    a ``host:pid`` claim lock, and returns ``None`` (undeterminable → assume
+    alive, don't suppress a failure) for foreign hosts or malformed locks."""
+    import hermes_cli.kanban_db as _kb
+
+    host = _kb._claimer_id().split(":", 1)[0]
+
+    # Positive evidence the owner is dead / alive on this host.
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: int(pid) == 4242)
+    assert _kb._claim_owner_alive(f"{host}:4242") is True
+    assert _kb._claim_owner_alive(f"{host}:9999") is False
+
+    # Undeterminable → None (never used to suppress a failure).
+    assert _kb._claim_owner_alive(None) is None
+    assert _kb._claim_owner_alive("") is None
+    assert _kb._claim_owner_alive(f"{host}:notapid") is None
+    assert _kb._claim_owner_alive("some-other-host:4242") is None
+
+
+def test_service_restart_kill_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """An orphaned worker (unknown exit — not this dispatcher's child) whose
+    owning dispatcher pid is gone is released to ``ready`` and leaves
+    ``consecutive_failures`` untouched, even across many bounces — a service
+    restart must never trip the breaker."""
+    import hermes_cli.kanban_db as _kb
+
+    # Everything dead: the orphan worker AND the dispatcher that owned the
+    # claim (the gateway bounced and took its worker children with it).
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        dead_dispatcher = 90001  # the restarted gateway's old pid
+        tid = kb.create_task(conn, title="restart", assignee="a")
+
+        # Far more bounces than DEFAULT_FAILURE_LIMIT (2): if any counted as a
+        # failure the task would end up blocked.
+        for i in range(6):
+            pid = 71000 + i  # never registered → _classify_worker_exit unknown
+            kb.claim_task(conn, tid, claimer=f"{host}:{dead_dispatcher}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
+                "WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid not in crashed, "restart kill is not a crash"
+            killed = getattr(
+                _kb.detect_crashed_workers, "_last_restart_killed", []
+            )
+            assert tid in killed, f"bounce {i}: expected in restart_killed"
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"bounce {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"bounce {i}: service restart must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        # Last-failure error stamped for the badge tooltip + retry context.
+        assert task.last_failure_error and (
+            "service restart" in task.last_failure_error
+        )
+
+        # A ``killed_by_restart`` run outcome + event were recorded, and NO
+        # phantom ``crashed`` outcome pollutes the board history.
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "killed_by_restart" in outcomes
+        assert "crashed" not in outcomes
+
+        event_kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "killed_by_restart" in event_kinds
+
+
+def test_orphan_with_live_owning_dispatcher_still_counts_as_crash(
+    kanban_home, monkeypatch,
+):
+    """The carve-out is surgical: an orphaned worker (unknown exit) whose
+    owning dispatcher is STILL ALIVE is a genuine task-level crash, not a
+    service bounce, so it still counts a failure and trips the breaker. We
+    only suppress the failure with positive evidence the whole service died."""
+    import hermes_cli.kanban_db as _kb
+
+    live_dispatcher = 88888  # owning dispatcher is still up
+    # Owner alive, orphan workers dead.
+    monkeypatch.setattr(
+        _kb, "_pid_alive", lambda pid: int(pid) == live_dispatcher
+    )
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="orphan", assignee="a")
+
+        for i in range(2):  # DEFAULT_FAILURE_LIMIT == 2
+            pid = 61000 + i  # unregistered → unknown exit
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=? WHERE id=?",
+                (pid, f"{host}:{live_dispatcher}", tid),
+            )
+            conn.commit()
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid in crashed, (
+                f"hit {i}: orphan with a live owner is a real crash"
+            )
+            killed = getattr(
+                _kb.detect_crashed_workers, "_last_restart_killed", []
+            )
+            assert tid not in killed, "live owner must not be a restart kill"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"live-owner orphans should still trip the breaker, got "
+            f"{task.status}"
+        )
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
