@@ -322,15 +322,18 @@ class TestIsAuthError:
 
 def _insert_sub(conn, name, config_dir, *, enabled=1, max_concurrency=4,
                 cooling_until=None, last_limited_at=None, reserved=0,
-                provider="claude"):
+                provider="claude", paid_until=None,
+                plan_name="", credit_allowance=None, billing_window=""):
     now = time.time()
     conn.execute(
         "INSERT INTO claude_subscriptions"
         " (name, config_dir, provider, max_concurrency, enabled, reserved,"
-        "  cooling_until, last_limited_at, created_at, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "  cooling_until, last_limited_at, paid_until, plan_name,"
+        "  credit_allowance, billing_window, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (name, config_dir, provider, max_concurrency, enabled, reserved,
-         cooling_until, last_limited_at, now, now),
+         cooling_until, last_limited_at, paid_until, plan_name,
+         credit_allowance, billing_window, now, now),
     )
     conn.commit()
 
@@ -503,6 +506,114 @@ class TestSelectableRows:
             assert names == ["personal"]
         finally:
             conn.close()
+
+    def test_expired_paid_until_excludes_from_pool(self, tmp_path, _logged_in):
+        # A pocket whose paid_until is in the past is excluded — leasing it
+        # would fail with a silent auth error instead of a clear reason.
+        # (t_e0c5725b requirement 4.)
+        conn = subs.connect()
+        try:
+            now = time.time()
+            live = tmp_path / "live"
+            live.mkdir()
+            _insert_sub(conn, "live", str(live))
+
+            expired = tmp_path / "expired"
+            expired.mkdir()
+            _insert_sub(conn, "expired", str(expired), paid_until=now - 86400)
+
+            names = [r["name"] for r in subs._selectable_rows(conn, now)]
+            assert names == ["live"]
+        finally:
+            conn.close()
+
+    def test_future_paid_until_remains_selectable(self, tmp_path, _logged_in):
+        # A paid_until in the future (or unset) does NOT block leasing — the
+        # subscription is paid-up and selectable as normal.
+        conn = subs.connect()
+        try:
+            now = time.time()
+            d = tmp_path / "paid"
+            d.mkdir()
+            _insert_sub(conn, "paid", str(d), paid_until=now + 25 * 86400)
+            names = [r["name"] for r in subs._selectable_rows(conn, now)]
+            assert names == ["paid"]
+        finally:
+            conn.close()
+
+    def test_unset_paid_until_remains_selectable(self, tmp_path, _logged_in):
+        # NULL paid_until means "operator hasn't set it / no fixed expiry" and
+        # must not block leasing — the field is informational when unset.
+        conn = subs.connect()
+        try:
+            now = time.time()
+            d = tmp_path / "unknown"
+            d.mkdir()
+            _insert_sub(conn, "unknown", str(d), paid_until=None)
+            names = [r["name"] for r in subs._selectable_rows(conn, now)]
+            assert names == ["unknown"]
+        finally:
+            conn.close()
+
+
+class TestExpiredPockets:
+    """expired_pockets: lists lapsed subscriptions with a clear reason so the
+    exhaustion message names them instead of producing a silent auth failure
+    (t_e0c5725b requirement 4)."""
+
+    def test_expired_pocket_listed_with_reason(self, tmp_path, _logged_in):
+        conn = subs.connect()
+        try:
+            now = time.time()
+            d = tmp_path / "glm"
+            d.mkdir()
+            _insert_sub(
+                conn, "glm", str(d), provider="zai",
+                paid_until=now - 3 * 86400,
+            )
+        finally:
+            conn.close()
+        out = subs.expired_pockets(now=now)
+        assert len(out) == 1
+        assert out[0]["name"] == "glm"
+        assert out[0]["provider"] == "zai"
+        assert "paid period expired" in out[0]["reason"]
+
+    def test_future_paid_until_not_listed(self, tmp_path, _logged_in):
+        conn = subs.connect()
+        try:
+            now = time.time()
+            d = tmp_path / "future"
+            d.mkdir()
+            _insert_sub(conn, "future", str(d), paid_until=now + 7 * 86400)
+        finally:
+            conn.close()
+        assert subs.expired_pockets(now=now) == []
+
+    def test_unset_paid_until_not_listed(self, tmp_path, _logged_in):
+        conn = subs.connect()
+        try:
+            d = tmp_path / "unknown"
+            d.mkdir()
+            _insert_sub(conn, "unknown", str(d), paid_until=None)
+        finally:
+            conn.close()
+        assert subs.expired_pockets(now=time.time()) == []
+
+    def test_reserved_expired_not_listed(self, tmp_path, _logged_in):
+        # A reserved pocket is operator-only; its expiry is not a worker-pool
+        # exclusion signal, so expired_pockets (worker-facing) omits it.
+        conn = subs.connect()
+        try:
+            now = time.time()
+            d = tmp_path / "personal"
+            d.mkdir()
+            _insert_sub(
+                conn, "personal", str(d), reserved=1, paid_until=now - 86400,
+            )
+        finally:
+            conn.close()
+        assert subs.expired_pockets(now=now) == []
 
 
 class TestAutoResumeEta:
@@ -679,6 +790,30 @@ class TestAcquire:
             conn.close()
         with pytest.raises(subs.NoSubscriptionAvailable):
             subs.acquire("t", wait_seconds=0)
+
+    def test_expired_paid_period_surfaces_in_exhaustion_reason(
+        self, tmp_path, _logged_in
+    ):
+        # When every worker pocket has a lapsed paid_until, the exhaustion
+        # message must NAME the expired pocket and say "paid period expired"
+        # so the dispatcher/operator sees a clear reason — not a silent auth
+        # failure when the worker eventually tries to log in (t_e0c5725b req 4).
+        now = time.time()
+        conn = subs.connect()
+        try:
+            d = tmp_path / "glm"
+            d.mkdir()
+            _insert_sub(
+                conn, "glm", str(d), provider="zai",
+                paid_until=now - 2 * 86400,
+            )
+        finally:
+            conn.close()
+        with pytest.raises(subs.NoSubscriptionAvailable) as exc:
+            subs.acquire("t", wait_seconds=0)
+        msg = str(exc.value)
+        assert "glm" in msg
+        assert "paid period expired" in msg
 
     def test_reserved_pocket_leasable_with_allow_reserved(self, tmp_path, _logged_in):
         conn = subs.connect()

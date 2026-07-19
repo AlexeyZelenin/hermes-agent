@@ -373,6 +373,26 @@ def _recent_burn_rate(
     return weighted_tokens / span
 
 
+def _pacing_config_providers(conn: sqlite3.Connection) -> dict[str, str]:
+    """``{subscription: provider}`` from the controller's ``pacing_config`` table.
+
+    Non-Claude pockets (zai, kimi-coding, …) have no row in
+    ``claude_subscriptions`` — they are virtual pockets the zeus controller
+    creates from each vendor's usage API. Their provider lives in
+    ``pacing_config.provider`` instead. This reads that mapping so the read
+    path can label them correctly rather than defaulting every pocket to
+    ``claude``. Empty on a DB predating the table or the column.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT subscription, provider FROM pacing_config "
+            "WHERE provider IS NOT NULL AND provider != ''"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {r["subscription"]: r["provider"] for r in rows if r["provider"]}
+
+
 def _subscription_meta(conn: sqlite3.Connection) -> dict[str, dict]:
     """``{name: {display_name, enabled, reserved, cooling_until, last_limited_at}}``.
 
@@ -391,13 +411,20 @@ def _subscription_meta(conn: sqlite3.Connection) -> dict[str, dict]:
         return {}
     reserved_by_name = _reserved_flags(conn)
     dirs_by_name = _config_dirs(conn)
+    providers = _pacing_config_providers(conn)
     return {
         r["name"]: {
             "display_name": r["display_name"] or "",
             "enabled": bool(r["enabled"]),
             "reserved": reserved_by_name.get(r["name"], False),
             "config_dir": dirs_by_name.get(r["name"], ("", "claude"))[0],
-            "provider": dirs_by_name.get(r["name"], ("", "claude"))[1],
+            # Non-Claude pockets (glm/kimi/…) aren't in claude_subscriptions;
+            # their provider comes from pacing_config. When both speak, the
+            # pool table wins (it is the authoritative registry).
+            "provider": (
+                dirs_by_name.get(r["name"], ("", ""))[1]
+                or providers.get(r["name"], "claude")
+            ),
             "cooling_until": (
                 float(r["cooling_until"]) if r["cooling_until"] is not None else None
             ),
@@ -512,14 +539,43 @@ def _interactive_tokens(
     return result["total_tokens"]
 
 
+def _row_spent_tokens(row: "sqlite3.Row | dict[str, Any]") -> Optional[int]:
+    """Vendor-reported tokens spent in this window, or ``None``.
+
+    The zeus controller writes ``spent_tokens`` for non-Claude pockets (zai,
+    kimi-coding) taken directly from each vendor's usage API. Claude pockets
+    leave it NULL because their spend is reconstructed from the token ledger.
+    Tolerant of a pacing_state predating the column.
+    """
+    val = row.get("spent_tokens") if isinstance(row, dict) else (
+        row["spent_tokens"] if "spent_tokens" in row.keys() else None
+    )
+    return int(val) if val is not None else None
+
+
 def _pocket(
     row: "sqlite3.Row | dict[str, Any]",
     subs: dict[str, dict],
     conn: sqlite3.Connection,
     now: float,
     exclude_sessions: frozenset[str],
+    *,
+    provider_override: Optional[str] = None,
+    session_row: Optional["sqlite3.Row | dict[str, Any]"] = None,
 ) -> dict:
-    """Shape one ``pacing_state`` row into a dashboard pocket dict."""
+    """Shape one ``pacing_state`` row into a dashboard pocket dict.
+
+    ``provider_override`` lets the caller pin a non-Claude pocket's provider
+    (zai / kimi-coding / …) when the pool registry has no entry for it. The
+    default is the registry's provider, falling back to ``claude``.
+
+    ``session_row`` is the *other* pacing_state row for split-window pockets
+    (non-Claude vendors whose usage API reports a 5h session window and a
+    weekly window as two rows). When supplied, the nested 5h verdict is built
+    from that row's vendor-reported spent% / reset_at / spent_tokens instead
+    of being derived from the token ledger — the vendor's number is the
+    authoritative one for those pockets, and the ledger has no rows for them.
+    """
     spent = row["spent_percent"]
     target = row["target_percent"]
     reset_at = row["reset_at"]
@@ -529,9 +585,26 @@ def _pocket(
     pace_delta = spent - target if spent is not None and target is not None else None
     window_start = _window_start(reset_at, row["elapsed_percent"], updated_at)
     cooling = cooling_until is not None and cooling_until > now
+    provider = provider_override or meta.get("provider") or "claude"
+    # Vendor-reported spend for this window (non-Claude). When present, the
+    # token_usage ledger read below is informational only — the vendor's
+    # number already counts every token burned against this account, including
+    # interactive use the local ledger never sees.
+    vendor_spent = _row_spent_tokens(row)
     live = _window_tokens(conn, row["subscription"], window_start)
+    # If the ledger has nothing for this pocket (non-Claude), fall back to the
+    # vendor-reported ``spent_tokens`` so the dashboard shows a real number
+    # instead of 0.
+    if (
+        live is not None
+        and live["total_tokens"] == 0
+        and vendor_spent not in (None, 0)
+    ):
+        live = {**live, "total_tokens": vendor_spent}
     # v2 real-time circuit-breaker: re-derive spend from the live ledger, using
-    # tokens burned up to ``updated_at`` as the controller's calibration point.
+    # as-of ``updated_at`` as the controller's calibration point. Non-Claude
+    # pockets skip the breaker entirely — their vendor reports the authoritative
+    # spent%, and the circuit-breaker's ledger-derived budget does not apply.
     snapshot = _window_tokens(conn, row["subscription"], window_start, until_ts=updated_at)
     # EMA-weighted recent burn rate over the last ~2h, restricted to spend
     # inside this (weekly) window. Drives the projection that replaces the
@@ -557,16 +630,21 @@ def _pocket(
     # Note: the session breaker computes its OWN recent rate restricted to the
     # 5h window (passing the weekly rate would judge the session curve on the
     # wrong window's burn).
-    breaker_5h, five_start, five_reset, five_live = _session_breaker(
-        conn,
-        row["subscription"],
-        cooling_until=cooling_until,
-        weekly_budget=breaker["implied_budget_tokens"],
-        weekly_start=window_start,
-        reset_at=reset_at,
-        now=now,
-        cooling=cooling,
-    )
+    if session_row is not None:
+        breaker_5h, five_start, five_reset, five_live = _vendor_session_window(
+            session_row, now=now
+        )
+    else:
+        breaker_5h, five_start, five_reset, five_live = _session_breaker(
+            conn,
+            row["subscription"],
+            cooling_until=cooling_until,
+            weekly_budget=breaker["implied_budget_tokens"],
+            weekly_start=window_start,
+            reset_at=reset_at,
+            now=now,
+            cooling=cooling,
+        )
     effective = zeus_circuit_breaker.aggregate([breaker, breaker_5h])
     # Interactive (operator/supervisor) spend attributed to this pocket by its
     # login dir — the runtime count the ledger alone misses (task t_5580f23b).
@@ -603,7 +681,7 @@ def _pocket(
         "window_start": window_start,
         "window_tokens": live,
         "config_dir": meta.get("config_dir") or "",
-        "provider": meta.get("provider") or "claude",
+        "provider": provider,
         # Interactive (non-worker) tokens attributed to this pocket by its login
         # dir, over the weekly and 5h windows. ``None`` when the dir can't be read.
         "interactive_week_tokens": interactive_week,
@@ -620,6 +698,44 @@ def _pocket(
         # ``recommended_agent_limit`` here is the cap the board should obey.
         "effective_breaker": effective,
     }
+
+
+def _vendor_session_window(
+    row: "sqlite3.Row | dict[str, Any]", *, now: float
+) -> tuple[dict, float, float, Optional[dict]]:
+    """Build the nested 5h verdict from a vendor-reported session row.
+
+    Non-Claude vendors (z.ai, Moonshot) publish a real 5h-session spent%
+    and reset directly in their usage API — the controller writes them as a
+    separate ``Current session`` pacing_state row. That number already counts
+    every token burned against the account, so the verdict is a plain
+    circuit-breaker evaluation against the spent% alone (no ledger, no
+    derived budget — the vendor is authoritative). Returns
+    ``(breaker_5h, start, reset, tokens_dict)`` mirroring ``_session_breaker``.
+    """
+    reset_at = row["reset_at"]
+    spent = row["spent_percent"]
+    start = _window_start(reset_at, row["elapsed_percent"], row["updated_at"])
+    breaker = zeus_circuit_breaker.evaluate(
+        spent_percent=spent,
+        live_tokens=None,
+        snapshot_tokens=None,
+        window_start=start,
+        reset_at=reset_at,
+        now=now,
+        cooling=False,
+    )
+    spent_tok = _row_spent_tokens(row)
+    tokens = {"total_tokens": spent_tok or 0, "turns": 0, "last_ts": None}
+    return breaker, start or 0.0, reset_at or 0.0, tokens
+
+
+def _is_session_label(label: str) -> bool:
+    """Heuristic: does this window_label describe the 5h session window?"""
+    if not label:
+        return False
+    low = label.strip().lower()
+    return "session" in low or "5h" in low or "5 h" in low or "session" in low
 
 
 def pacing_snapshot(
@@ -641,11 +757,18 @@ def pacing_snapshot(
     or a missing ``pacing_state`` table yields
     an empty ``pockets`` list rather than raising, so the panel degrades to a
     "no pacing data" state instead of a 500.
+
+    Non-Claude pockets (zai, kimi-coding, …) are emitted as a single merged
+    pocket even when the controller writes them as two rows (Current session +
+    Current week) — the session row feeds the nested 5h window, the weekly row
+    is the primary, and the vendor-reported ``spent_percent`` / ``spent_tokens``
+    are used directly. The token ledger is only consulted for Claude pockets.
     """
     empty = {"board": board, "now": now, "pockets": [], "window_total_tokens": 0}
     if conn is None:
         return empty
     subs = _subscription_meta(conn)
+    providers = _pacing_config_providers(conn)
     try:
         rows = conn.execute(
             "SELECT * FROM pacing_state WHERE board = ? ORDER BY subscription",
@@ -655,10 +778,40 @@ def pacing_snapshot(
         return empty
     _save_window_backup(conn, board, rows, now)
     exclude = frozenset(pocket_accounting.attributed_session_ids(conn))
-    pockets = [
-        _pocket(_restore_window(conn, board, r, now), subs, conn, now, exclude)
-        for r in rows
-    ]
+    # Group rows by subscription. Claude pockets → one row (weekly); the nested
+    # 5h verdict is derived from the ledger. Non-Claude pockets → up to two
+    # rows (Current session + Current week) which we merge into one pocket so
+    # the dashboard renders one card with both windows filled from the vendor.
+    by_sub: dict[str, list[sqlite3.Row]] = {}
+    for r in rows:
+        by_sub.setdefault(r["subscription"], []).append(r)
+    pockets: list[dict] = []
+    for name, group in by_sub.items():
+        provider_hint = providers.get(name)
+        if len(group) == 1:
+            pockets.append(_pocket(
+                _restore_window(conn, board, group[0], now),
+                subs, conn, now, exclude,
+                provider_override=provider_hint,
+            ))
+            continue
+        # Split-window pocket: pick the weekly row as the primary and the
+        # session row as the nested window. If neither label matches the
+        # heuristic, the first row is primary and the second is the session —
+        # the controller always emits the weekly row first.
+        weekly = next((r for r in group if not _is_session_label(r["window_label"])), group[0])
+        session = next((r for r in group if _is_session_label(r["window_label"])), group[-1])
+        pockets.append(_pocket(
+            _restore_window(conn, board, weekly, now),
+            subs, conn, now, exclude,
+            provider_override=provider_hint,
+            session_row=_restore_window(conn, board, session, now),
+        ))
+    # Stable order: Claude pockets keep their source order; non-Claude pockets
+    # (merged from dual rows) are sorted by name after the Claude ones so the
+    # panel groups providers readably. The dashboard's own fallback sort still
+    # runs on top of this.
+    pockets.sort(key=lambda p: (p["provider"] == "claude", p["subscription"]))
     total = sum(
         p["window_tokens"]["total_tokens"]
         for p in pockets

@@ -632,6 +632,12 @@ def _selectable_rows(
     personal/operator pocket out of the worker pool (task t_83c4b740). Only an
     explicit operator-driven ``allow_reserved`` lifts it.
 
+    A subscription whose ``paid_until`` is set and in the past is excluded —
+    its paid period has lapsed, so leasing it would produce silent auth failures
+    instead of a clear, actionable block. The expiry is surfaced via
+    ``expired_pockets()`` and folded into the exhaustion reason so the operator
+    sees "paid period expired on 12.08" rather than a mysterious 401 (t_e0c5725b).
+
     ``provider`` restricts selection to one vendor's pockets (e.g. a Codex task
     leases only Codex pockets); ``None`` spreads across the whole pool, which is
     what lets the scheduler fall over to a Codex pocket when every Claude pocket
@@ -651,6 +657,11 @@ def _selectable_rows(
         if row["reserved"] and not allow_reserved:
             continue
         if row["cooling_until"] and float(row["cooling_until"]) > now:
+            continue
+        # Paid period lapsed → exclude. A NULL paid_until means "operator hasn't
+        # set it / the plan has no fixed expiry" and does NOT block leasing.
+        paid_until = row["paid_until"]
+        if paid_until and float(paid_until) <= now:
             continue
         if not Path(row["config_dir"]).is_dir():
             continue
@@ -829,9 +840,19 @@ def acquire(
                 f" (earliest recovery {datetime.fromtimestamp(earliest):%Y-%m-%d %H:%M})"
                 if earliest else ""
             )
+            # Fold expired paid periods into the reason so the dispatcher
+            # reports "paid period expired 12.08" rather than a silent auth
+            # failure when the worker tries to use the lapsed pocket (t_e0c5725b).
+            expired = expired_pockets(now=now)
+            why = ""
+            if expired:
+                names = ", ".join(
+                    f"{p['name']} ({p['reason']})" for p in expired
+                )
+                why = f" — excluded expired: {names}"
             raise NoSubscriptionAvailable(
                 f"{SUBSCRIPTIONS_EXHAUSTED_MARKER} all {label}subscriptions"
-                f" are cooling after usage limits{when}",
+                f" are cooling after usage limits{when}{why}",
                 earliest_recovery=earliest,
             )
         if time.monotonic() >= deadline:
@@ -1001,4 +1022,44 @@ def paid_period_warnings(
         else:
             continue
         out.append({**sub, "severity": severity, "message": msg})
+    return out
+
+
+def expired_pockets(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Subscriptions whose paid period has lapsed and which are therefore
+    excluded from the worker pool by ``_selectable_rows``.
+
+    Returns one dict per enabled, non-reserved subscription with a non-NULL
+    ``paid_until <= now``. Each carries ``name``, ``provider``,
+    ``paid_until``, and a ``reason`` string suitable for inclusion in an
+    exhaustion message so the dispatcher reports WHY the pool is empty
+    ("paid period expired 12.08") instead of failing with a bare auth error.
+    """
+    now = time.time() if now is None else now
+    conn = connect()
+    try:
+        sync_registry(conn)
+        rows = conn.execute(
+            "SELECT name, provider, display_name, paid_until"
+            " FROM claude_subscriptions"
+            " WHERE enabled = 1 AND reserved = 0"
+            " AND paid_until IS NOT NULL AND paid_until <= ?"
+            " ORDER BY paid_until ASC",
+            (now,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        paid_until = float(row["paid_until"])
+        out.append({
+            "name": row["name"],
+            "provider": row["provider"] or PROVIDER_CLAUDE,
+            "display_name": row["display_name"] or "",
+            "paid_until": paid_until,
+            "reason": (
+                f"paid period expired "
+                f"{datetime.fromtimestamp(paid_until):%Y-%m-%d}"
+            ),
+        })
     return out

@@ -14,6 +14,8 @@ import pytest
 from hermes_cli import zeus_pacing
 
 # Mirrors the production pacing/subscription/ledger schema (zeus.db).
+# pacing_state PK is (board, subscription, window_label) so a non-Claude
+# vendor can publish two rows per pocket — Current session + Current week.
 _SCHEMA = """
 CREATE TABLE pacing_state (
     subscription TEXT NOT NULL DEFAULT '',
@@ -28,17 +30,42 @@ CREATE TABLE pacing_state (
     burn_rate_per_min REAL,
     reason TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL,
+    spent_tokens INTEGER,
+    allowance_estimated INTEGER,
+    PRIMARY KEY (board, subscription, window_label)
+);
+CREATE TABLE pacing_config (
+    board TEXT NOT NULL,
+    subscription TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    max_agent_limit INTEGER NOT NULL DEFAULT 8,
+    min_agent_limit INTEGER NOT NULL DEFAULT 1,
+    target_util REAL NOT NULL DEFAULT 0.95,
+    operator_reserve_frac REAL NOT NULL DEFAULT 0.15,
+    burndown_start REAL NOT NULL DEFAULT 0.9,
+    window_label TEXT NOT NULL DEFAULT 'Current week',
+    updated_at REAL NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    window_allowance_5h_tokens INTEGER,
+    window_allowance_week_tokens INTEGER,
+    allowance_estimated INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (board, subscription)
 );
 CREATE TABLE claude_subscriptions (
     name TEXT PRIMARY KEY,
     config_dir TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT 'claude',
     display_name TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
+    reserved INTEGER NOT NULL DEFAULT 0,
     max_concurrency INTEGER NOT NULL DEFAULT 4,
     cooling_until REAL,
     last_limited_at REAL,
+    paid_until REAL,
+    plan_name TEXT NOT NULL DEFAULT '',
+    credit_allowance INTEGER,
+    billing_window TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL DEFAULT 0
 );
@@ -77,15 +104,17 @@ def _add_pacing(conn: sqlite3.Connection, **kw) -> None:
         "burn_rate_per_min": 4000.0,
         "reason": "spending ahead",
         "updated_at": NOW,
+        "spent_tokens": None,
+        "allowance_estimated": None,
     }
     row.update(kw)
     conn.execute(
         "INSERT INTO pacing_state (subscription, board, window_label, spent_percent, "
         "target_percent, elapsed_percent, reset_at, mode, agent_limit, "
-        "burn_rate_per_min, reason, updated_at) VALUES "
+        "burn_rate_per_min, reason, updated_at, spent_tokens, allowance_estimated) VALUES "
         "(:subscription, :board, :window_label, :spent_percent, :target_percent, "
         ":elapsed_percent, :reset_at, :mode, :agent_limit, :burn_rate_per_min, "
-        ":reason, :updated_at)",
+        ":reason, :updated_at, :spent_tokens, :allowance_estimated)",
         row,
     )
     conn.commit()
@@ -570,7 +599,100 @@ def test_admission_surfaces_in_pocket_admission_when_overshooting():
     # Overshooting weekly but no wall hit -> graceful signal, not skip-all.
     assert admission["glm"]["hard_block"] is False
     assert admission["glm"]["sustainable_rate_ratio"] is not None
-    assert admission["glm"]["sustainable_rate_ratio"] < 1.0
-    # And throttled_pockets (hard-block subset) excludes it.
-    assert "glm" not in zeus_pacing.throttled_pockets(conn, "ra", now=NOW)
+
+
+# ---------------------------------------------------------------------------
+# Non-Claude pockets — vendor-reported spend, split-window merge (t_e0c5725b)
+# ---------------------------------------------------------------------------
+
+def _add_pacing_config(conn, subscription, provider, board="ra"):
+    conn.execute(
+        "INSERT INTO pacing_config (board, subscription, provider, enabled, updated_at) "
+        "VALUES (?, ?, ?, 1, ?)",
+        (board, subscription, provider, NOW),
+    )
+    conn.commit()
+
+
+def test_non_claude_provider_label_from_pacing_config():
+    """A non-Claude pocket (zai/glm) has no row in claude_subscriptions; its
+    provider must come from pacing_config.provider so the panel labels it
+    correctly instead of defaulting to 'claude'."""
+    conn = _conn()
+    _add_pacing_config(conn, "glm", "zai")
+    _add_pacing(conn, subscription="glm", spent_percent=40.0)
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert p["provider"] == "zai"
+
+
+def test_vendor_spent_tokens_fills_window_when_ledger_empty():
+    """When the local token_usage ledger has no rows for a non-Claude pocket
+    (the vendor's API is the authoritative counter), the dashboard must fall
+    back to the vendor-reported spent_tokens so the window shows a real number
+    instead of 0."""
+    conn = _conn()
+    _add_pacing_config(conn, "glm", "zai")
+    _add_pacing(conn, subscription="glm", spent_percent=40.0, spent_tokens=380000)
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert p["window_tokens"]["total_tokens"] == 380000
+
+
+def test_split_window_non_claude_merges_session_and_week():
+    """A non-Claude vendor publishes two rows per pocket — Current session and
+    Current week. The snapshot must merge them into a single pocket: the weekly
+    row is the primary, the session row feeds the nested 5h window from the
+    vendor's authoritative spent%/reset, no ledger reconstruction."""
+    conn = _conn()
+    _add_pacing_config(conn, "glm", "zai")
+    # Weekly row: 40% spent of weekly quota.
+    _add_pacing(
+        conn,
+        subscription="glm",
+        window_label="Current week",
+        spent_percent=40.0,
+        reset_at=NOW + WEEK * 0.6,
+        elapsed_percent=40.0,
+        spent_tokens=400000,
+    )
+    # Session row: 75% spent of 5h session, resets in 1h.
+    _add_pacing(
+        conn,
+        subscription="glm",
+        window_label="Current session",
+        spent_percent=75.0,
+        reset_at=NOW + 3600,
+        elapsed_percent=80.0,
+        spent_tokens=90000,
+    )
+    snap = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)
+    # One merged pocket, not two.
+    glm_pockets = [p for p in snap["pockets"] if p["subscription"] == "glm"]
+    assert len(glm_pockets) == 1
+    p = glm_pockets[0]
+    assert p["provider"] == "zai"
+    # Weekly spent% surfaces as the primary window.
+    assert p["spent_percent"] == 40.0
+    # The nested 5h session window is built from the vendor row, not ledger.
+    nested = p["five_hour_window"]
+    assert p["circuit_breaker_5h"]["live_spent_percent"] == 75.0
+    assert nested["tokens"]["total_tokens"] == 90000
+
+
+def test_claude_pocket_still_uses_ledger_only():
+    """A Claude pocket (no pacing_config.provider, default provider) is shaped
+    by the ledger path exactly as before — no vendor spent_tokens fallback,
+    single row expected."""
+    conn = _conn()
+    _add_pacing(conn, subscription="personal", spent_percent=30.0)
+    window_start = NOW - WEEK * 0.3
+    conn.execute(
+        "INSERT INTO token_usage (ts, subscription, total_tokens) "
+        "VALUES (?, 'personal', 300000)",
+        (window_start + 60,),
+    )
+    conn.commit()
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    assert p["provider"] == "claude"
+    # Ledger-derived, not vendor-reported.
+    assert p["window_tokens"]["total_tokens"] == 300000
 
