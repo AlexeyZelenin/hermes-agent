@@ -3439,10 +3439,17 @@ def _evict_cached_clients(provider: str) -> None:
             client = _client_cache.get(key, (None, None, None))[0]
             if client is not None:
                 _force_close_async_httpx(client)
+                # #29507: never call client.close() from the evicting thread.
+                # close() runs os.close() on pool FDs while another thread may
+                # be mid-request on them; the kernel recycles the FD (e.g. to
+                # a kanban.db open) and the SSL layer's pending TLS flush then
+                # writes ciphertext into the wrong file. shutdown() is FD-safe
+                # from any thread; the last in-flight owner closes on unwind.
                 try:
-                    close_fn = getattr(client, "close", None)
-                    if callable(close_fn):
-                        close_fn()
+                    from agent.agent_runtime_helpers import (
+                        force_close_tcp_sockets as _fd_safe_shutdown,
+                    )
+                    _fd_safe_shutdown(getattr(client, "_real_client", client))
                 except Exception:
                     pass
             _client_cache.pop(key, None)
