@@ -588,20 +588,27 @@ def _guard_live_board_under_pytest(path: Path) -> None:
     Root-cause fix (task t_ecacc87b) for repeated incidents where a leaky
     worker / dashboard test created junk cards ('Popup детали', 'Hello2',
     'paused', ...) on the real shared board. The repo conftests pin an
-    isolated ``HERMES_KANBAN_HOME`` for every test; if we still reach here
-    inside a pytest process with **no** ``HERMES_KANBAN_HOME`` /
-    ``HERMES_KANBAN_DB`` override **and** the resolved path lands under the
-    developer's genuine ``~/.hermes``, a fixture leaked — fail loudly instead
-    of silently writing to the live board.
+    isolated ``HERMES_KANBAN_HOME`` for every test; if a fixture leaks and the
+    resolved path still lands under the developer's genuine ``~/.hermes``,
+    fail loudly instead of silently writing to the live board.
+
+    The invariant is purely about the **resolved path**: inside pytest a
+    kanban path under the real ``~/.hermes`` is always a leak. We deliberately
+    do NOT treat ``HERMES_KANBAN_HOME`` / ``HERMES_KANBAN_DB`` merely *being
+    set* as proof of isolation. The kanban dispatcher injects
+    ``HERMES_KANBAN_DB=<live board db>`` into every worker's env (see
+    :func:`_default_spawn` / worker env build), so a worker that shells out
+    ``pytest`` inherits a var pointing straight at the LIVE board. Trusting
+    "the var is set" disabled the guard in exactly the scenario that shredded
+    the shared kanban.db under concurrent test load (task t_42ec4d5e). When
+    those vars legitimately point at a tempdir, the resolved path is under
+    that tempdir — not the real home — so the ``relative_to`` check below lets
+    it through unchanged; only a path under the real ``~/.hermes`` trips it.
 
     ``PYTEST_CURRENT_TEST`` is set by pytest per test and is inherited by any
     subprocess a test spawns, so this also protects subprocess-based leaks.
     """
     if "PYTEST_CURRENT_TEST" not in os.environ:
-        return
-    if os.environ.get("HERMES_KANBAN_HOME", "").strip():
-        return
-    if os.environ.get("HERMES_KANBAN_DB", "").strip():
         return
     real_home = _real_platform_hermes_home()
     if real_home is None:
@@ -612,11 +619,12 @@ def _guard_live_board_under_pytest(path: Path) -> None:
         return  # resolved somewhere isolated (a tempdir) — allowed
     raise RuntimeError(
         "kanban live-board guard: a pytest run resolved the shared kanban "
-        f"board at {path} (under the real {real_home}) with no "
-        "HERMES_KANBAN_HOME / HERMES_KANBAN_DB isolation override. A test "
-        "fixture leaked and this write would have polluted the LIVE board. "
-        "Pin an isolated board in the test — set HERMES_KANBAN_HOME to a "
-        "tmp_path (the repo conftest does this automatically for every test)."
+        f"board at {path} (under the real {real_home}). A test fixture leaked "
+        "— or an inherited HERMES_KANBAN_DB / HERMES_KANBAN_HOME from a "
+        "dispatcher-spawned worker points at the live board — and this write "
+        "would have polluted the LIVE board. Pin an isolated board in the "
+        "test: set HERMES_KANBAN_HOME to a tmp_path (the repo conftest does "
+        "this automatically for every test)."
     )
 
 
@@ -636,7 +644,14 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
-        return Path(override).expanduser()
+        pinned = Path(override).expanduser()
+        # The pin bypasses board resolution but NOT the live-board guard: the
+        # dispatcher injects HERMES_KANBAN_DB=<live board db> into every
+        # worker's env, so a worker that shells out `pytest` inherits a pin
+        # aimed straight at the shared board. Under pytest, a pin that resolves
+        # under the real ~/.hermes is a leak, not isolation (t_42ec4d5e).
+        _guard_live_board_under_pytest(pinned)
+        return pinned
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
