@@ -11992,6 +11992,7 @@ def _usage_snapshot_dict(snapshot: Any) -> Optional[Dict[str, Any]]:
         "windows": [
             {
                 "label": w.label,
+                "key": w.key,
                 "used_percent": w.used_percent,
                 "reset_at": w.reset_at.isoformat() if w.reset_at else None,
                 "detail": w.detail,

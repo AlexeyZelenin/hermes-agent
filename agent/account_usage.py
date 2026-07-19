@@ -28,6 +28,11 @@ class AccountUsageWindow:
     used_percent: Optional[float] = None
     reset_at: Optional[datetime] = None
     detail: Optional[str] = None
+    # Stable, display-independent identifier for the window (e.g. ``five_hour``,
+    # ``seven_day``). ``label`` is a localised/human string that can't be matched
+    # on; ``key`` is what a consumer keys the 5h vs weekly bar off. ``None`` for
+    # providers whose windows have no canonical key.
+    key: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,29 @@ def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, mark
     if snapshot.unavailable_reason:
         lines.append(f"Unavailable: {snapshot.unavailable_reason}")
     return lines
+
+
+def account_usage_window_percents(
+    snapshot: Optional[AccountUsageSnapshot],
+) -> dict[str, float]:
+    """``{window_key: used_percent}`` for every keyed window in a usage snapshot.
+
+    The default window provider for the pacing panel: the account-usage API
+    returns *both* the five-hour session and the seven-day weekly windows, each
+    with a real ``used_percent``. This flattens them to a ``key -> percent`` map
+    (e.g. ``{"five_hour": 25.0, "seven_day": 40.0}``) so the panel can fill the
+    5h bar — which the locally-derived circuit-breaker leaves blank on an
+    uncalibrated pocket — from the provider's own number. Windows without a
+    canonical ``key`` or a numeric ``used_percent`` are skipped; ``None``/empty
+    snapshots yield ``{}`` (fail-open — the panel keeps its derived value).
+    """
+    if snapshot is None:
+        return {}
+    out: dict[str, float] = {}
+    for window in snapshot.windows:
+        if window.key and _is_finite_num(window.used_percent):
+            out[window.key] = float(window.used_percent)
+    return out
 
 
 def _fmt_usd(d: float) -> str:
@@ -776,6 +804,7 @@ def _fetch_anthropic_account_usage(api_key: Optional[str] = None) -> Optional[Ac
                 label=label,
                 used_percent=used,
                 reset_at=_parse_dt(window.get("resets_at")),
+                key=key,
             )
         )
     details: list[str] = []

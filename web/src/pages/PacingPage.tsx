@@ -15,6 +15,18 @@ import { cn, themedBody } from "@/lib/utils";
 // a cheap local sqlite scan, so 5s is plenty to feel live without hammering.
 const REFRESH_MS = 5000;
 
+// The real 5h/weekly window numbers come from each pocket's Anthropic OAuth
+// usage API — a per-pocket network call, so it refreshes on a much slower cadence
+// than the local pacing poll (it only feeds the bars a real spent% when the
+// locally-derived circuit-breaker has none).
+const USAGE_REFRESH_MS = 60000;
+
+// The bare ~/.claude login: the empty-pool fallback pocket. Labelled and sorted
+// apart from the named pool pockets (agent.claude_subscriptions.DEFAULT_SUB_NAME).
+const FALLBACK_POCKET = "default";
+// Anthropic/Claude pockets — the only provider with a "default" fallback login.
+const CLAUDE_PROVIDER = "claude";
+
 type Tone = "default" | "destructive" | "outline" | "secondary" | "success" | "warning";
 
 // One subscription pocket, merged from the pool registry (health, who's using,
@@ -23,6 +35,7 @@ type Tone = "default" | "destructive" | "outline" | "secondary" | "success" | "w
 interface Sub {
   name: string;
   displayName: string;
+  provider: string;
   enabled: boolean;
   reserved: boolean;
   loggedIn: boolean;
@@ -149,12 +162,32 @@ function forecast(p: ZeusPacingPocket | null): { text: string; tone: Tone } | nu
   return { text: `успевает до сброса (~${Math.round(proj)}% к концу недели)`, tone: "success" };
 }
 
+// The empty-pool fallback pocket (bare ~/.claude). Rendered with a "· fallback"
+// tag and sorted after the named Anthropic pockets.
+function isFallback(s: Sub): boolean {
+  return s.name === FALLBACK_POCKET && s.provider === CLAUDE_PROVIDER;
+}
+
+// Keep the source order, but push the Anthropic fallback pocket to the end of
+// its provider group so it reads as the "everything else" catch-all, not a peer.
+function sortFallbackLast(subs: Sub[]): Sub[] {
+  return subs
+    .map((s, i) => [s, i] as const)
+    .sort(([a, ia], [b, ib]) => {
+      const fa = isFallback(a) ? 1 : 0;
+      const fb = isFallback(b) ? 1 : 0;
+      return fa - fb || ia - ib;
+    })
+    .map(([s]) => s);
+}
+
 function mergeSubs(pool: SubscriptionPoolEntry[], pockets: ZeusPacingPocket[]): Sub[] {
   const byName = new Map<string, ZeusPacingPocket>();
   for (const p of pockets) byName.set(p.subscription, p);
   const subs: Sub[] = pool.map((e) => ({
     name: e.name,
     displayName: e.display_name || e.name,
+    provider: byName.get(e.name)?.provider || CLAUDE_PROVIDER,
     enabled: e.enabled,
     reserved: e.reserved,
     loggedIn: e.logged_in,
@@ -173,6 +206,7 @@ function mergeSubs(pool: SubscriptionPoolEntry[], pockets: ZeusPacingPocket[]): 
     subs.push({
       name: p.subscription,
       displayName: p.display_name || p.subscription,
+      provider: p.provider || CLAUDE_PROVIDER,
       enabled: p.enabled ?? true,
       reserved: p.reserved,
       loggedIn: true,
@@ -185,7 +219,7 @@ function mergeSubs(pool: SubscriptionPoolEntry[], pockets: ZeusPacingPocket[]): 
       pacing: p,
     });
   }
-  return subs;
+  return sortFallbackLast(subs);
 }
 
 // A spent-fill bar with optional target + elapsed tick marks (weekly only —
@@ -265,12 +299,15 @@ function WindowRow({
   );
 }
 
-function SubCard({ sub }: { sub: Sub }) {
+function SubCard({ sub, realFive }: { sub: Sub; realFive: number | null }) {
   const p = sub.pacing;
   const h = health(sub);
   const fc = forecast(p);
   const bph = burnPerHour(sub);
-  const fiveSpent = p?.circuit_breaker_5h?.live_spent_percent ?? null;
+  // Prefer the provider's own 5h utilization (account-usage API) — the local
+  // circuit-breaker leaves ``live_spent_percent`` null on an uncalibrated pocket,
+  // which is why the 5h bar dashed while the weekly bar rendered.
+  const fiveSpent = realFive ?? p?.circuit_breaker_5h?.live_spent_percent ?? null;
   const fiveReset = p?.five_hour_window?.seconds_to_reset ?? null;
   const fiveTokens = p?.five_hour_window?.tokens?.total_tokens ?? null;
   return (
@@ -278,6 +315,9 @@ function SubCard({ sub }: { sub: Sub }) {
       <CardContent className="flex flex-col gap-3 py-3">
         <div className="flex flex-wrap items-center gap-2">
           <span className="truncate font-medium">{sub.displayName}</span>
+          {isFallback(sub) && (
+            <span className="shrink-0 text-xs text-muted-foreground">· fallback</span>
+          )}
           {h.broken ? (
             <Link to="/problems">
               <Badge tone={h.tone} className="shrink-0">
@@ -350,7 +390,15 @@ function SubCard({ sub }: { sub: Sub }) {
   );
 }
 
-function StateGroup({ state, subs }: { state: SubState; subs: Sub[] }) {
+function StateGroup({
+  state,
+  subs,
+  realFive,
+}: {
+  state: SubState;
+  subs: Sub[];
+  realFive: Map<string, number>;
+}) {
   if (subs.length === 0) return null;
   const meta = STATE_META[state];
   return (
@@ -363,7 +411,7 @@ function StateGroup({ state, subs }: { state: SubState; subs: Sub[] }) {
         <span className={cn("text-xs text-muted-foreground", themedBody)}>{meta.hint}</span>
       </div>
       {subs.map((s) => (
-        <SubCard key={s.name} sub={s} />
+        <SubCard key={s.name} sub={s} realFive={realFive.get(s.name) ?? null} />
       ))}
     </div>
   );
@@ -371,6 +419,7 @@ function StateGroup({ state, subs }: { state: SubState; subs: Sub[] }) {
 
 export default function PacingPage() {
   const [subs, setSubs] = useState<Sub[] | null>(null);
+  const [realFive, setRealFive] = useState<Map<string, number>>(new Map());
   const [problemCount, setProblemCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const { toast, showToast } = useToast();
@@ -397,6 +446,23 @@ export default function PacingPage() {
       .finally(() => setLoading(false));
   }, [showToast]);
 
+  // The real 5h number per pocket, from each account's Anthropic OAuth usage API
+  // (network-heavy → slow cadence). Fail-open: a hiccup just leaves the last map
+  // in place and the bar falls back to its locally-derived value.
+  const loadUsage = useCallback(() => {
+    api
+      .getSubscriptionUsage()
+      .then((res) => {
+        const next = new Map<string, number>();
+        for (const acc of res.accounts ?? []) {
+          const five = (acc.usage?.windows ?? []).find((w) => w.key === "five_hour");
+          if (five?.used_percent != null) next.set(acc.name, five.used_percent);
+        }
+        setRealFive(next);
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     load();
     const id = window.setInterval(() => {
@@ -405,6 +471,14 @@ export default function PacingPage() {
     }, REFRESH_MS);
     return () => window.clearInterval(id);
   }, [load]);
+
+  useEffect(() => {
+    loadUsage();
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "visible") loadUsage();
+    }, USAGE_REFRESH_MS);
+    return () => window.clearInterval(id);
+  }, [loadUsage]);
 
   if (loading) {
     return (
@@ -443,9 +517,9 @@ export default function PacingPage() {
         </div>
       )}
 
-      <StateGroup state="active" subs={grouped.active} />
-      <StateGroup state="idle" subs={grouped.idle} />
-      <StateGroup state="paused" subs={grouped.paused} />
+      <StateGroup state="active" subs={grouped.active} realFive={realFive} />
+      <StateGroup state="idle" subs={grouped.idle} realFive={realFive} />
+      <StateGroup state="paused" subs={grouped.paused} realFive={realFive} />
 
       <Toast toast={toast} />
     </div>

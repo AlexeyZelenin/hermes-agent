@@ -299,6 +299,59 @@ def test_anthropic_usage_uses_explicit_pooled_token(monkeypatch):
     assert calls[0]["headers"]["Authorization"] == "Bearer sk-ant-oat01-pooled"
 
 
+def test_anthropic_usage_carries_both_windows_with_stable_keys(monkeypatch):
+    """The OAuth usage API returns BOTH the 5h and weekly windows; each must be
+    surfaced with its canonical ``key`` so the panel can fill the 5h bar."""
+    payload = {
+        "five_hour": {"utilization": 0.25, "resets_at": "2026-07-17T10:00:00Z"},
+        "seven_day": {"utilization": 0.40, "resets_at": "2026-07-24T10:00:00Z"},
+    }
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient([], payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage("anthropic", api_key="sk-ant-oat01-pooled")
+
+    assert snapshot is not None
+    by_key = {w.key: w for w in snapshot.windows}
+    assert set(by_key) == {"five_hour", "seven_day"}
+    assert by_key["five_hour"].label == "Current session"
+    assert by_key["five_hour"].used_percent == 25.0
+    assert by_key["seven_day"].label == "Current week"
+    assert by_key["seven_day"].used_percent == 40.0
+
+
+def test_account_usage_window_percents_flattens_both_labels():
+    snapshot = account_usage.AccountUsageSnapshot(
+        provider="anthropic",
+        source="oauth_usage_api",
+        fetched_at=account_usage._utc_now(),
+        windows=(
+            account_usage.AccountUsageWindow(
+                label="Current session", used_percent=25.0, key="five_hour"
+            ),
+            account_usage.AccountUsageWindow(
+                label="Current week", used_percent=40.0, key="seven_day"
+            ),
+            # No key -> not addressable, must be skipped.
+            account_usage.AccountUsageWindow(label="Mystery", used_percent=10.0),
+            # Keyed but no percent -> skipped (nothing to fill the bar with).
+            account_usage.AccountUsageWindow(label="Opus week", key="seven_day_opus"),
+        ),
+    )
+
+    assert account_usage.account_usage_window_percents(snapshot) == {
+        "five_hour": 25.0,
+        "seven_day": 40.0,
+    }
+
+
+def test_account_usage_window_percents_none_snapshot_is_empty():
+    assert account_usage.account_usage_window_percents(None) == {}
+
+
 def test_usage_snapshot_shows_banked_resets_hint(monkeypatch):
     calls = []
     monkeypatch.setattr(

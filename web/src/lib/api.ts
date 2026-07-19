@@ -1645,6 +1645,9 @@ export interface CredentialPoolProvider {
 
 export interface AccountUsageWindow {
   label: string;
+  /** Stable window id (``five_hour`` | ``seven_day`` | ...); null for providers
+   * whose windows have no canonical key. Match on this, not the display label. */
+  key: string | null;
   used_percent: number | null;
   reset_at: string | null;
   detail: string | null;
@@ -2438,6 +2441,8 @@ export interface ZeusPacingPocket {
   display_name: string;
   enabled: boolean | null;
   reserved: boolean;
+  /** ``claude`` (Anthropic) | ``codex`` | ...; drives fallback-row grouping. */
+  provider: string;
   window_label: string;
   spent_percent: number | null;
   target_percent: number | null;
