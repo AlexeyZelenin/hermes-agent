@@ -793,6 +793,32 @@ def claude_pool_alive() -> bool:
         return False
 
 
+def resolve_throttled_pockets(board: Optional[str] = None) -> dict[str, str]:
+    """``{assignee_lower: reason}`` for pockets the dispatcher must skip now.
+
+    Reads the live pacing ledger and returns the subscription pockets whose
+    OWN window is throttled (tripped), keyed lower-cased so an assignee lookup
+    is case-insensitive. A native worker's assignee profile IS its pocket name
+    (``glm`` → pocket ``glm``), so this is the map the dispatcher uses to defer
+    a ready task while its OWN pocket is walled — leaving free pockets (a
+    different subscription) dispatching. Claude-pool assignees (leased across
+    ``personal``/``work1``/``work2`` at spawn time) have no single pocket name
+    and are not gated here; the subscription pool's own lease-time capacity /
+    rotation / rate-limit-exit path handles a walled Claude pool.
+
+    Fail-open: any error, or the zeus plugin being absent, yields ``{}`` so a
+    pacing read never stalls dispatch. See
+    :func:`hermes_cli.zeus_pacing.throttled_pockets_for_board`.
+    """
+    try:
+        from hermes_cli import zeus_pacing
+        slug = board if board else get_current_board()
+        raw = zeus_pacing.throttled_pockets_for_board(slug)
+        return {str(name).strip().lower(): reason for name, reason in raw.items()}
+    except Exception:
+        return {}
+
+
 def resolve_model_map(board: Optional[str] = None,
                       project_models: Any = None) -> dict[str, str]:
     """Effective model map: config.yaml ``kanban.models`` ← board ← project.
@@ -7794,6 +7820,14 @@ class DispatchResult:
     "task is genuinely stuck"."""
     skipped_board_capped: list[str] = field(default_factory=list)
     """Tasks deferred because the board's persisted agent_limit is full."""
+    skipped_pacing_throttled: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks deferred this tick because their assignee's subscription pocket
+    is throttled by pacing (its OWN 5h / weekly window bit — e.g. glm at
+    96% of its session). Each entry is ``(task_id, assignee, reason)``. NOT an
+    operator-actionable failure and NOT a counted failure: the task is picked
+    up on a later tick once the pocket's window cools. A different pocket's
+    tasks (a free subscription) keep dispatching — the throttle binds only its
+    OWN dispatches. See :func:`hermes_cli.zeus_pacing.throttled_pockets`."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9629,6 +9663,14 @@ def _dispatch_once_locked(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
+    # Per-pocket pacing gate: subscriptions whose OWN window is throttled right
+    # now (e.g. glm at 96% of its 5h session). A ready task whose assignee names
+    # one of these pockets is deferred this tick so a hot pocket stops feeding
+    # its own dispatches, while a free pocket (a different subscription) keeps
+    # spawning. Resolved once per tick and fail-open ({} on any pacing-read
+    # error) so pacing telemetry can never stall the board. See
+    # resolve_throttled_pockets / zeus_pacing.throttled_pockets.
+    throttled_pockets = resolve_throttled_pockets(board)
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -9734,6 +9776,25 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Per-pocket pacing gate: defer this task while its assignee's OWN
+        # subscription pocket is throttled (its 5h / weekly window bit). Unlike
+        # a spawn failure this counts nothing against the task — it bounces back
+        # to ``ready`` and is retried on a later tick once the window cools. A
+        # different pocket's tasks are unaffected, so a hot pocket throttles
+        # only ITS OWN dispatches (the fix for the actuation split's regression:
+        # a per-pocket throttle must still bind its own tasks).
+        _pocket_reason = throttled_pockets.get((row_assignee or "").strip().lower())
+        if _pocket_reason is not None:
+            result.skipped_pacing_throttled.append(
+                (row["id"], row_assignee, _pocket_reason)
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "pacing_throttled",
+                        {"assignee": row_assignee, "reason": _pocket_reason},
+                    )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at

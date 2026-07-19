@@ -39,6 +39,7 @@ from __future__ import annotations
 import math
 import os
 import sqlite3
+import time
 from typing import Any, Optional
 
 from hermes_cli import (
@@ -575,3 +576,70 @@ def pacing_snapshot(
         "pockets": pockets,
         "window_total_tokens": total,
     }
+
+
+def throttled_pockets(
+    conn: Optional[sqlite3.Connection],
+    board: str,
+    *,
+    now: float,
+) -> dict[str, str]:
+    """``{pocket_name: reason}`` for every pocket whose window bit right now.
+
+    A pocket surfaces in :func:`pacing_snapshot` as one entry per window it is
+    paced over (its weekly allowance and the nested 5h session each yield a
+    row). This folds all of a subscription's entries with
+    :func:`zeus_circuit_breaker.aggregate` — a hard wall in ANY window
+    (projected overshoot, near-exhaustion, or a provider cooldown) trips the
+    whole pocket — and returns only the tripped ones, mapped to the winning
+    window's reason.
+
+    This is the dispatch-gating view of pacing: the kanban dispatcher matches a
+    ready task's assignee against these pocket names and skips the task while
+    its OWN pocket is throttled, leaving free pockets (a different subscription)
+    dispatching normally. Degrades to ``{}`` (fail open) on any error or a
+    missing ledger — a pacing read must never halt the board, matching the rest
+    of this module.
+    """
+    try:
+        snapshot = pacing_snapshot(conn, board, now=now)
+    except Exception:
+        return {}
+    by_name: dict[str, list[dict]] = {}
+    for pocket in snapshot.get("pockets", []):
+        verdict = pocket.get("effective_breaker")
+        name = pocket.get("subscription")
+        if verdict and name:
+            by_name.setdefault(name, []).append(verdict)
+    throttled: dict[str, str] = {}
+    for name, verdicts in by_name.items():
+        folded = zeus_circuit_breaker.aggregate(verdicts)
+        if folded.get("tripped"):
+            throttled[name] = folded.get("reason") or "pocket throttled"
+    return throttled
+
+
+def throttled_pockets_for_board(
+    board: str, *, now: Optional[float] = None
+) -> dict[str, str]:
+    """Open the zeus ledger and return :func:`throttled_pockets` for ``board``.
+
+    Convenience wrapper for callers (the kanban dispatcher) that don't hold a
+    zeus connection. Opens and closes the read-only ledger like the dashboard's
+    pacing route. Returns ``{}`` when the ledger is absent (zeus plugin not
+    installed) or on any error — fail open.
+    """
+    if now is None:
+        now = time.time()
+    conn = connect()
+    if conn is None:
+        return {}
+    try:
+        return throttled_pockets(conn, board, now=now)
+    except Exception:
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
