@@ -4920,6 +4920,49 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+
+    # Backstop sweep: a 'ready' task should never hold a claim_lock (claim_task
+    # transitions ready -> running atomically). If one does — e.g. a stale lock
+    # that survived a block/unblock during a DB-corruption epoch, or a leftover
+    # from a pre-fix code path — the dispatcher's candidate query
+    # (``claim_lock IS NULL``) skips it forever and it never counts toward the
+    # 'dispatcher stuck' signal. There is no running worker to terminate here,
+    # so just null the claim columns so the card becomes dispatchable next tick.
+    # Scoped to expired / no-expiry locks to stay race-safe against any
+    # legitimate future-dated lock. RCA: t_eeba1321 (seen on t_e0c5725b).
+    orphaned = conn.execute(
+        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NOT NULL "
+        "  AND (claim_expires IS NULL OR claim_expires < ?)",
+        (now,),
+    ).fetchall()
+    for row in orphaned:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL "
+                "WHERE id = ? AND status = 'ready' AND claim_lock IS ? "
+                "  AND (claim_expires IS NULL OR claim_expires < ?)",
+                (row["id"], row["claim_lock"], now),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn, row["id"], "stale_ready_lock_cleared",
+                {
+                    "stale_lock": row["claim_lock"],
+                    "claim_expires": (
+                        int(row["claim_expires"])
+                        if row["claim_expires"] is not None else None
+                    ),
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "now": now,
+                },
+            )
+            reclaimed += 1
     return reclaimed
 
 
@@ -6488,7 +6531,9 @@ def promote_task(
     drives it from a deliberate operator action with an audit-trail
     entry. Refuses to promote if any parent dep is not in a terminal
     state (`done`/`archived`) unless ``force=True``. Does NOT change
-    assignee or claim state. Returns ``(True, None)`` on success and
+    assignee, but clears any stale claim state (claim_lock/claim_expires/
+    worker_pid) so the promoted card is dispatchable. Returns ``(True, None)``
+    on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
@@ -6526,8 +6571,13 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        # Clear any stale claim state on the way into 'ready'. A 'blocked' task
+        # can still carry a live claim_lock (e.g. blocked mid-run); promoting it
+        # to 'ready' with the lock intact makes it invisible to the dispatcher,
+        # whose candidate query requires ``claim_lock IS NULL``. RCA: t_eeba1321.
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
+            "UPDATE tasks SET status = 'ready', "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
             (task_id,),
         )
@@ -7067,9 +7117,18 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
         # still reset here, which is correct: a deliberate unblock is a fresh
         # start for the dispatcher's retry budget.
+        # Clear any claim state as we leave the non-dispatchable lane. A task
+        # blocked (or scheduled) with a live claim_lock — e.g. one blocked
+        # mid-run during a DB-corruption epoch — would otherwise return to
+        # 'ready' still holding the lock, and the dispatcher's candidate query
+        # requires ``claim_lock IS NULL`` (has_spawnable_ready / dispatch_once),
+        # so the card is invisible forever and does not even count toward the
+        # 'dispatcher stuck' warning. Reclaimable only by a manual
+        # ``hermes kanban reclaim``. RCA: t_eeba1321 (seen on t_e0c5725b).
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )

@@ -1202,6 +1202,101 @@ def test_unblock_resets_failure_counters(kanban_home):
         assert task.last_failure_error is None
 
 
+def _force_blocked_with_stale_lock(conn, task_id):
+    """Simulate the corruption-epoch anomaly (t_eeba1321): a task parked in
+    ``blocked`` while still carrying a live ``claim_lock`` / ``claim_expires``
+    / ``worker_pid``. Normal ``block_task`` clears the lock, so we set the
+    anomalous state directly."""
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', claim_lock = 'host:worker-447', "
+        "claim_expires = ?, worker_pid = 99999 WHERE id = ?",
+        (int(time.time()) + 3600, task_id),
+    )
+    conn.commit()
+
+
+def test_unblock_clears_stale_claim_lock(kanban_home, all_assignees_spawnable):
+    """A blocked task carrying a stale claim_lock must return to ``ready``
+    with the lock cleared, otherwise the dispatcher's candidate query
+    (``claim_lock IS NULL``) skips it forever (t_eeba1321)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="alice")
+        _force_blocked_with_stale_lock(conn, t)
+
+        assert kb.unblock_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+        # End-to-end: the unblocked card is now visible to the dispatcher.
+        assert kb.has_spawnable_ready(conn) is True
+
+
+def test_promote_clears_stale_claim_lock(kanban_home, all_assignees_spawnable):
+    """promote_task must clear a stale claim_lock when moving blocked/todo
+    into ``ready`` — same invisibility bug as unblock (t_eeba1321)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="alice")
+        _force_blocked_with_stale_lock(conn, t)
+
+        ok, reason = kb.promote_task(conn, t, actor="tester", force=True)
+        assert ok, reason
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+        assert kb.has_spawnable_ready(conn) is True
+
+
+def test_release_stale_claims_sweeps_ready_lane(kanban_home):
+    """release_stale_claims must also null out a stale claim_lock left on a
+    ``ready`` task — there is no running worker, but the lock still hides the
+    card from dispatch (t_eeba1321)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        # Ready card with an expired lock (no active worker/run).
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = 'host:worker-447', "
+            "claim_expires = ?, worker_pid = 99999 WHERE id = ?",
+            (int(time.time()) - 3600, t),
+        )
+        conn.commit()
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
+            ).fetchall()
+        ]
+        assert "stale_ready_lock_cleared" in kinds
+
+
+def test_release_stale_claims_ready_lane_ignores_live_lock(kanban_home):
+    """A ready card whose lock has NOT expired is left untouched — the
+    ready-lane sweep is scoped to expired / no-expiry locks to stay race-safe
+    against any legitimate future-dated lock (t_eeba1321)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = 'host:worker-1', "
+            "claim_expires = ? WHERE id = ?",
+            (int(time.time()) + 3600, t),
+        )
+        conn.commit()
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 0
+        assert kb.get_task(conn, t).claim_lock == "host:worker-1"
+
+
 def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
     """recompute_ready must not auto-recover tasks whose consecutive_failures
     has reached the circuit-breaker limit (#35072).
