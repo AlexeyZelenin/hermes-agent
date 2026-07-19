@@ -793,30 +793,60 @@ def claude_pool_alive() -> bool:
         return False
 
 
-def resolve_throttled_pockets(board: Optional[str] = None) -> dict[str, str]:
-    """``{assignee_lower: reason}`` for pockets the dispatcher must skip now.
+def resolve_pocket_admission(board: Optional[str] = None) -> dict[str, dict]:
+    """``{assignee_lower: admission_verdict}`` for the dispatcher.
 
-    Reads the live pacing ledger and returns the subscription pockets whose
-    OWN window is throttled (tripped), keyed lower-cased so an assignee lookup
-    is case-insensitive. A native worker's assignee profile IS its pocket name
-    (``glm`` → pocket ``glm``), so this is the map the dispatcher uses to defer
-    a ready task while its OWN pocket is walled — leaving free pockets (a
-    different subscription) dispatching. Claude-pool assignees (leased across
+    Reads the live pacing ledger and returns the **graceful-admission** verdict
+    for every pocket that is currently paced, keyed lower-cased so an assignee
+    lookup is case-insensitive. A native worker's assignee profile IS its pocket
+    name (``glm`` → pocket ``glm``); Claude-pool assignees (leased across
     ``personal``/``work1``/``work2`` at spawn time) have no single pocket name
-    and are not gated here; the subscription pool's own lease-time capacity /
+    and are not gated here — the subscription pool's own lease-time capacity /
     rotation / rate-limit-exit path handles a walled Claude pool.
+
+    Each value is the verdict dict from
+    :func:`hermes_cli.zeus_pacing.pocket_admission` (``hard_block``,
+    ``sustainable_rate_ratio``, ``recent_rate_per_sec``, ``reason``, ``state``).
+    The dispatcher:
+
+    - **skips** a ready task while its pocket is hard-blocked (a provider
+      cooldown or near-exhaustion — admitting any task would blow a real limit);
+    - **rate-caps** it otherwise when ``sustainable_rate_ratio < 1.0`` (the
+      pocket is overshooting): the in-flight count is held to
+      ``max(1, round(base * ratio))`` so spend paces down smoothly instead of
+      slamming to zero — graceful admission, the fix for t_4ee09bd0.
 
     Fail-open: any error, or the zeus plugin being absent, yields ``{}`` so a
     pacing read never stalls dispatch. See
-    :func:`hermes_cli.zeus_pacing.throttled_pockets_for_board`.
+    :func:`hermes_cli.zeus_pacing.pocket_admission_for_board`.
     """
     try:
         from hermes_cli import zeus_pacing
         slug = board if board else get_current_board()
-        raw = zeus_pacing.throttled_pockets_for_board(slug)
-        return {str(name).strip().lower(): reason for name, reason in raw.items()}
+        raw = zeus_pacing.pocket_admission_for_board(slug)
+        return {
+            str(name).strip().lower(): verdict
+            for name, verdict in raw.items()
+        }
     except Exception:
         return {}
+
+
+def resolve_throttled_pockets(board: Optional[str] = None) -> dict[str, str]:
+    """``{assignee_lower: reason}`` for HARD-BLOCKED pockets (legacy compat).
+
+    Thin view over :func:`resolve_pocket_admission` returning only the
+    ``hard_block`` pockets as a flat ``{name: reason}`` map. Kept for
+    dashboards / diagnostics and any caller that only needs the skip-all
+    signal. The dispatcher uses :func:`resolve_pocket_admission` directly so it
+    can apply the graceful rate cap as well.
+    """
+    admission = resolve_pocket_admission(board)
+    return {
+        name: v.get("reason") or "pocket throttled"
+        for name, v in admission.items()
+        if v.get("hard_block")
+    }
 
 
 def resolve_model_map(board: Optional[str] = None,
@@ -8191,7 +8221,24 @@ class DispatchResult:
     operator-actionable failure and NOT a counted failure: the task is picked
     up on a later tick once the pocket's window cools. A different pocket's
     tasks (a free subscription) keep dispatching — the throttle binds only its
-    OWN dispatches. See :func:`hermes_cli.zeus_pacing.throttled_pockets`."""
+    OWN dispatches. See :func:`hermes_cli.zeus_pacing.throttled_pockets`.
+
+    As of graceful admission (t_4ee09bd0) this list holds only the
+    **hard-blocked** tasks (a provider cooldown or near-exhaustion — the
+    projection-only overshoot class is now rate-capped gracefully via
+    ``skipped_pacing_admission`` instead of skipped entirely)."""
+    skipped_pacing_admission: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks deferred this tick by GRACEFUL ADMISSION: their assignee's pocket
+    is overshooting its sustainable rate (``sustainable_rate_ratio < 1.0``) but
+    not hard-blocked, so the dispatcher rate-caps the pocket's in-flight count
+    instead of skipping it entirely. Each entry is
+    ``(task_id, assignee, reason)``. The pocket keeps a trickle of workers
+    (floored to 1) and paces its spend down smoothly rather than slamming to
+    zero — the fix for the binary-throttle self-lock class. Like
+    ``skipped_pacing_throttled`` this is NOT a counted failure: the task
+    dispatches on a later tick once the pocket's in-flight count drops below
+    the admission cap. See :func:`hermes_cli.zeus_pacing.pocket_admission` /
+    :func:`hermes_cli.zeus_circuit_breaker.admission_agent_limit`."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -10055,14 +10102,36 @@ def _dispatch_once_locked(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
-    # Per-pocket pacing gate: subscriptions whose OWN window is throttled right
-    # now (e.g. glm at 96% of its 5h session). A ready task whose assignee names
-    # one of these pockets is deferred this tick so a hot pocket stops feeding
-    # its own dispatches, while a free pocket (a different subscription) keeps
-    # spawning. Resolved once per tick and fail-open ({} on any pacing-read
-    # error) so pacing telemetry can never stall the board. See
-    # resolve_throttled_pockets / zeus_pacing.throttled_pockets.
-    throttled_pockets = resolve_throttled_pockets(board)
+    # Per-pocket pacing gate (graceful admission, t_4ee09bd0): resolve each
+    # paced pocket's admission verdict once per tick. A pocket whose OWN window
+    # is hard-blocked (provider cooldown or near-exhaustion) skips ALL its
+    # dispatches; a pocket overshooting its sustainable rate (ratio < 1.0) is
+    # rate-capped — its in-flight workers are held to a fraction of the board's
+    # concurrency so spend paces down smoothly instead of slamming to zero.
+    # Free pockets (a different subscription) keep dispatching. Fail-open ({})
+    # on any pacing-read error so telemetry can never stall the board. See
+    # resolve_pocket_admission / zeus_pacing.pocket_admission.
+    pocket_admission = resolve_pocket_admission(board)
+    # admission_agent_limit: pure helper that turns the sustainable-rate ratio
+    # into a per-pocket in-flight cap (floored to 1). Imported once here rather
+    # than per-loop-iteration.
+    if pocket_admission:
+        from hermes_cli import zeus_circuit_breaker as _cb_mod
+        _admission_cap_fn = _cb_mod.admission_agent_limit
+    else:
+        _admission_cap_fn = None
+    # Per-assignee in-flight count (running tasks). Needed by the graceful-
+    # admission cap and computed once per tick regardless of whether the
+    # operator set max_in_progress_per_profile (that cap is orthogonal — it
+    # bounds local-resource pressure; the admission cap bounds pocket spend).
+    _admission_running: dict[str, int] = {}
+    if pocket_admission:
+        for prow in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        ):
+            _admission_running[prow["assignee"]] = int(prow["n"])
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -10189,25 +10258,67 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
-        # Per-pocket pacing gate: defer this task while its assignee's OWN
-        # subscription pocket is throttled (its 5h / weekly window bit). Unlike
-        # a spawn failure this counts nothing against the task — it bounces back
-        # to ``ready`` and is retried on a later tick once the window cools. A
-        # different pocket's tasks are unaffected, so a hot pocket throttles
+        # Per-pocket pacing gate (graceful admission, t_4ee09bd0):
+        #  (a) HARD BLOCK (provider cooldown or near-exhaustion ≥95%): skip the
+        #      task entirely. Admitting any task would blow a real limit.
+        #  (b) GRACEFUL ADMISSION (sustainable_rate_ratio < 1.0, not hard-
+        #      blocked): the pocket is overshooting its sustainable rate. Cap
+        #      its in-flight count to round(base_in_flight * ratio) (floored to
+        #      1) so spend paces down smoothly — admit what fits, not zero.
+        #  (c) else: free / on-pace / burning-down pocket — dispatch normally.
+        # A different pocket's tasks are unaffected, so a hot pocket throttles
         # only ITS OWN dispatches (the fix for the actuation split's regression:
         # a per-pocket throttle must still bind its own tasks).
-        _pocket_reason = throttled_pockets.get((row_assignee or "").strip().lower())
-        if _pocket_reason is not None:
-            result.skipped_pacing_throttled.append(
-                (row["id"], row_assignee, _pocket_reason)
+        _pocket_verdict = pocket_admission.get((row_assignee or "").strip().lower())
+        if _pocket_verdict is not None:
+            if _pocket_verdict.get("hard_block"):
+                _pocket_reason = _pocket_verdict.get("reason") or "pocket throttled"
+                result.skipped_pacing_throttled.append(
+                    (row["id"], row_assignee, _pocket_reason)
+                )
+                if not dry_run:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "pacing_throttled",
+                            {"assignee": row_assignee, "reason": _pocket_reason},
+                        )
+                continue
+            # Graceful admission: cap this pocket's in-flight count. Base the
+            # cap on the board's effective_max_in_progress (the budget the
+            # pocket is competing for), so a throttled pocket gets a fraction
+            # of the whole board rather than of its own current count (which
+            # would freeze a pocket that's currently idle but historically hot).
+            _ratio = _pocket_verdict.get("sustainable_rate_ratio")
+            _cap = (
+                _admission_cap_fn(
+                    sustainable_rate_ratio=_ratio,
+                    base_in_flight=effective_max_in_progress,
+                )
+                if _admission_cap_fn is not None
+                else None
             )
-            if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "pacing_throttled",
-                        {"assignee": row_assignee, "reason": _pocket_reason},
+            if _cap is not None:
+                _current = _admission_running.get(row_assignee, 0)
+                if _current >= _cap:
+                    _adm_reason = (
+                        f"admission cap {_cap} (sustainable rate "
+                        f"{_ratio:.2f}× — pacing down from {_current} in flight)"
                     )
-            continue
+                    result.skipped_pacing_admission.append(
+                        (row["id"], row_assignee, _adm_reason)
+                    )
+                    if not dry_run:
+                        with write_txn(conn):
+                            _append_event(
+                                conn, row["id"], "pacing_admission",
+                                {
+                                    "assignee": row_assignee,
+                                    "cap": _cap,
+                                    "in_flight": _current,
+                                    "ratio": _ratio,
+                                },
+                            )
+                    continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API

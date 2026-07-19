@@ -76,6 +76,14 @@ _WINDOW_COLUMNS = (
     "updated_at",
 )
 
+# --- graceful admission / EMA-weighted projection ----------------------------
+# The breaker's projection must reflect RECENT burn, not the lifetime average
+# since window start (a day-one onboarding burst would otherwise poison the
+# whole week — task t_4ee09bd0). ``_recent_burn_rate`` reconstructs an EMA of
+# the token burn rate over this lookback window from the append-only ledger.
+_RECENT_RATE_LOOKBACK_SEC = 2 * 3600  # 2h of samples feed the EMA
+_RECENT_RATE_TAU_SEC = 1800           # 30-min time constant: recent samples dominate
+
 _BACKUP_DDL = """
 CREATE TABLE IF NOT EXISTS pacing_state_backup (
     board TEXT NOT NULL,
@@ -300,6 +308,71 @@ def _window_tokens(
     }
 
 
+def _recent_burn_rate(
+    conn: sqlite3.Connection,
+    subscription: str,
+    *,
+    now: float,
+    since_ts: Optional[float] = None,
+    lookback_sec: float = _RECENT_RATE_LOOKBACK_SEC,
+    tau_sec: float = _RECENT_RATE_TAU_SEC,
+) -> Optional[float]:
+    """Exponentially-weighted recent token burn rate (tokens/sec), or ``None``.
+
+    The projection the breaker makes must reflect the pocket's *recent* burn,
+    not the lifetime average since the window started (a day-one onboarding
+    burst that's long since gone idle would otherwise project to an overshoot
+    for the entire week — the self-lock false-positive). This reconstructs an
+    EMA of the burn rate over the last ``lookback_sec`` from the append-only
+    ledger, weighting each row by ``exp(-(now - ts) / tau)`` so recent spend
+    dominates.
+
+    Returns ``0.0`` when the ledger is readable but has NO rows in the lookback
+    — that is a DEFINITIVE idle signal (the pocket genuinely hasn't burned
+    recently), distinct from ``None`` (ledger unreadable / table absent). ``0.0``
+    is what lets the breaker's idle override fire for a pocket with no recent
+    spend, instead of falling back to the stale lifetime average. Without this
+    distinction a day-one onboarding burst that's since gone quiet would keep
+    self-locking on the lifetime projection forever (task t_4ee09bd0).
+
+    ``since_ts`` clamps the lower bound to the window start when supplied: we
+    only ever pace spend inside the window we're judging (a weekly window
+    ignores last week's tail; a 5h window ignores earlier sessions).
+    """
+    start = now - lookback_sec
+    if since_ts is not None and since_ts > start:
+        start = since_ts
+    if start >= now:
+        # Window started in the future (clock skew / fresh window): no spend
+        # can exist yet -> definitively idle, not unknown.
+        return 0.0
+    clause = "subscription = ? AND ts >= ? AND ts <= ?"
+    params: list = [subscription, start, now]
+    try:
+        rows = conn.execute(
+            f"SELECT ts, total_tokens FROM token_usage WHERE {clause} "
+            "ORDER BY ts ASC",
+            tuple(params),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if not rows:
+        # Ledger readable, no recent spend -> idle (0.0), NOT unknown.
+        return 0.0
+    alpha = 1.0 / tau_sec if tau_sec > 0 else 1.0
+    # Time-weighted token sum / (lookback span), where each row's tokens are
+    # weighted by exp(-alpha * age). Equivalent to integrating the EMA impulse
+    # train and normalizing by the lookback window.
+    weighted_tokens = 0.0
+    for r in rows:
+        age = max(0.0, now - float(r["ts"]))
+        weighted_tokens += float(r["total_tokens"] or 0) * math.exp(-alpha * age)
+    span = now - start
+    if span <= 0:
+        return None
+    return weighted_tokens / span
+
+
 def _subscription_meta(conn: sqlite3.Connection) -> dict[str, dict]:
     """``{name: {display_name, enabled, reserved, cooling_until, last_limited_at}}``.
 
@@ -379,6 +452,7 @@ def _session_breaker(
     reset_at: Optional[float],
     now: float,
     cooling: bool,
+    recent_rate_per_sec: Optional[float] = None,
 ) -> tuple[dict, float, float, Optional[dict]]:
     """Nested 5h-session verdict + its window bounds and in-window tokens.
 
@@ -387,6 +461,9 @@ def _session_breaker(
     (anchored on the client reset), judged against the session budget derived
     from the weekly one under the even-rate doctrine. Returns
     ``(breaker_5h, start, reset, tokens)``.
+
+    ``recent_rate_per_sec`` (5h-window-restricted) drives the EMA-weighted
+    projection and graceful-admission ratio for this nested curve.
     """
     start, reset = _five_hour_window(cooling_until, now)
     tokens = _window_tokens(conn, subscription, start)
@@ -396,6 +473,10 @@ def _session_breaker(
     budget = subscription_limits.measured_session_limit(conn, subscription)
     if budget is None:
         budget = _five_hour_budget(weekly_budget, weekly_start, reset_at)
+    # Restrict the recent-rate EMA to spend inside THIS 5h session window.
+    rate_5h = recent_rate_per_sec
+    if rate_5h is None:
+        rate_5h = _recent_burn_rate(conn, subscription, now=now, since_ts=start)
     breaker = zeus_circuit_breaker.evaluate(
         spent_percent=None,
         live_tokens=tokens["total_tokens"] if tokens is not None else None,
@@ -405,6 +486,7 @@ def _session_breaker(
         now=now,
         cooling=cooling,
         budget_tokens=budget,
+        recent_rate_per_sec=rate_5h,
     )
     return breaker, start, reset, tokens
 
@@ -451,6 +533,14 @@ def _pocket(
     # v2 real-time circuit-breaker: re-derive spend from the live ledger, using
     # tokens burned up to ``updated_at`` as the controller's calibration point.
     snapshot = _window_tokens(conn, row["subscription"], window_start, until_ts=updated_at)
+    # EMA-weighted recent burn rate over the last ~2h, restricted to spend
+    # inside this (weekly) window. Drives the projection that replaces the
+    # lifetime average, and the graceful-admission ratio. None when the ledger
+    # has no recent rows for this pocket — the breaker then holds at current
+    # spend rather than extrapolating a stale average.
+    recent_rate = _recent_burn_rate(
+        conn, row["subscription"], now=now, since_ts=window_start
+    )
     breaker = zeus_circuit_breaker.evaluate(
         spent_percent=spent,
         live_tokens=live["total_tokens"] if live is not None else None,
@@ -459,10 +549,14 @@ def _pocket(
         reset_at=reset_at,
         now=now,
         cooling=cooling,
+        recent_rate_per_sec=recent_rate,
     )
     # Fold the nested session verdict into the weekly one: open (either wall)
     # halts, a session burndown in the block's tail lifts a weekly throttle to
     # drain the remainder, else the tighter throttle wins (see aggregate()).
+    # Note: the session breaker computes its OWN recent rate restricted to the
+    # 5h window (passing the weekly rate would judge the session curve on the
+    # wrong window's burn).
     breaker_5h, five_start, five_reset, five_live = _session_breaker(
         conn,
         row["subscription"],
@@ -578,28 +672,45 @@ def pacing_snapshot(
     }
 
 
-def throttled_pockets(
+def pocket_admission(
     conn: Optional[sqlite3.Connection],
     board: str,
     *,
     now: float,
-) -> dict[str, str]:
-    """``{pocket_name: reason}`` for every pocket whose window bit right now.
+) -> dict[str, dict]:
+    """``{pocket_name: admission_verdict}`` for every paced, enabled pocket.
 
-    A pocket surfaces in :func:`pacing_snapshot` as one entry per window it is
-    paced over (its weekly allowance and the nested 5h session each yield a
-    row). This folds all of a subscription's entries with
-    :func:`zeus_circuit_breaker.aggregate` — a hard wall in ANY window
-    (projected overshoot, near-exhaustion, or a provider cooldown) trips the
-    whole pocket — and returns only the tripped ones, mapped to the winning
-    window's reason.
+    The dispatch-gating view of pacing — what the kanban dispatcher matches a
+    ready task's assignee against. Replaces the binary "tripped -> block all"
+    rule with **graceful admission**: a pocket whose window is overshooting the
+    sustainable rate is *rate-capped* (admit fewer concurrent tasks), not
+    slammed to zero. Only genuine walls hard-block.
 
-    This is the dispatch-gating view of pacing: the kanban dispatcher matches a
-    ready task's assignee against these pocket names and skips the task while
-    its OWN pocket is throttled, leaving free pockets (a different subscription)
-    dispatching normally. Degrades to ``{}`` (fail open) on any error or a
-    missing ledger — a pacing read must never halt the board, matching the rest
-    of this module.
+    Each verdict dict carries:
+
+    ``hard_block`` (bool)
+        ``True`` only for real walls — a provider cooldown or near-exhaustion
+        (>= ``HARD_SPENT_PERCENT``). The dispatcher skips the pocket entirely
+        while this is set. Projection-only overshoot is NOT a hard block.
+    ``sustainable_rate_ratio`` (float | None)
+        The tightest rate ratio across the pocket's windows (weekly ∧ 5h
+        session). ``< 1.0`` means the pocket is burning faster than the rate
+        that would land it at 100% of budget by reset, and the dispatcher
+        should cap its in-flight count to ``round(base * ratio)`` (floored to
+        1) — *graceful admission*. ``None`` when the pocket is on/under pace,
+        has no recent burn rate, or is burning down (no cap).
+    ``recent_rate_per_sec`` (float | None)
+        The actual recent burn rate (max across windows) — diagnostic.
+    ``reason`` (str)
+        The winning window's reason (for the ``pacing_throttled`` /
+        ``pacing_admission`` event log).
+    ``state`` (str)
+        Effective breaker state (open / half_open / burndown / closed).
+
+    Tracking-only pockets (``pacing_config.enabled = 0``) are excluded — they
+    are observed but never dispatch-gated, so a projection with no real
+    allowance can't self-lock the pocket (or the very card that would fix it).
+    Degrades to ``{}`` (fail open) on any error or a missing ledger.
     """
     try:
         snapshot = pacing_snapshot(conn, board, now=now)
@@ -619,12 +730,75 @@ def throttled_pockets(
         name = pocket.get("subscription")
         if verdict and name:
             by_name.setdefault(name, []).append(verdict)
-    throttled: dict[str, str] = {}
+    admission: dict[str, dict] = {}
     for name, verdicts in by_name.items():
         folded = zeus_circuit_breaker.aggregate(verdicts)
-        if folded.get("tripped"):
-            throttled[name] = folded.get("reason") or "pocket throttled"
-    return throttled
+        # Exclude pockets with no pacing telemetry at all (all-unknown) — there
+        # is nothing to gate on, and failing open keeps the board moving.
+        if folded.get("state") == "unknown" and not folded.get("hard_block"):
+            continue
+        admission[name] = {
+            "hard_block": bool(folded.get("hard_block")),
+            "sustainable_rate_ratio": folded.get("sustainable_rate_ratio"),
+            "recent_rate_per_sec": folded.get("recent_rate_per_sec"),
+            "reason": folded.get("reason") or "pocket throttled",
+            "state": folded.get("state", "unknown"),
+        }
+    return admission
+
+
+def throttled_pockets(
+    conn: Optional[sqlite3.Connection],
+    board: str,
+    *,
+    now: float,
+) -> dict[str, str]:
+    """``{pocket_name: reason}`` for every HARD-BLOCKED pocket right now.
+
+    The hard-block subset of :func:`pocket_admission` — only the pockets the
+    dispatcher must skip entirely because admitting ANY task would risk blowing
+    a real limit (a provider cooldown, or near-exhaustion of the budget).
+    Projection-only overshoot is deliberately NOT here: that is paced
+    *gracefully* via the sustainable-rate ratio instead of slammed to zero
+    (task t_4ee09bd0 — graceful admission replaces the binary throttle).
+
+    Kept as a thin view over :func:`pocket_admission` for callers that only
+    need the skip-all signal (dashboards, diagnostics). The dispatcher itself
+    uses :func:`pocket_admission` directly so it can apply the graceful cap.
+    Degrades to ``{}`` (fail open) on any error or a missing ledger.
+    """
+    admission = pocket_admission(conn, board, now=now)
+    return {
+        name: v["reason"]
+        for name, v in admission.items()
+        if v.get("hard_block")
+    }
+
+
+def pocket_admission_for_board(
+    board: str, *, now: Optional[float] = None
+) -> dict[str, dict]:
+    """Open the zeus ledger and return :func:`pocket_admission` for ``board``.
+
+    Convenience wrapper for callers (the kanban dispatcher) that don't hold a
+    zeus connection. Opens and closes the read-only ledger like the dashboard's
+    pacing route. Returns ``{}`` when the ledger is absent (zeus plugin not
+    installed) or on any error — fail open.
+    """
+    if now is None:
+        now = time.time()
+    conn = connect()
+    if conn is None:
+        return {}
+    try:
+        return pocket_admission(conn, board, now=now)
+    except Exception:
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def throttled_pockets_for_board(
@@ -632,10 +806,9 @@ def throttled_pockets_for_board(
 ) -> dict[str, str]:
     """Open the zeus ledger and return :func:`throttled_pockets` for ``board``.
 
-    Convenience wrapper for callers (the kanban dispatcher) that don't hold a
-    zeus connection. Opens and closes the read-only ledger like the dashboard's
-    pacing route. Returns ``{}`` when the ledger is absent (zeus plugin not
-    installed) or on any error — fail open.
+    Convenience wrapper for callers that don't hold a zeus connection. Returns
+    ``{}`` when the ledger is absent (zeus plugin not installed) or on any
+    error — fail open.
     """
     if now is None:
         now = time.time()

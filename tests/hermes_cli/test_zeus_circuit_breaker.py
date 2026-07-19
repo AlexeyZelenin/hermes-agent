@@ -329,3 +329,145 @@ def test_aggregate_keeps_component_windows():
     a = {"state": "closed", "reason": "on pace"}
     b = {"state": "burndown", "reason": "drain"}
     assert cb.aggregate([a, b])["windows"] == [a, b]
+
+
+# ---------------------------------------------------------------------------
+# Graceful admission + idle override (task t_4ee09bd0)
+# ---------------------------------------------------------------------------
+
+def test_idle_recent_rate_overrides_lifetime_projection():
+    """The operator's kimi case: 16% spent at 11% elapsed (onboarding burst
+    yesterday) -> lifetime average projects 145% (would trip), but the recent
+    burn rate is 0 (idle). The idle override holds the projection at current
+    spend so the pocket doesn't self-lock."""
+    # budget 1000 (160 tokens / 16%); 16% spent at 11% elapsed.
+    v = cb.evaluate(
+        spent_percent=16.0,
+        live_tokens=160,
+        snapshot_tokens=160,  # 160/16% = 1000 budget -> live 16%
+        window_start=NOW - WEEK * 0.11,
+        reset_at=NOW + WEEK * 0.89,
+        now=NOW,
+        recent_rate_per_sec=0.0,  # idle
+    )
+    assert v["idle"] is True
+    # Projection held at current spend (16%), not extrapolated to ~145%.
+    assert v["projected_spent_percent"] == pytest.approx(16.0)
+    assert v["state"] != "open"
+    assert v["tripped"] is False
+    # No graceful cap either — nothing is burning.
+    assert v["sustainable_rate_ratio"] is None
+
+
+def test_active_recent_rate_keeps_lifetime_projection():
+    """A pocket that IS actively burning keeps the lifetime-average projection
+    (its real pace); the recent rate drives the graceful-admission ratio
+    instead of overriding the projection. A genuine overshoot still trips."""
+    # 65% spent at 50% elapsed -> lifetime projects 130% (TRIP). Supply a
+    # recent rate that is NOT idle (would add >10% over the rest of the window).
+    rate = 100.0  # tokens/sec
+    v = _eval(live_tokens=650, recent_rate_per_sec=rate)
+    # 650 live, budget 1000; 50% of week left = ~302400 s; growth = huge -> not idle.
+    assert v["idle"] is False
+    assert v["projected_spent_percent"] == pytest.approx(130.0)  # lifetime avg
+    assert v["state"] == "open"
+
+
+def test_hard_block_only_for_cooldown_or_near_exhaustion():
+    """Projection-only overshoot is NOT a hard block (it paces gracefully);
+    only cooling or >= HARD_SPENT_PERCENT hard-blocks."""
+    # Projection overshoot to 130% but only 65% actually spent -> not hard block.
+    v = _eval(live_tokens=650)
+    assert v["state"] == "open"
+    assert v["tripped"] is True
+    assert v["hard_block"] is False  # projection-only
+    # Near-exhaustion -> hard block regardless of projection.
+    v2 = cb.evaluate(
+        spent_percent=96.0, live_tokens=960, snapshot_tokens=960,
+        window_start=NOW - WEEK * 0.95, reset_at=NOW + WEEK * 0.05, now=NOW,
+    )
+    assert v2["hard_block"] is True
+    # Cooling -> hard block.
+    v3 = _eval(live_tokens=100, cooling=True)
+    assert v3["hard_block"] is True
+
+
+def test_sustainable_rate_ratio_when_overshooting():
+    """A pocket burning at 2x the rate that would land it at 100% by reset
+    reports ratio 0.5; on/under pace reports None."""
+    # 50% spent at 50% elapsed, 0.5 week left. Remaining budget = 50% = 500 tok.
+    # Target rate = 500 / (0.5 week). Burn at 2x that -> ratio 0.5.
+    seconds_left = WEEK * 0.5
+    budget = 1000.0
+    remaining = budget * 0.5
+    target_rate = remaining / seconds_left
+    v = _eval(live_tokens=500, recent_rate_per_sec=target_rate * 2.0)
+    assert v["sustainable_rate_ratio"] == pytest.approx(0.5, abs=0.01)
+
+
+def test_sustainable_rate_ratio_none_on_under_pace():
+    """A pocket under its sustainable rate (ratio > 1) emits no cap."""
+    seconds_left = WEEK * 0.5
+    budget = 1000.0
+    remaining = budget * 0.5  # 50% spent
+    target_rate = remaining / seconds_left
+    # Burning at HALF the target rate -> ratio 2.0 -> on/under pace -> None.
+    v = _eval(live_tokens=500, recent_rate_per_sec=target_rate * 0.5)
+    assert v["sustainable_rate_ratio"] is None
+
+
+def test_admission_agent_limit_scales_concurrency():
+    """ratio 0.5 of 4 in flight -> cap 2; ratio 0.34 -> floored? no, round=1."""
+    assert cb.admission_agent_limit(
+        sustainable_rate_ratio=0.5, base_in_flight=4) == 2
+    assert cb.admission_agent_limit(
+        sustainable_rate_ratio=0.34, base_in_flight=4) == 1
+
+
+def test_admission_agent_limit_floors_to_one():
+    """Even a pocket well over its rate keeps 1 worker (trickle, no self-lock)."""
+    assert cb.admission_agent_limit(
+        sustainable_rate_ratio=0.01, base_in_flight=10) == 1
+
+
+def test_admission_agent_limit_none_when_no_ratio():
+    """No ratio (on/under pace / idle / burning down) -> no cap."""
+    assert cb.admission_agent_limit(
+        sustainable_rate_ratio=None, base_in_flight=4) is None
+    assert cb.admission_agent_limit(
+        sustainable_rate_ratio=1.5, base_in_flight=4) is None  # on/under pace
+
+
+def test_admission_agent_limit_none_when_cap_not_below_base():
+    """If the computed cap is >= the current in-flight, there's nothing to
+    throttle -> None."""
+    # ratio 0.9, base 4 -> round(3.6)=4 >= 4 -> no cap.
+    assert cb.admission_agent_limit(
+        sustainable_rate_ratio=0.9, base_in_flight=4) is None
+
+
+def test_aggregate_takes_min_ratio_and_any_hard_block():
+    """Folding windows: any hard_block wins; sustainable_rate_ratio is the min."""
+    eff = cb.aggregate([
+        {"state": "half_open", "reason": "ahead", "hard_block": False,
+         "sustainable_rate_ratio": 0.5, "recent_rate_per_sec": 10.0},
+        {"state": "closed", "reason": "ok", "hard_block": True,
+         "sustainable_rate_ratio": 0.8, "recent_rate_per_sec": 5.0},
+    ])
+    assert eff["hard_block"] is True
+    assert eff["sustainable_rate_ratio"] == 0.5  # min
+    assert eff["recent_rate_per_sec"] == 10.0  # max
+
+
+def test_aggregate_burndown_lifts_sustainable_cap():
+    """A pocket burning down (tail of a window, under-utilizing) is not rate-
+    capped — the doctrine says drain the remainder, so sustainable -> None."""
+    eff = cb.aggregate([
+        {"state": "half_open", "reason": "ahead", "hard_block": False,
+         "sustainable_rate_ratio": 0.5, "recent_rate_per_sec": 10.0},
+        {"state": "burndown", "reason": "drain", "hard_block": False,
+         "sustainable_rate_ratio": None, "recent_rate_per_sec": 5.0},
+    ])
+    assert eff["state"] == "burndown"
+    assert eff["sustainable_rate_ratio"] is None  # lifted
+

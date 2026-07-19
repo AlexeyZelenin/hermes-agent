@@ -450,3 +450,127 @@ def test_interactive_tokens_none_without_config_dir():
     p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
     assert p["interactive_week_tokens"] is None
     assert p["config_dir"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Graceful admission — recent burn rate + idle override (task t_4ee09bd0)
+# ---------------------------------------------------------------------------
+
+def test_recent_burn_rate_weights_recent_spend():
+    """The EMA weights recent rows over old ones. A 50k turn 5 min ago should
+    dominate a 50k turn 90 min ago at a 30-min time constant."""
+    import math
+    conn = _conn()
+    now = NOW
+    tau = zeus_pacing._RECENT_RATE_TAU_SEC
+    lookback = zeus_pacing._RECENT_RATE_LOOKBACK_SEC
+    # Two equal turns: one 5 min ago, one 90 min ago.
+    conn.execute(
+        "INSERT INTO token_usage (ts, subscription, total_tokens) VALUES "
+        "(?, 'personal', 50000)", (now - 300,))
+    conn.execute(
+        "INSERT INTO token_usage (ts, subscription, total_tokens) VALUES "
+        "(?, 'personal', 50000)", (now - 5400,))
+    conn.commit()
+    rate = zeus_pacing._recent_burn_rate(conn, "personal", now=now)
+    assert rate is not None
+    # Reconstruct the expected EMA to confirm the weighting.
+    expected = (
+        50000 * math.exp(-300.0 / tau)
+        + 50000 * math.exp(-5400.0 / tau)
+    ) / lookback
+    assert rate == pytest.approx(expected, rel=0.01)
+    # The recent turn contributes far more than the old one.
+    assert math.exp(-300.0 / tau) > 10 * math.exp(-5400.0 / tau)
+
+
+def test_recent_burn_rate_zero_when_idle():
+    """A readable ledger with no rows in the lookback -> 0.0 (definitively idle,
+    not unknown). This 0.0 is what lets the breaker's idle override fire for a
+    pocket with no recent spend — distinct from None (ledger unreadable)."""
+    conn = _conn()
+    # A turn just OUTSIDE the lookback window.
+    old_ts = NOW - zeus_pacing._RECENT_RATE_LOOKBACK_SEC - 100
+    conn.execute(
+        "INSERT INTO token_usage (ts, subscription, total_tokens) VALUES "
+        "(?, 'personal', 50000)", (old_ts,))
+    conn.commit()
+    assert zeus_pacing._recent_burn_rate(conn, "personal", now=NOW) == 0.0
+
+
+def test_idle_pocket_does_not_trip_on_stale_burst():
+    """End-to-end: a pocket that burned hard on day one (16% at 11% elapsed)
+    but has since gone IDLE (no recent ledger rows) does NOT trip on the stale
+    lifetime-average projection — the idle override holds it at current spend.
+    This is the operator's kimi self-lock case."""
+    conn = _conn()
+    # Weekly window: started 11% ago, resets in 89%.
+    _add_pacing(
+        conn,
+        subscription="kimi",
+        spent_percent=16.0,
+        elapsed_percent=11.0,
+        reset_at=NOW + WEEK * 0.89,
+        burn_rate_per_min=0.0,  # controller agrees: idle
+        mode="idle",
+    )
+    # The onboarding burst that poisoned the lifetime avg: placed just after
+    # window start, but OUTSIDE the 2h recent-rate lookback.
+    window_start = NOW - WEEK * 0.11
+    conn.execute(
+        "INSERT INTO token_usage (ts, subscription, total_tokens) VALUES "
+        "(?, 'kimi', 160000)", (window_start + 60,)
+    )  # 160k tokens -> 16% of a ~1M budget
+    conn.commit()
+    p = zeus_pacing.pacing_snapshot(conn, "ra", now=NOW)["pockets"][0]
+    cb = p["circuit_breaker"]
+    # Recent rate is None (idle) -> idle override fires -> no trip.
+    assert cb["idle"] is True
+    assert cb["state"] != "open"
+    assert cb["tripped"] is False
+    # And the pocket is not hard-blocked either.
+    assert p["effective_breaker"]["hard_block"] is False
+
+
+def test_admission_surfaces_in_pocket_admission_when_overshooting():
+    """A pocket actively overshooting its sustainable WEEKLY rate carries a
+    sustainable_rate_ratio in its admission verdict (graceful cap signal),
+    not a hard_block. The session window stays healthy (only the weekly curve
+    is overshooting), so this is graceful — not a skip-all."""
+    conn = _conn()
+    # 50% spent at 50% elapsed weekly.
+    _add_pacing(
+        conn,
+        subscription="glm",
+        spent_percent=50.0,
+        elapsed_percent=50.0,
+        reset_at=NOW + WEEK / 2,
+        burn_rate_per_min=5000.0,
+        mode="throttle",
+    )
+    # Calibration: 500k tokens at window start calibrates a ~1M weekly budget.
+    window_start = NOW - WEEK / 2
+    conn.execute(
+        "INSERT INTO token_usage (ts, subscription, total_tokens) VALUES "
+        "(?, 'glm', 500000)", (window_start + 60,)
+    )
+    # Recent turns (within the 2h lookback) sized so the WEEKLY rate clearly
+    # overshoots the sustainable line (ratio < 1) but the 5h session does NOT
+    # near-exhaust. Session budget ≈ weekly * 5h/week ≈ 1M * 0.03 ≈ 30k tokens;
+    # 24k of recent spend keeps the session at ~80% (under the 95% hard-block).
+    # Two 12k turns in the last few minutes drive a high EMA rate.
+    for delta in (60, 180):
+        conn.execute(
+            "INSERT INTO token_usage (ts, subscription, total_tokens) VALUES "
+            "(?, 'glm', 12000)", (NOW - delta,)
+        )
+    conn.commit()
+    admission = zeus_pacing.pocket_admission(conn, "ra", now=NOW)
+    assert "glm" in admission
+    # Overshooting weekly but no wall hit -> graceful signal, not skip-all.
+    assert admission["glm"]["hard_block"] is False
+    assert admission["glm"]["sustainable_rate_ratio"] is not None
+    assert admission["glm"]["sustainable_rate_ratio"] < 1.0
+    # And throttled_pockets (hard-block subset) excludes it.
+    assert "glm" not in zeus_pacing.throttled_pockets(conn, "ra", now=NOW)
+
