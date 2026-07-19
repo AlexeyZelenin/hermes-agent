@@ -10,6 +10,11 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
 
 
+def _git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                   capture_output=True, text=True)
+
+
 @pytest.fixture
 def kanban_conn(tmp_path):
     conn = kb.connect(db_path=tmp_path / "kanban.db")
@@ -900,3 +905,67 @@ def test_no_cross_vendor_fallover_by_default(monkeypatch, kanban_conn, tmp_path)
             executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
         )
     assert providers_tried == ["claude"], "must not retry cross-vendor when flag is off"
+
+
+def test_phantom_completion_blocked_on_zero_output_and_no_changes(monkeypatch, kanban_conn, tmp_path):
+    """A session that returns no handoff text AND leaves no git changes (a scratch
+    workspace is not a repo) must be refused, not marked done - the zero-output
+    false positive this guard exists to kill (t_790b2481)."""
+    from agent import acp_task_executor as executor
+
+    task_id = kb.create_task(kanban_conn, title="Empty run", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            return "", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    with pytest.raises(RuntimeError, match="zero output and no changes"):
+        executor.run_task(
+            executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+        )
+    assert kb.get_task(kanban_conn, task_id).status == "blocked"
+
+
+def test_empty_handoff_still_completes_when_workspace_has_changes(monkeypatch, kanban_conn, tmp_path):
+    """No-regression: a run that left real git changes but returned an empty
+    handoff string still completes. The guard only blocks zero-output AND
+    no-changes runs (t_790b2481)."""
+    from agent import acp_task_executor as executor
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "base")
+    # Work the run left behind but never summarized:
+    (repo / "new.py").write_text("x = 1\n", encoding="utf-8")
+
+    task_id = kb.create_task(kanban_conn, title="Committed run", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            return "", ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(repo), board="test"
+    )
+    assert kb.get_task(kanban_conn, task_id).status == "done"

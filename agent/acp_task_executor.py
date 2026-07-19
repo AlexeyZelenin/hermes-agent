@@ -289,6 +289,37 @@ def _run_pooled_session(executor, workspace, prompt, timeout, model, task_id, fo
             subs.release(lease)
         _salvage_partial_output(task_id, board, client)
         subs.mark_limited(lease.name, limited)
+def _workspace_shows_work(workspace, run_id, board=None):
+    """True when this run left visible work in a git-backed workspace - a dirty
+    tree or a new commit past the run's claim-time base. A scratch workspace is
+    not a git repo, so there is nothing to show and this returns False.
+
+    This is the second half of the phantom-completion guard: it lets a run that
+    committed real code but returned an empty handoff string (e.g. crashed right
+    after committing) still complete, while a run that produced neither output
+    nor changes is refused. Fail-open on any git uncertainty so a transient git
+    error never discards a real run (t_790b2481)."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    top = kb._git_toplevel(Path(workspace))
+    if top is None:
+        return False
+    entries = kb._git_status_porcelain_entries(top)
+    if entries is None:
+        return True
+    if entries:
+        return True
+    if run_id is None:
+        return False
+    try:
+        with kb.connect_closing(board=board) as conn:
+            row = conn.execute(
+                "SELECT base_commit FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        base = row["base_commit"] if row else None
+    except Exception:
+        base = None
+    return bool(base and kb._git_has_new_commit(top, base))
 def run_task(*, executor, task_id, workspace, board=None):
     from hermes_cli import kanban_db as kb
     with kb.connect_closing(board=board) as conn:
@@ -329,6 +360,17 @@ def run_task(*, executor, task_id, workspace, board=None):
     if effort: metadata["effort_requested"]=effort
     if subscription: metadata["subscription"]=subscription
     _stamp_session_metadata(metadata, client)
+    # Phantom-completion guard: an external session that returned no handoff text
+    # AND left no visible work (clean/absent git tree, no new commit) is a
+    # zero-output false positive. Completing it here would mark the task done with
+    # nothing to show, so re-block it for another attempt instead. A run with real
+    # output OR real changes still completes normally, so valid paths are untouched
+    # (t_790b2481).
+    if not (text or "").strip() and not _workspace_shows_work(workspace, run_id, board):
+        with kb.connect_closing(board=board) as conn:
+            kb.block_task(conn, task_id, kind="capability", expected_run_id=run_id,
+                          reason=f"External {executor} ACP session produced no output and no changes (phantom completion blocked)")
+        raise RuntimeError(f"External {executor} ACP session produced zero output and no changes; completion blocked")
     with kb.connect_closing(board=board) as conn:
         if not kb.complete_task(conn,task_id,summary=text.strip() or f"External {executor} ACP session completed.",metadata=metadata,expected_run_id=run_id): raise RuntimeError("task was reclaimed or terminal")
     return text
