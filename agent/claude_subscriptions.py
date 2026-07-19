@@ -148,6 +148,34 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE claude_subscriptions"
                 " ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'"
             )
+    # Plan/quota fields (t_e0c5725b): paid_until = epoch when the paid period
+    # ends; plan_name / credit_allowance / billing_window describe the
+    # subscription's commercial plan so the dashboard can show "оплачено до
+    # 12.08, осталось 25 дней" and the pacing panel can fill non-Claude windows.
+    if "paid_until" not in cols:
+        with conn:
+            conn.execute(
+                "ALTER TABLE claude_subscriptions"
+                " ADD COLUMN paid_until REAL"
+            )
+    if "plan_name" not in cols:
+        with conn:
+            conn.execute(
+                "ALTER TABLE claude_subscriptions"
+                " ADD COLUMN plan_name TEXT NOT NULL DEFAULT ''"
+            )
+    if "credit_allowance" not in cols:
+        with conn:
+            conn.execute(
+                "ALTER TABLE claude_subscriptions"
+                " ADD COLUMN credit_allowance INTEGER"
+            )
+    if "billing_window" not in cols:
+        with conn:
+            conn.execute(
+                "ALTER TABLE claude_subscriptions"
+                " ADD COLUMN billing_window TEXT NOT NULL DEFAULT ''"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -400,8 +428,9 @@ def sync_registry(conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, A
 
 def update_subscription(name: str, **fields: Any) -> bool:
     """Update mutable metadata (display_name, notes, enabled, reserved,
-    max_concurrency)."""
-    allowed = {"display_name", "notes", "enabled", "reserved", "max_concurrency"}
+    max_concurrency, paid_until, plan_name, credit_allowance, billing_window)."""
+    allowed = {"display_name", "notes", "enabled", "reserved", "max_concurrency",
+               "paid_until", "plan_name", "credit_allowance", "billing_window"}
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not updates:
         return False
@@ -411,6 +440,11 @@ def update_subscription(name: str, **fields: Any) -> bool:
         updates["enabled"] = 1 if updates["enabled"] else 0
     if "reserved" in updates:
         updates["reserved"] = 1 if updates["reserved"] else 0
+    if "credit_allowance" in updates:
+        updates["credit_allowance"] = (
+            int(updates["credit_allowance"])
+            if updates["credit_allowance"] is not None else None
+        )
     conn = connect()
     try:
         assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -852,6 +886,7 @@ def pool_status() -> List[Dict[str, Any]]:
             cooling_until = row["cooling_until"]
             cooling = bool(cooling_until and float(cooling_until) > now)
             provider = _row_provider(row)
+            paid_until = row["paid_until"]
             status.append({
                 "name": row["name"],
                 "config_dir": row["config_dir"],
@@ -872,7 +907,98 @@ def pool_status() -> List[Dict[str, Any]]:
                 "burn_rate_tokens_per_hour": _burn_rate_tokens_per_hour(
                     conn, row["name"], now
                 ),
+                "paid_until": float(paid_until) if paid_until else None,
+                "plan_name": row["plan_name"] or "",
+                "credit_allowance": (
+                    int(row["credit_allowance"]) if row["credit_allowance"] else None
+                ),
+                "billing_window": row["billing_window"] or "",
             })
         return status
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Paid-period monitoring (t_e0c5725b)
+# ---------------------------------------------------------------------------
+
+def _days_left(paid_until: Optional[float], now: float) -> Optional[int]:
+    """Whole days remaining until paid_until, or None when unset."""
+    if paid_until is None:
+        return None
+    return max(0, int((float(paid_until) - now) // 86400))
+
+
+def expiring_subscriptions(
+    now: Optional[float] = None,
+    warn_days: tuple = (7, 2),
+) -> List[Dict[str, Any]]:
+    """Subscriptions whose paid period is expiring or expired.
+
+    Returns one dict per subscription with a non-NULL ``paid_until``,
+    annotated with ``days_left`` and ``expired``. Sorted by soonest first.
+    ``warn_days`` are the thresholds the caller uses to decide severity
+    (e.g. 7 = warning, 2 = urgent); they are not used for filtering —
+    every paid subscription is returned so the caller can choose.
+    """
+    now = time.time() if now is None else now
+    conn = connect()
+    try:
+        sync_registry(conn)
+        rows = conn.execute(
+            "SELECT name, provider, display_name, paid_until, plan_name"
+            " FROM claude_subscriptions"
+            " WHERE enabled = 1 AND paid_until IS NOT NULL"
+            " ORDER BY paid_until ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        paid_until = float(row["paid_until"])
+        days = _days_left(paid_until, now)
+        out.append({
+            "name": row["name"],
+            "provider": row["provider"] or PROVIDER_CLAUDE,
+            "display_name": row["display_name"] or "",
+            "plan_name": row["plan_name"] or "",
+            "paid_until": paid_until,
+            "days_left": days,
+            "expired": paid_until <= now,
+        })
+    return out
+
+
+def paid_period_warnings(
+    now: Optional[float] = None,
+    warn_days: tuple = (7, 2),
+) -> List[Dict[str, Any]]:
+    """Subscriptions within the warning window or already expired.
+
+    One entry per subscription whose paid period ends within
+    ``max(warn_days)`` days (or has already ended). Each carries a
+    ``severity`` derived from ``warn_days`` (first = 'warning',
+    second = 'urgent', expired = 'expired') and a human-readable
+    ``message`` suitable for a findings-store title.
+    """
+    now = time.time() if now is None else now
+    horizon = max(warn_days) if warn_days else 0
+    out = []
+    for sub in expiring_subscriptions(now=now):
+        days = sub["days_left"]
+        if days is None:
+            continue
+        if sub["expired"]:
+            severity = "expired"
+            msg = f"подписка {sub['name']} истекла"
+        elif days <= (warn_days[1] if len(warn_days) > 1 else 2):
+            severity = "urgent"
+            msg = f"подписка {sub['name']} истекает через {days} дн."
+        elif days <= horizon:
+            severity = "warning"
+            msg = f"подписка {sub['name']} истекает через {days} дн."
+        else:
+            continue
+        out.append({**sub, "severity": severity, "message": msg})
+    return out
