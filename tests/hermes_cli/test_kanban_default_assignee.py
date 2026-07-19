@@ -38,11 +38,16 @@ def _fake_spawn(*args, **kwargs):
 def test_unassigned_task_skipped_without_default_assignee(isolated_kanban_home):
     """Baseline: with no default_assignee, an unassigned ready task is
     skipped via the existing `skipped_unassigned` bucket and the DB row
-    is untouched."""
+    is untouched.
+
+    ``created_by`` is set so the create-gate (t_d5a8eafe) does not route
+    the task to triage — this test is about the dispatcher's handling of
+    a real unassigned task, not about anonymous junk.
+    """
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, created_by="test")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
     assert res.skipped_unassigned == [task_id]
@@ -56,11 +61,15 @@ def test_unassigned_task_skipped_without_default_assignee(isolated_kanban_home):
 def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_home):
     """Core #27145 contract: with default_assignee set, an unassigned ready
     task gets the assignment applied and dispatched on the same tick. The
-    DB row is mutated (assignee column + an 'assigned' event)."""
+    DB row is mutated (assignee column + an 'assigned' event).
+
+    ``created_by`` set so the create-gate (t_d5a8eafe) keeps the task in
+    ready — this test exercises the dispatcher fallback, not the gate.
+    """
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, created_by="test")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,
@@ -92,11 +101,15 @@ def test_dry_run_with_default_assignee_reports_without_mutating(isolated_kanban_
     """Dry-run mode: reports what WOULD happen (task in auto_assigned_default,
     spawn entry) but does NOT mutate the DB. Operators using
     `hermes kanban dispatch --dry-run` see the routing decision before
-    committing."""
+    committing.
+
+    ``created_by`` set so the create-gate (t_d5a8eafe) keeps the task in
+    ready — this test exercises dry-run dispatch, not the gate.
+    """
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, created_by="test")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -113,11 +126,16 @@ def test_dry_run_with_default_assignee_reports_without_mutating(isolated_kanban_
 def test_whitespace_default_assignee_treated_as_none(isolated_kanban_home):
     """Empty / whitespace-only default_assignee values must be treated as
     'no fallback set' so a misconfigured kanban.default_assignee=' '
-    doesn't surprise operators by silently routing unassigned tasks."""
+    doesn't surprise operators by silently routing unassigned tasks.
+
+    ``created_by`` set so the create-gate (t_d5a8eafe) keeps the task in
+    ready — this test is about the dispatcher's whitespace handling, not
+    the gate.
+    """
     kb, _home = isolated_kanban_home
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        task_id = kb.create_task(conn, title="t1", assignee=None)
+        task_id = kb.create_task(conn, title="t1", assignee=None, created_by="test")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=False,

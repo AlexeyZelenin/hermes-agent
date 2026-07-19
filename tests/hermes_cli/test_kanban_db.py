@@ -45,7 +45,7 @@ def _init_git_repo(repo: Path) -> None:
 def test_init_db_is_idempotent(kanban_home):
     # Second call should not error or drop data.
     with kb.connect() as conn:
-        kb.create_task(conn, title="persisted")
+        kb.create_task(conn, title="persisted", created_by="test")
     kb.init_db()
     with kb.connect() as conn:
         tasks = kb.list_tasks(conn)
@@ -224,8 +224,8 @@ def test_create_task_no_parents_is_ready(kanban_home):
 
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
-        p = kb.create_task(conn, title="parent")
-        c = kb.create_task(conn, title="child", parents=[p])
+        p = kb.create_task(conn, title="parent", created_by="test")
+        c = kb.create_task(conn, title="child", parents=[p], created_by="test")
         assert kb.get_task(conn, c).status == "todo"
         kb.complete_task(conn, p, result="ok")
         assert kb.get_task(conn, c).status == "ready"
@@ -233,12 +233,12 @@ def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
 
 def test_create_task_unknown_parent_errors(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
-        kb.create_task(conn, title="orphan", parents=["t_ghost"])
+        kb.create_task(conn, title="orphan", parents=["t_ghost"], created_by="test")
 
 
 def test_workspace_kind_validation(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="workspace_kind"):
-        kb.create_task(conn, title="bad ws", workspace_kind="cloud")
+        kb.create_task(conn, title="bad ws", workspace_kind="cloud", created_by="test")
 
 
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
@@ -250,6 +250,7 @@ def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
             workspace_kind="worktree",
             workspace_path=str(target),
             branch_name=" wt/t6-wire ",
+            created_by="test",
         )
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
@@ -267,6 +268,7 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
             title="bad branch",
             workspace_kind="scratch",
             branch_name="wt/bad",
+            created_by="test",
         )
 
 
@@ -276,8 +278,8 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
 
 def test_link_demotes_ready_child_to_todo_when_parent_not_done(kanban_home):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b")
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", created_by="test")
         assert kb.get_task(conn, b).status == "ready"
         kb.link_tasks(conn, a, b)
         assert kb.get_task(conn, b).status == "todo"
@@ -285,9 +287,9 @@ def test_link_demotes_ready_child_to_todo_when_parent_not_done(kanban_home):
 
 def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a")
+        a = kb.create_task(conn, title="a", created_by="test")
         kb.complete_task(conn, a)
-        b = kb.create_task(conn, title="b")
+        b = kb.create_task(conn, title="b", created_by="test")
         assert kb.get_task(conn, b).status == "ready"
         kb.link_tasks(conn, a, b)
         assert kb.get_task(conn, b).status == "ready"
@@ -295,16 +297,16 @@ def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
 
 def test_link_rejects_self_loop(kanban_home):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a")
+        a = kb.create_task(conn, title="a", created_by="test")
         with pytest.raises(ValueError, match="itself"):
             kb.link_tasks(conn, a, a)
 
 
 def test_link_detects_cycle(kanban_home):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b", parents=[a])
-        c = kb.create_task(conn, title="c", parents=[b])
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", parents=[a], created_by="test")
+        c = kb.create_task(conn, title="c", parents=[b], created_by="test")
         with pytest.raises(ValueError, match="cycle"):
             kb.link_tasks(conn, c, a)
         with pytest.raises(ValueError, match="cycle"):
@@ -313,9 +315,9 @@ def test_link_detects_cycle(kanban_home):
 
 def test_recompute_ready_cascades_through_chain(kanban_home):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b", parents=[a])
-        c = kb.create_task(conn, title="c", parents=[b])
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", parents=[a], created_by="test")
+        c = kb.create_task(conn, title="c", parents=[b], created_by="test")
         assert [kb.get_task(conn, x).status for x in (a, b, c)] == \
                ["ready", "todo", "todo"]
         kb.complete_task(conn, a)
@@ -355,9 +357,9 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
 
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a")
-        b = kb.create_task(conn, title="b")
-        c = kb.create_task(conn, title="c", parents=[a, b])
+        a = kb.create_task(conn, title="a", created_by="test")
+        b = kb.create_task(conn, title="b", created_by="test")
+        c = kb.create_task(conn, title="c", parents=[a, b], created_by="test")
         kb.complete_task(conn, a)
         assert kb.get_task(conn, c).status == "todo"
         kb.complete_task(conn, b)
@@ -389,9 +391,9 @@ def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):
 
 def test_claim_fails_on_non_ready(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="x")
+        t = kb.create_task(conn, title="x", created_by="test")
         # Move to todo by introducing an unsatisfied parent.
-        p = kb.create_task(conn, title="p")
+        p = kb.create_task(conn, title="p", created_by="test")
         kb.link_tasks(conn, p, t)
         assert kb.get_task(conn, t).status == "todo"
         assert kb.claim_task(conn, t) is None
@@ -411,8 +413,8 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
 
 def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        child = kb.create_task(conn, title="child", parents=[parent], created_by="test")
         assert kb.get_task(conn, child).status == "todo"
         assert kb.schedule_task(conn, child, reason="wait until tomorrow") is True
 
@@ -1162,7 +1164,7 @@ def test_concurrent_claims_only_one_wins(kanban_home):
 
 def test_complete_records_result(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="x")
+        t = kb.create_task(conn, title="x", created_by="test")
         assert kb.complete_task(conn, t, result="done and dusted")
         task = kb.get_task(conn, t)
     assert task.status == "done"
@@ -1492,7 +1494,7 @@ def test_list_tasks_assignee_filter_case_insensitive(kanban_home):
 
 def test_archive_hides_from_default_list(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="x")
+        t = kb.create_task(conn, title="x", created_by="test")
         kb.complete_task(conn, t)
         assert kb.archive_task(conn, t)
         assert len(kb.list_tasks(conn)) == 0
@@ -1501,7 +1503,7 @@ def test_archive_hides_from_default_list(kanban_home):
 
 def test_delete_archived_task_removes_related_rows(kanban_home):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
+        parent = kb.create_task(conn, title="parent", created_by="test")
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
         kb.claim_task(conn, tid)
@@ -1525,7 +1527,7 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
 
 def test_delete_archived_task_rejects_non_archived_rows(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="live")
+        tid = kb.create_task(conn, title="live", created_by="test")
         assert kb.delete_archived_task(conn, tid) is False
         assert kb.get_task(conn, tid) is not None
 
@@ -1533,9 +1535,9 @@ def test_delete_archived_task_rejects_non_archived_rows(kanban_home):
 def test_list_tasks_order_by(kanban_home):
     with kb.connect() as conn:
         # Create tasks with different titles and priorities
-        t_a = kb.create_task(conn, title="alpha", priority=1)
-        t_b = kb.create_task(conn, title="beta", priority=2)
-        t_c = kb.create_task(conn, title="gamma", priority=1)
+        t_a = kb.create_task(conn, title="alpha", priority=1, created_by="test")
+        t_b = kb.create_task(conn, title="beta", priority=2, created_by="test")
+        t_c = kb.create_task(conn, title="gamma", priority=1, created_by="test")
 
         # Default sort: priority DESC, created ASC
         default = kb.list_tasks(conn)
@@ -1581,8 +1583,8 @@ def test_delete_task_returns_false_for_missing_task(kanban_home):
 
 def test_delete_task_cascades_links(kanban_home):
     with kb.connect() as conn:
-        p = kb.create_task(conn, title="parent")
-        c = kb.create_task(conn, title="child", parents=[p])
+        p = kb.create_task(conn, title="parent", created_by="test")
+        c = kb.create_task(conn, title="child", parents=[p], created_by="test")
         child = kb.get_task(conn, c)
         assert child is not None and child.status == "todo"
         kb.delete_task(conn, p)
@@ -1597,7 +1599,7 @@ def test_delete_task_cascades_links(kanban_home):
 
 def test_comments_recorded_in_order(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="x")
+        t = kb.create_task(conn, title="x", created_by="test")
         kb.add_comment(conn, t, "user", "first")
         kb.add_comment(conn, t, "researcher", "second")
         comments = kb.list_comments(conn, t)
@@ -1607,7 +1609,7 @@ def test_comments_recorded_in_order(kanban_home):
 
 def test_empty_comment_rejected(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="x")
+        t = kb.create_task(conn, title="x", created_by="test")
         with pytest.raises(ValueError, match="body is required"):
             kb.add_comment(conn, t, "user", "")
 
@@ -1626,9 +1628,9 @@ def test_events_capture_lifecycle(kanban_home):
 
 def test_worker_context_includes_parent_results_and_comments(kanban_home):
     with kb.connect() as conn:
-        p = kb.create_task(conn, title="p")
+        p = kb.create_task(conn, title="p", created_by="test")
         kb.complete_task(conn, p, result="PARENT_RESULT_MARKER")
-        c = kb.create_task(conn, title="child", parents=[p])
+        c = kb.create_task(conn, title="child", parents=[p], created_by="test")
         kb.add_comment(conn, c, "user", "CLARIFICATION_MARKER")
         ctx = kb.build_worker_context(conn, c)
     assert "PARENT_RESULT_MARKER" in ctx
@@ -1655,7 +1657,7 @@ def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
 
 def test_dispatch_skips_unassigned(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="floater")
+        t = kb.create_task(conn, title="floater", created_by="test")
         res = kb.dispatch_once(conn, dry_run=True)
     assert t in res.skipped_unassigned
     assert t not in res.skipped_nonspawnable
@@ -2188,7 +2190,7 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
 
 def test_scratch_workspace_created_under_hermes_home(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="x")
+        t = kb.create_task(conn, title="x", created_by="test")
         task = kb.get_task(conn, t)
         assert task is not None
         ws = kb.resolve_workspace(task)
@@ -2201,7 +2203,8 @@ def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
     target = tmp_path / "my-vault"
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="biz", workspace_kind="dir", workspace_path=str(target)
+            conn, title="biz", workspace_kind="dir", workspace_path=str(target),
+            created_by="test",
         )
         task = kb.get_task(conn, t)
         assert task is not None
@@ -2215,7 +2218,8 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
     _init_git_repo(repo)
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="ship", workspace_kind="worktree", workspace_path=str(repo)
+            conn, title="ship", workspace_kind="worktree", workspace_path=str(repo),
+            created_by="test",
         )
         task = kb.get_task(conn, t)
         assert task is not None
@@ -2258,7 +2262,8 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
     kb.create_board("wt-default-board", default_workdir=str(repo))
     with kb.connect(board="wt-default-board") as conn:
         t = kb.create_task(
-            conn, title="ship", workspace_kind="worktree", board="wt-default-board"
+            conn, title="ship", workspace_kind="worktree", board="wt-default-board",
+            created_by="test",
         )
         task = kb.get_task(conn, t)
         assert task is not None
@@ -2282,7 +2287,7 @@ def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeyp
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
+        t = kb.create_task(conn, title="ship", workspace_kind="worktree", created_by="test")
         task = kb.get_task(conn, t)
         assert task is not None
         with pytest.raises(ValueError, match="default_workdir"):
@@ -2301,6 +2306,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
             workspace_kind="worktree",
             workspace_path=str(target),
             branch_name=branch,
+            created_by="test",
         )
         task = kb.get_task(conn, t)
         assert task is not None
@@ -2437,7 +2443,7 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
 def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
     """A scratch workspace under the kanban workspaces root is removed."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="scratchy")
+        t = kb.create_task(conn, title="scratchy", created_by="test")
         task = kb.get_task(conn, t)
         assert task is not None
         ws = kb.resolve_workspace(task)
@@ -2450,7 +2456,7 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="render chart")
+        t = kb.create_task(conn, title="render chart", created_by="test")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
@@ -2486,7 +2492,7 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
 def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
     """A declared scratch deliverable must not disappear behind a false Done."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="missing report")
+        t = kb.create_task(conn, title="missing report", created_by="test")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
@@ -2508,7 +2514,7 @@ def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
 def test_complete_task_preserves_legacy_artifact_path_from_summary(kanban_home):
     """Summary-only workers keep the file they tell the user was delivered."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="legacy report")
+        t = kb.create_task(conn, title="legacy report", created_by="test")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
@@ -2537,7 +2543,7 @@ def test_complete_task_leaves_non_scratch_artifact_paths_unchanged(
     external.write_text("keep me here", encoding="utf-8")
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="external report")
+        t = kb.create_task(conn, title="external report", created_by="test")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
@@ -2562,7 +2568,7 @@ def test_complete_task_leaves_non_scratch_artifact_paths_unchanged(
 def test_complete_task_persists_duplicate_scratch_artifact_names(kanban_home):
     """Scratch artifact persistence does not overwrite duplicate basenames."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="render reports")
+        t = kb.create_task(conn, title="render reports", created_by="test")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
@@ -2594,7 +2600,7 @@ def test_complete_task_persists_board_scratch_artifacts_to_board_attachments(kan
     kb.create_board("work-proj")
 
     with kb.connect(board="work-proj") as conn:
-        t = kb.create_task(conn, title="board chart", board="work-proj")
+        t = kb.create_task(conn, title="board chart", board="work-proj", created_by="test")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task, board="work-proj")
         kb.set_workspace_path(conn, t, ws)
@@ -2630,7 +2636,7 @@ def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_pa
     (real_source / "README.md").write_text("important", encoding="utf-8")
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship")
+        t = kb.create_task(conn, title="ship", created_by="test")
         # Simulate the bad state directly: workspace_kind='scratch' (default)
         # but workspace_path pointing at the user's real source tree, which is
         # exactly what board.default_workdir produces when the task is created
@@ -2664,7 +2670,7 @@ def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeyp
     kb.init_db()
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ext")
+        t = kb.create_task(conn, title="ext", created_by="test")
         scratch_dir = workspaces_override / t
         scratch_dir.mkdir()
         conn.execute(
@@ -2689,8 +2695,8 @@ def test_cleanup_workspace_deferred_while_child_active(kanban_home):
     A's completion, before B ever ran.
     """
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child")
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        child = kb.create_task(conn, title="child", created_by="test")
         kb.link_tasks(conn, parent, child)  # child depends on parent
         p_task = kb.get_task(conn, parent)
         parent_ws = kb.resolve_workspace(p_task)
@@ -2707,8 +2713,8 @@ def test_cleanup_workspace_deferred_while_child_active(kanban_home):
 def test_cleanup_workspace_swept_after_last_child_completes(kanban_home):
     """Once all children are terminal, the deferred parent scratch dir is removed."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child")
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        child = kb.create_task(conn, title="child", created_by="test")
         kb.link_tasks(conn, parent, child)
         p_task = kb.get_task(conn, parent)
         parent_ws = kb.resolve_workspace(p_task)
@@ -2741,10 +2747,11 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
     child_dir = tmp_path / "persistent-child"
     child_dir.mkdir()
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="scratch parent")
+        parent = kb.create_task(conn, title="scratch parent", created_by="test")
         child = kb.create_task(
             conn, title="dir child", workspace_kind="dir",
             workspace_path=str(child_dir),
+            created_by="test",
         )
         kb.link_tasks(conn, parent, child)
         p_task = kb.get_task(conn, parent)
@@ -2779,7 +2786,8 @@ def test_janitor_flags_dirty_dir_workspace(kanban_home, tmp_path):
 
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="build", workspace_kind="dir", workspace_path=str(repo)
+            conn, title="build", workspace_kind="dir", workspace_path=str(repo),
+            created_by="test",
         )
         assert kb.complete_task(conn, t, result="done")
 
@@ -2811,7 +2819,8 @@ def test_janitor_silent_on_clean_dir_workspace(kanban_home, tmp_path):
 
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="clean build", workspace_kind="dir", workspace_path=str(repo)
+            conn, title="clean build", workspace_kind="dir", workspace_path=str(repo),
+            created_by="test",
         )
         assert kb.complete_task(conn, t, result="done")
         assert _dirty_tree_events(conn, t) == []
@@ -2839,6 +2848,7 @@ def test_janitor_detects_stray_files_outside_workspace(kanban_home, tmp_path):
         t = kb.create_task(
             conn, title="scoped build", workspace_kind="dir",
             workspace_path=str(workspace),
+            created_by="test",
         )
         assert kb.complete_task(conn, t, result="done")
         payload = _dirty_tree_events(conn, t)[0].payload
@@ -2851,7 +2861,7 @@ def test_janitor_detects_stray_files_outside_workspace(kanban_home, tmp_path):
 def test_janitor_ignores_scratch_workspace(kanban_home):
     """Scratch workspaces are wiped on completion — the janitor must not fire."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="scratchy")
+        t = kb.create_task(conn, title="scratchy", created_by="test")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
@@ -2867,7 +2877,8 @@ def test_janitor_ignores_dir_workspace_not_in_git(kanban_home, tmp_path):
 
     with kb.connect() as conn:
         t = kb.create_task(
-            conn, title="notes", workspace_kind="dir", workspace_path=str(plain)
+            conn, title="notes", workspace_kind="dir", workspace_path=str(plain),
+            created_by="test",
         )
         assert kb.complete_task(conn, t, result="done")
         assert _dirty_tree_events(conn, t) == []
@@ -2888,6 +2899,7 @@ def test_janitor_flags_dirty_worktree(kanban_home, tmp_path):
         t = kb.create_task(
             conn, title="wt build", workspace_kind="worktree",
             workspace_path=str(worktree), branch_name="wt/x",
+            created_by="test",
         )
         assert kb.complete_task(conn, t, result="done")
         payload = _dirty_tree_events(conn, t)[0].payload
@@ -2936,7 +2948,7 @@ def test_anchor_janitor_restores_clean_off_trunk_anchor(kanban_home, tmp_path, m
     assert _current_branch(repo) == "task/t_stranded"
 
     with kb.connect(board="anchor-board") as conn:
-        t = kb.create_task(conn, title="ship", board="anchor-board")
+        t = kb.create_task(conn, title="ship", board="anchor-board", created_by="test")
         assert kb.complete_task(conn, t, result="done")
 
         events = _anchor_events(conn, t)
@@ -2963,7 +2975,7 @@ def test_anchor_janitor_reports_dirty_anchor_without_clobber(kanban_home, tmp_pa
     (repo / "wip.py").write_text("x = 1\n", encoding="utf-8")  # untracked → dirty
 
     with kb.connect(board="anchor-dirty-board") as conn:
-        t = kb.create_task(conn, title="ship", board="anchor-dirty-board")
+        t = kb.create_task(conn, title="ship", board="anchor-dirty-board", created_by="test")
         assert kb.complete_task(conn, t, result="done")
 
         events = _anchor_events(conn, t)
@@ -2990,7 +3002,7 @@ def test_anchor_janitor_silent_when_on_trunk_and_clean(kanban_home, tmp_path, mo
     assert _current_branch(repo) == "main"
 
     with kb.connect(board="anchor-clean-board") as conn:
-        t = kb.create_task(conn, title="ship", board="anchor-clean-board")
+        t = kb.create_task(conn, title="ship", board="anchor-clean-board", created_by="test")
         assert kb.complete_task(conn, t, result="done")
         assert _anchor_events(conn, t) == []
         assert [c for c in kb.list_comments(conn, t) if c.author == "janitor"] == []
@@ -2999,7 +3011,7 @@ def test_anchor_janitor_silent_when_on_trunk_and_clean(kanban_home, tmp_path, mo
 def test_anchor_janitor_noop_without_board_default_workdir(kanban_home):
     """No board default_workdir → no anchor to guard → the janitor stays silent."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship")
+        t = kb.create_task(conn, title="ship", created_by="test")
         assert kb.complete_task(conn, t, result="done")
         assert _anchor_events(conn, t) == []
 
@@ -3065,9 +3077,9 @@ def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
 
 def test_tenant_column_filters_listings(kanban_home):
     with kb.connect() as conn:
-        kb.create_task(conn, title="a1", tenant="biz-a")
-        kb.create_task(conn, title="b1", tenant="biz-b")
-        kb.create_task(conn, title="shared")  # no tenant
+        kb.create_task(conn, title="a1", tenant="biz-a", created_by="test")
+        kb.create_task(conn, title="b1", tenant="biz-b", created_by="test")
+        kb.create_task(conn, title="shared", created_by="test")  # no tenant
         biz_a = kb.list_tasks(conn, tenant="biz-a")
         biz_b = kb.list_tasks(conn, tenant="biz-b")
     assert [t.title for t in biz_a] == ["a1"]
@@ -3076,8 +3088,8 @@ def test_tenant_column_filters_listings(kanban_home):
 
 def test_list_tasks_filters_workflow_template_and_step(kanban_home):
     with kb.connect() as conn:
-        ta = kb.create_task(conn, title="alpha")
-        tb = kb.create_task(conn, title="beta")
+        ta = kb.create_task(conn, title="alpha", created_by="test")
+        tb = kb.create_task(conn, title="beta", created_by="test")
         conn.execute(
             "UPDATE tasks SET workflow_template_id=?, current_step_key=? WHERE id=?",
             ("wf1", "step_x", ta),
@@ -3117,7 +3129,7 @@ def test_list_runs_filters_by_outcome_value(kanban_home):
 
 def test_tenant_propagates_to_events(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="tenant-task", tenant="biz-a")
+        t = kb.create_task(conn, title="tenant-task", tenant="biz-a", created_by="test")
         events = kb.list_events(conn, t)
     # The "created" event should have tenant in its payload.
     created = [e for e in events if e.kind == "created"]
@@ -3131,7 +3143,8 @@ def test_tenant_propagates_to_events(kanban_home):
 def test_create_task_stamps_session_id(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(
-            conn, title="from chat", session_id="acp-sess-123"
+            conn, title="from chat", session_id="acp-sess-123",
+            created_by="test",
         )
         t = kb.get_task(conn, tid)
     assert t is not None
@@ -3140,7 +3153,7 @@ def test_create_task_stamps_session_id(kanban_home):
 
 def test_create_task_session_id_defaults_to_none(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="cli-created")
+        tid = kb.create_task(conn, title="cli-created", created_by="test")
         t = kb.get_task(conn, tid)
     assert t is not None
     assert t.session_id is None
@@ -3148,10 +3161,10 @@ def test_create_task_session_id_defaults_to_none(kanban_home):
 
 def test_session_id_filters_listings(kanban_home):
     with kb.connect() as conn:
-        kb.create_task(conn, title="s1-a", session_id="sess-1")
-        kb.create_task(conn, title="s1-b", session_id="sess-1")
-        kb.create_task(conn, title="s2-a", session_id="sess-2")
-        kb.create_task(conn, title="cli-only")  # no session
+        kb.create_task(conn, title="s1-a", session_id="sess-1", created_by="test")
+        kb.create_task(conn, title="s1-b", session_id="sess-1", created_by="test")
+        kb.create_task(conn, title="s2-a", session_id="sess-2", created_by="test")
+        kb.create_task(conn, title="cli-only", created_by="test")  # no session
         sess1 = kb.list_tasks(conn, session_id="sess-1")
         sess2 = kb.list_tasks(conn, session_id="sess-2")
         unscoped = kb.list_tasks(conn)
@@ -3179,14 +3192,17 @@ def test_session_id_compose_with_tenant_filter(kanban_home):
     the filters must AND, not replace."""
     with kb.connect() as conn:
         kb.create_task(
-            conn, title="match", tenant="scarf:foo", session_id="acp-x"
+            conn, title="match", tenant="scarf:foo", session_id="acp-x",
+            created_by="test",
         )
         kb.create_task(
-            conn, title="wrong-tenant", tenant="other", session_id="acp-x"
+            conn, title="wrong-tenant", tenant="other", session_id="acp-x",
+            created_by="test",
         )
         kb.create_task(
             conn, title="wrong-session",
             tenant="scarf:foo", session_id="acp-y",
+            created_by="test",
         )
         rows = kb.list_tasks(
             conn, tenant="scarf:foo", session_id="acp-x"
@@ -3355,7 +3371,7 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, default_home)
         kb.init_db()
         with kb.connect() as conn:
-            task_id = kb.create_task(conn, title="cross-profile")
+            task_id = kb.create_task(conn, title="cross-profile", created_by="test")
 
         # Worker switches to the profile HERMES_HOME and reads.
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
@@ -3669,7 +3685,7 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     )
 
     # DB still usable end-to-end — create + list a task
-    t = kb.create_task(conn, title="post-fallback task")
+    t = kb.create_task(conn, title="post-fallback task", created_by="test")
     tasks = kb.list_tasks(conn)
     assert any(row.id == t for row in tasks)
     conn.close()
@@ -3687,15 +3703,15 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     """
     with kb.connect() as conn:
         # A is done.
-        a = kb.create_task(conn, title="parent-done")
+        a = kb.create_task(conn, title="parent-done", created_by="test")
         kb.complete_task(conn, a)
 
         # C is running (not done) — blocks child B.
-        c = kb.create_task(conn, title="parent-running")
+        c = kb.create_task(conn, title="parent-running", created_by="test")
         kb.claim_task(conn, c, claimer="worker:1")
 
         # B depends on both A (done) and C (running) → stays todo.
-        b = kb.create_task(conn, title="child", parents=[a, c])
+        b = kb.create_task(conn, title="child", parents=[a, c], created_by="test")
         assert kb.get_task(conn, b).status == "todo"
 
         # Remove the blocking dependency C → B.
@@ -3718,8 +3734,8 @@ def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
     stuck in ``todo`` until a later dispatcher tick.
     """
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="obsolete parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="obsolete parent", created_by="test")
+        child = kb.create_task(conn, title="child", parents=[parent], created_by="test")
 
         assert kb.get_task(conn, child).status == "todo"
         assert kb.archive_task(conn, parent) is True
@@ -3733,10 +3749,10 @@ def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
 def test_create_child_with_historical_archived_parent_is_ready(kanban_home):
     """An archived parent link is historical and must not gate new children."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="trashed parent")
+        parent = kb.create_task(conn, title="trashed parent", created_by="test")
         assert kb.archive_task(conn, parent) is True
 
-        child = kb.create_task(conn, title="child", parents=[parent])
+        child = kb.create_task(conn, title="child", parents=[parent], created_by="test")
 
         assert kb.get_task(conn, child).status == "ready"
 
@@ -3744,26 +3760,26 @@ def test_create_child_with_historical_archived_parent_is_ready(kanban_home):
 def test_unblock_ignores_archived_parent_but_not_active_parent(kanban_home):
     """Unblocking uses the same parent gate as creation and dispatch."""
     with kb.connect() as conn:
-        archived = kb.create_task(conn, title="trashed parent")
-        active = kb.create_task(conn, title="active parent")
+        archived = kb.create_task(conn, title="trashed parent", created_by="test")
+        active = kb.create_task(conn, title="active parent", created_by="test")
         assert kb.archive_task(conn, archived) is True
 
-        blocked_child = kb.create_task(conn, title="blocked child", parents=[archived])
+        blocked_child = kb.create_task(conn, title="blocked child", parents=[archived], created_by="test")
         assert kb.get_task(conn, blocked_child).status == "ready"
         assert kb.claim_task(conn, blocked_child) is not None
         assert kb.block_task(conn, blocked_child, reason="needs input") is True
         assert kb.unblock_task(conn, blocked_child) is True
         assert kb.get_task(conn, blocked_child).status == "ready"
 
-        active_child = kb.create_task(conn, title="active child", parents=[archived, active])
+        active_child = kb.create_task(conn, title="active child", parents=[archived, active], created_by="test")
         assert kb.get_task(conn, active_child).status == "todo"
 
 
 def test_linking_historical_archived_parent_preserves_ready_child(kanban_home):
     """Adding an archived historical link must not demote an eligible child."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="trashed parent")
-        child = kb.create_task(conn, title="ready child")
+        parent = kb.create_task(conn, title="trashed parent", created_by="test")
+        child = kb.create_task(conn, title="ready child", created_by="test")
         assert kb.archive_task(conn, parent) is True
         assert kb.get_task(conn, child).status == "ready"
 
@@ -4144,7 +4160,7 @@ def test_task_dict_survives_corrupt_created_at(tmp_path, monkeypatch):
     # bug that produced corrupt rows).
     conn = kb.connect()
     try:
-        good_id = kb.create_task(conn, title="good")
+        good_id = kb.create_task(conn, title="good", created_by="test")
         # Now write a row with corrupt created_at directly.
         conn.execute(
             "UPDATE tasks SET created_at = ? WHERE id = ?",
@@ -4175,7 +4191,7 @@ def test_create_task_scratch_without_workspace_ignores_board_default_workdir(kan
     kb.create_board("work-proj", default_workdir=default_wd)
 
     with kb.connect(board="work-proj") as conn:
-        tid = kb.create_task(conn, title="scratch-task", board="work-proj")
+        tid = kb.create_task(conn, title="scratch-task", board="work-proj", created_by="test")
         t = kb.get_task(conn, tid)
     assert t is not None
     assert t.workspace_kind == "scratch"
@@ -4193,6 +4209,7 @@ def test_create_task_dir_without_workspace_inherits_board_default_workdir(kanban
             title="inherited",
             workspace_kind="dir",
             board="work-proj-dir",
+            created_by="test",
         )
         t = kb.get_task(conn, tid)
     assert t is not None
@@ -4204,7 +4221,7 @@ def test_create_task_without_workspace_no_default_stays_none(kanban_home):
     kb.create_board("empty-board")
 
     with kb.connect(board="empty-board") as conn:
-        tid = kb.create_task(conn, title="none", board="empty-board")
+        tid = kb.create_task(conn, title="none", board="empty-board", created_by="test")
         t = kb.get_task(conn, tid)
     assert t is not None
     assert t.workspace_path is None
@@ -4216,7 +4233,7 @@ def test_create_task_with_explicit_workspace_ignores_board_default(kanban_home):
 
     explicit = "/my/explicit/path"
     with kb.connect(board="custom-ws-board") as conn:
-        tid = kb.create_task(conn, title="explicit", workspace_path=explicit, board="custom-ws-board")
+        tid = kb.create_task(conn, title="explicit", workspace_path=explicit, board="custom-ws-board", created_by="test")
         t = kb.get_task(conn, tid)
     assert t is not None
     assert t.workspace_path == explicit
@@ -4358,7 +4375,7 @@ def test_dispatch_review_spawns_with_correct_skills(
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="review floater")
+        t = kb.create_task(conn, title="review floater", created_by="test")
         _set_task_status(conn, t, "review")
         res = kb.dispatch_once(conn, dry_run=True)
     assert t in res.skipped_unassigned
@@ -4824,7 +4841,7 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     # And once the lock clears, normal access still works.
     monkeypatch.setattr(kb.sqlite3, "connect", real_connect)
     with kb.connect(db_path=db_path) as conn:
-        kb.create_task(conn, title="still here")
+        kb.create_task(conn, title="still here", created_by="test")
         titles = [t.title for t in kb.list_tasks(conn)]
     assert "still here" in titles
 
@@ -4837,7 +4854,7 @@ def test_init_db_allows_missing_then_healthy(tmp_path):
 
     # Idempotent on a healthy DB: data survives a second init.
     with kb.connect(db_path=db_path) as conn:
-        kb.create_task(conn, title="keeps")
+        kb.create_task(conn, title="keeps", created_by="test")
     kb.init_db(db_path=db_path)
     with kb.connect(db_path=db_path) as conn:
         tasks = kb.list_tasks(conn)
@@ -4857,8 +4874,8 @@ def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
     import logging
 
     with kb.connect() as conn:
-        t1 = kb.create_task(conn, title="first scratch")
-        t2 = kb.create_task(conn, title="second scratch")
+        t1 = kb.create_task(conn, title="first scratch", created_by="test")
+        t2 = kb.create_task(conn, title="second scratch", created_by="test")
 
     # Sentinel must not exist yet on a fresh install.
     assert not kb._scratch_tip_shown()
@@ -4922,8 +4939,8 @@ def test_maybe_emit_scratch_tip_skips_non_scratch_workspaces(kanban_home, caplog
     import logging
 
     with kb.connect() as conn:
-        t_wt = kb.create_task(conn, title="worktree task")
-        t_dir = kb.create_task(conn, title="dir task")
+        t_wt = kb.create_task(conn, title="worktree task", created_by="test")
+        t_dir = kb.create_task(conn, title="dir task", created_by="test")
 
     assert not kb._scratch_tip_shown()
 
@@ -4987,7 +5004,7 @@ def test_connect_pragmas_applied_on_reconnect(tmp_path):
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     # First connection: write a task and close.
     with kb.connect(db_path=db_path) as conn:
-        kb.create_task(conn, title="reconnect-check")
+        kb.create_task(conn, title="reconnect-check", created_by="test")
     # Force re-init path by discarding path cache.
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     # Second connection: pragmas must still be applied.
@@ -5004,7 +5021,7 @@ def test_pragmas_not_accidentally_disabled_by_migrate_path(tmp_path):
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     # Initialise with a fresh connect so schema + init run.
     with kb.connect(db_path=db_path) as conn:
-        kb.create_task(conn, title="pre-migration-task")
+        kb.create_task(conn, title="pre-migration-task", created_by="test")
     # Simulate a re-entry through the init/migration path by discarding path cache.
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with kb.connect(db_path=db_path) as conn:
@@ -5367,7 +5384,7 @@ def test_connect_closing_yields_usable_connection(tmp_path):
     db_path = tmp_path / "kanban.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with kb.connect_closing(db_path=db_path) as conn:
-        tid = kb.create_task(conn, title="closing-cm test")
+        tid = kb.create_task(conn, title="closing-cm test", created_by="test")
         task = kb.get_task(conn, tid)
         assert task is not None
         assert task.title == "closing-cm test"
@@ -5395,7 +5412,7 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
 
 def test_updated_at_seeded_to_created_at_on_insert(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="fresh")
+        tid = kb.create_task(conn, title="fresh", created_by="test")
         t = kb.get_task(conn, tid)
     assert t.updated_at is not None
     assert t.updated_at == t.created_at
@@ -5403,7 +5420,7 @@ def test_updated_at_seeded_to_created_at_on_insert(kanban_home):
 
 def test_updated_at_bumps_on_meaningful_edit(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="before")
+        tid = kb.create_task(conn, title="before", created_by="test")
         # Pin created_at/updated_at into the past (created_at is NOT watched by the
         # trigger, so this write does not itself bump updated_at).
         conn.execute(
@@ -5419,7 +5436,7 @@ def test_updated_at_bumps_on_meaningful_edit(kanban_home):
 
 def test_updated_at_not_bumped_by_liveness_churn(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="running task")
+        tid = kb.create_task(conn, title="running task", created_by="test")
         conn.execute("UPDATE tasks SET updated_at = 1000 WHERE id = ?", (tid,))
         conn.commit()
         # Heartbeat / claim / pid churn must NOT count as a meaningful update.
@@ -5434,7 +5451,7 @@ def test_updated_at_not_bumped_by_liveness_churn(kanban_home):
 def test_updated_at_migration_backfills_from_created_at(kanban_home):
     """A legacy row without updated_at back-fills to created_at, not NULL/now."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="legacy")
+        tid = kb.create_task(conn, title="legacy", created_by="test")
         conn.execute("UPDATE tasks SET created_at = 500 WHERE id = ?", (tid,))
         # Simulate a pre-migration row: drop the value so the backfill has work.
         conn.execute("UPDATE tasks SET updated_at = NULL WHERE id = ?", (tid,))

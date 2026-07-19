@@ -102,8 +102,8 @@ def test_pause_missing_task(kanban_home):
 
 def test_pause_triage_and_todo_allowed(kanban_home):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        child = kb.create_task(conn, title="child", parents=[parent], created_by="test")
         assert kb.get_task(conn, child).status == "todo"
         ok, _ = kb.pause_task(conn, child)
         assert ok is True

@@ -82,7 +82,7 @@ def test_decompose_returns_none_when_task_missing(kanban_home):
 
 def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="already a real task")  # not triage
+        tid = kb.create_task(conn, title="already a real task", created_by="test")  # not triage
         result = kb.decompose_triage_task(
             conn,
             tid,

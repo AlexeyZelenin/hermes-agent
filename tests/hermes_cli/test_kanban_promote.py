@@ -136,7 +136,7 @@ def test_promote_dry_run_reports_dependency_failure(conn):
 
 
 def test_promote_rejects_non_todo_status(conn):
-    tid = kb.create_task(conn, title="standalone")
+    tid = kb.create_task(conn, title="standalone", created_by="test")
     assert kb.get_task(conn, tid).status == "ready"
     ok, err = kb.promote_task(conn, tid, actor="tester")
     assert ok is False
@@ -150,7 +150,7 @@ def test_promote_rejects_unknown_task(conn):
 
 
 def test_promote_blocked_task_works(conn):
-    tid = kb.create_task(conn, title="t")
+    tid = kb.create_task(conn, title="t", created_by="test")
     conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
     ok, err = kb.promote_task(
         conn, tid, actor="tester", reason="ready now"
@@ -179,9 +179,9 @@ def _promote_ns(task_id, *, ids=None, reason=None, force=False,
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
+        parent = kb.create_task(conn, title="parent", created_by="test")
         children = [
-            kb.create_task(conn, title=f"c{i}", parents=[parent])
+            kb.create_task(conn, title=f"c{i}", parents=[parent], created_by="test")
             for i in range(3)
         ]
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
@@ -198,8 +198,8 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
 def test_cli_promote_bulk_partial_failure_exits_1(kanban_home, capsys):
     """Bulk with one bad id: good ones still promote, exit code reflects failure."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        good = kb.create_task(conn, title="good", parents=[parent])
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        good = kb.create_task(conn, title="good", parents=[parent], created_by="test")
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
     rc = kb_cli._cmd_promote(_promote_ns(good, ids=["t_nope"]))
     assert rc == 1
@@ -212,9 +212,9 @@ def test_cli_promote_bulk_partial_failure_exits_1(kanban_home, capsys):
 
 def test_cli_promote_bulk_json_emits_list(kanban_home, capsys):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        a = kb.create_task(conn, title="a", parents=[parent])
-        b = kb.create_task(conn, title="b", parents=[parent])
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        a = kb.create_task(conn, title="a", parents=[parent], created_by="test")
+        b = kb.create_task(conn, title="b", parents=[parent], created_by="test")
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
     rc = kb_cli._cmd_promote(_promote_ns(a, ids=[b], as_json=True))
     assert rc == 0
@@ -227,8 +227,8 @@ def test_cli_promote_bulk_json_emits_list(kanban_home, capsys):
 def test_cli_promote_single_json_stays_flat_object(kanban_home, capsys):
     """Back-compat: single-id JSON is still a flat object, not a list."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="c", parents=[parent])
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        child = kb.create_task(conn, title="c", parents=[parent], created_by="test")
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
     rc = kb_cli._cmd_promote(_promote_ns(child, as_json=True))
     assert rc == 0
@@ -240,8 +240,8 @@ def test_cli_promote_single_json_stays_flat_object(kanban_home, capsys):
 def test_cli_promote_dedupes_duplicate_ids(kanban_home, capsys):
     """Same id in positional + --ids must only attempt the promotion once."""
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="c", parents=[parent])
+        parent = kb.create_task(conn, title="parent", created_by="test")
+        child = kb.create_task(conn, title="c", parents=[parent], created_by="test")
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
     rc = kb_cli._cmd_promote(_promote_ns(child, ids=[child, child]))
     assert rc == 0

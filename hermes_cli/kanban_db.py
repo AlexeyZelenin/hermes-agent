@@ -3121,6 +3121,17 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+
+    # Create-gate (t_d5a8eafe) is evaluated INSIDE the write transaction,
+    # after parent-assignee inheritance has had a chance to assign an
+    # owner — see the block following the ``_first_parent_assignee``
+    # call below. Running the gate here (before inheritance) would
+    # mis-trip on legitimate decomposition children whose parent carries
+    # an assignee: the child enters with assignee=NULL and the gate
+    # would route it to triage before the inheritance code runs. The
+    # ``create_gate_tripped`` flag is declared inside the txn and read
+    # by the ``created`` event payload; there is no forward reference
+    # to initialise here.
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -3345,6 +3356,49 @@ def create_task(
                         or configured_default_assignee()
                     )
 
+                # Create-gate (t_d5a8eafe): an anonymous empty task — no
+                # body, no created_by, AND no assignee — cannot enter a
+                # dispatchable lane. These rows are almost always typos,
+                # aborted UI input, or a stray CLI invocation (historical
+                # examples on the live board: 'ship', 'engine', 'uncat',
+                # 'paused', 'engine task' — all body=NULL, assignee=NULL,
+                # created_by=NULL — that nonetheless reached ``ready`` and
+                # either stalled the queue or wasted a spawn). Force such
+                # tasks to ``triage`` so a human can flesh them out or
+                # discard them, and tag the ``created`` event with
+                # ``routed_by_create_gate`` so the reason is visible in
+                # ``hermes kanban tail`` / event history.
+                #
+                # The assignee check is the key discriminator between
+                # intentional programmatic callers (which always set
+                # either ``created_by`` or ``assignee``) and genuine junk:
+                # the CLI sets ``created_by`` to ``_profile_author()``, the
+                # dashboard sets ``created_by="dashboard"``, the agent tool
+                # sets ``created_by`` to the active profile, the
+                # decomposer inherits a parent's owner above, and every
+                # test that means to spawn sets an ``assignee``. The only
+                # rows that hit all three NULLs are ones that bypassed
+                # every entry point — direct SQL, an older binary, or a UI
+                # typo that never made it past the form's owner field.
+                #
+                # Evaluated AFTER parent-assignee inheritance so a
+                # legitimate decomposition child of an owned parent (which
+                # arrives here with body=NULL, created_by=NULL,
+                # assignee=NULL but inherits the parent's owner just above)
+                # does not trip the gate. Explicit ``triage=True`` or
+                # ``initial_status='blocked'`` from the caller already
+                # lands the task out of the dispatchable lane and is left
+                # untouched.
+                create_gate_tripped = False
+                if (
+                    task_status in ("ready", "todo")
+                    and not (body or "").strip()
+                    and not created_by
+                    and not (assignee or "").strip()
+                ):
+                    task_status = "triage"
+                    create_gate_tripped = True
+
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
@@ -3425,6 +3479,11 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        # Set only when the create-gate redirected an
+                        # anonymous empty task from ready/todo to triage.
+                        # Lets operators see *why* a freshly-created task
+                        # is sitting in triage instead of running.
+                        "routed_by_create_gate": True if create_gate_tripped else None,
                     },
                 )
             return task_id
@@ -4153,6 +4212,66 @@ def recompute_ready(
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
+
+
+def sweep_empty_tasks(conn: sqlite3.Connection) -> int:
+    """Reclassify anonymous empty unassigned tasks stuck in a dispatchable lane.
+
+    Complement of the create-gate in :func:`create_task`
+    (t_d5a8eafe). A task with no body, no ``created_by``, AND no
+    ``assignee`` should never be in ``ready`` or ``todo`` — the
+    create-gate routes it to ``triage`` at insertion time. Rows that
+    bypassed the gate (older binary, direct SQL, restored backup, race)
+    are reclassified here so the board self-heals without an operator
+    having to archive them by hand.
+
+    The three-way NULL check (body + created_by + assignee) mirrors the
+    create-gate's discriminator: a task with an assignee or a created_by
+    is intentional (a programmatic caller set it), only the truly
+    anonymous rows are junk. Reclassification moves the row to
+    ``triage`` and emits a ``swept_empty`` event so
+    ``hermes kanban tail`` shows *why* the task moved. Idempotent: a
+    triage row is left alone, and rows already in triage are not touched
+    (the operator or a specifier promotion will handle them).
+
+    Returns the number of tasks reclassified. Safe to call inside or
+    outside an existing transaction.
+    """
+    swept = 0
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks "
+            "WHERE status IN ('ready', 'todo') "
+            "  AND (body IS NULL OR body = '') "
+            "  AND created_by IS NULL "
+            "  AND (assignee IS NULL OR assignee = '') "
+            "  AND paused = 0"
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            conn.execute(
+                "UPDATE tasks SET status = 'triage' "
+                "WHERE id = ? AND status IN ('ready', 'todo')",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "swept_empty",
+                {
+                    "reason": "anonymous empty unassigned task in "
+                              "dispatchable lane; create-gate bypassed — "
+                              "reclassified to triage",
+                },
+            )
+            swept += 1
+    if swept:
+        _log.info(
+            "kanban sweep_empty_tasks: reclassified %d anonymous empty "
+            "unassigned task(s) from ready/todo to triage.",
+            swept,
+        )
+    return swept
 
 
 # ---------------------------------------------------------------------------
@@ -7825,6 +7944,22 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    skipped_empty_anonymous: list[str] = field(default_factory=list)
+    """Ready task ids skipped because they have no body AND no created_by
+    (t_d5a8eafe). These are almost always typos, aborted UI input, or
+    rows inserted by older binaries / direct SQL that bypassed the
+    create-gate. The dispatcher refuses to spawn them; the
+    ``sweep_empty_tasks`` janitor reclassifies them to ``triage`` on the
+    next tick so a human can flesh them out or discard them. Tracked
+    separately from ``skipped_unassigned`` because the operator-actionable
+    fix is different: add a body / created_by (or archive the task),
+    not assign an owner."""
+    swept_empty: int = 0
+    """Number of anonymous empty tasks reclassified from ready/todo to
+    triage this tick by the ``sweep_empty_tasks`` janitor. Mirrors
+    ``reclaimed`` / ``promoted`` as a counter rather than an id list —
+    the swept ids are visible via the ``swept_empty`` task event in
+    ``hermes kanban tail``."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9579,6 +9714,11 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.auto_unblocked = _auto_unblock_subscription_blocked(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    # Create-gate janitor (t_d5a8eafe): reclassify any anonymous empty
+    # tasks (no body AND no created_by) that slipped into ready/todo
+    # despite the create-gate, so the dispatch loop below doesn't trip
+    # over them and the board self-heals.
+    result.swept_empty = sweep_empty_tasks(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -9599,7 +9739,7 @@ def _dispatch_once_locked(
     # never gets claimed/spawned regardless of how it reached 'ready'. This is
     # the single deterministic eligibility check the design calls for.
     ready_rows = conn.execute(
-        "SELECT id, assignee, priority, created_at FROM tasks "
+        "SELECT id, assignee, priority, created_at, body, created_by FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL AND paused = 0 "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -9668,6 +9808,26 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        # Defensive create-gate net (t_d5a8eafe): refuse to spawn a ready
+        # task that has no body, no created_by, AND no assignee. The
+        # create-gate at ``create_task`` time should have routed such rows
+        # to ``triage``, but rows can sneak in via older binaries, direct
+        # SQL, restored backups, or a caller that bypassed the gate. The
+        # ``sweep_empty_tasks`` janitor (run earlier in this same tick)
+        # will already have reclassified most of them; this check is the
+        # safety rail for the race window between the sweep and the
+        # SELECT above, and for any row the sweep deliberately leaves
+        # alone (e.g. paused tasks that then get un-paused mid-tick).
+        # The three-way NULL check mirrors the create-gate's
+        # discriminator: a row with an assignee, a created_by, or a body
+        # is intentional and dispatches normally.
+        if (
+            not (row["body"] or "").strip()
+            and not row["created_by"]
+            and not (row["assignee"] or "").strip()
+        ):
+            result.skipped_empty_anonymous.append(row["id"])
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -9942,6 +10102,21 @@ def _dispatch_once_locked(
             "skipped) for: %s. Set kanban.default_assignee or assign them.",
             len(result.skipped_unassigned),
             ", ".join(result.skipped_unassigned),
+        )
+    # Defensive create-gate net (t_d5a8eafe): surface empty anonymous rows
+    # that reached ``ready`` despite the create-gate. The
+    # ``sweep_empty_tasks`` janitor should reclassify them on the next
+    # tick; this WARNING is the signal that the gate was bypassed (older
+    # binary, direct SQL, restored backup) and the queue is silently
+    # losing spawn slots to junk rows.
+    if result.skipped_empty_anonymous:
+        _log.warning(
+            "kanban dispatch: %d ready task(s) have no body AND no "
+            "created_by — skipped as anonymous empty (create-gate bypassed "
+            "for these ids): %s. sweep_empty_tasks will reclassify them to "
+            "triage on the next tick.",
+            len(result.skipped_empty_anonymous),
+            ", ".join(result.skipped_empty_anonymous),
         )
     return result
 
