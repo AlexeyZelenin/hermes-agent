@@ -607,6 +607,14 @@ def throttled_pockets(
         return {}
     by_name: dict[str, list[dict]] = {}
     for pocket in snapshot.get("pockets", []):
+        # Tracking-only pocket: operator set pacing_config.enabled=0, so we
+        # observe its spend but never dispatch-gate on it. Skipping here (not
+        # just in actuation) is what makes enabled=0 actually stop the throttle
+        # — otherwise a projection with no real allowance self-locks the pocket
+        # (and even the very card that would fix it). enabled is None for rows
+        # with no config: treat as enabled (default gating preserved).
+        if pocket.get("enabled") is False:
+            continue
         verdict = pocket.get("effective_breaker")
         name = pocket.get("subscription")
         if verdict and name:
