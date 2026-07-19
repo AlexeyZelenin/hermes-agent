@@ -3485,6 +3485,29 @@
                 }, t.warnings.highest_severity === "critical" ? "!!!" :
                    t.warnings.highest_severity === "error" ? "!!" : "⚠")
               : null,
+            // Last-failure badge: surfaces the EXACT stored last-error line as
+            // a deterministic hover tooltip (no computed/AI text — just
+            // t.last_failure_error verbatim). Shown whenever an error is
+            // stamped; the field is cleared on success/unblock so a healthy
+            // card carries no badge. A counted failure (consecutive_failures
+            // > 0) shows the retry count in a warning colour; a benign requeue
+            // that stamped an error WITHOUT counting a failure (rate-limit
+            // wall or gateway/overseer service-restart kill) shows a muted
+            // ↻ so the two are visually distinct.
+            t.last_failure_error
+              ? h("span", {
+                  className: cn(
+                    "hermes-kanban-failure-badge",
+                    t.consecutive_failures > 0
+                      ? "hermes-kanban-failure-badge--counted"
+                      : "hermes-kanban-failure-badge--requeued",
+                  ),
+                  title: "Last error: " + t.last_failure_error,
+                },
+                  t.consecutive_failures > 0
+                    ? "⚠ ×" + t.consecutive_failures
+                    : "↻")
+              : null,
             t.priority > 0
               ? h(Badge, { className: "hermes-kanban-priority",
                            title: `Priority ${t.priority}. Higher-priority tasks are claimed first by the dispatcher.` }, `P${t.priority}`)

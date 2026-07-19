@@ -1192,6 +1192,31 @@
   cursor: help;
 }
 
+/* Last-failure badge — hover shows the exact stored last-error line.
+   Counted failures glow red; benign requeues (rate-limit / service-restart
+   kill, which stamp an error but never count a failure) stay muted. */
+.hermes-kanban-failure-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  font-weight: 700;
+  margin-left: 0.25rem;
+  padding: 0 0.3rem;
+  border-radius: 0.35rem;
+  cursor: help;
+  white-space: nowrap;
+}
+.hermes-kanban-failure-badge--counted {
+  color: #ff5c5c;
+  background: rgba(255, 92, 92, 0.12);
+}
+.hermes-kanban-failure-badge--requeued {
+  color: #9aa4b2;
+  background: rgba(154, 164, 178, 0.12);
+  font-weight: 500;
+}
+
 /* Attention strip — collapsed state is a thin bar. */
 .hermes-kanban-attention {
   border: 1px solid rgba(255, 158, 59, 0.35);
