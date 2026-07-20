@@ -5474,6 +5474,14 @@ def complete_task(
     """
     now = int(time.time())
 
+    # Mirror of the summary→result docstring fallback: an ACP/worker caller
+    # passes only ``summary``, which used to leave ``tasks.result`` empty and
+    # ``result_len: 0`` on the completed event — a reviewer reading the card
+    # saw "no result" while the full handoff sat on the run row (t_000401c5
+    # false-phantom, 20.07). One handoff text should land in both places.
+    if result is None and summary is not None:
+        result = summary
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -5589,8 +5597,15 @@ def complete_task(
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
         # full summary stays on the run row.
-        ev_summary = (summary if summary is not None else result) or ""
-        ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
+        ev_summary = ((summary if summary is not None else result) or "").strip()
+        if ev_summary:
+            first_line = ev_summary.splitlines()[0]
+            # A silent cut reads as the worker's whole handoff ("Important
+            # findi") — mark it so reviewers know to open the run row.
+            cut = first_line[:400]
+            if cut != ev_summary:
+                cut += " …[truncated; full handoff on the run row]"
+            ev_summary = cut
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,

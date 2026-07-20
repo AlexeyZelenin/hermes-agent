@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -1373,6 +1374,37 @@ def test_complete_records_result(kanban_home):
     assert task.status == "done"
     assert task.result == "done and dusted"
     assert task.completed_at is not None
+
+
+def test_complete_summary_only_backfills_result_and_marks_event_cut(kanban_home):
+    """ACP workers pass only ``summary``; tasks.result must carry it too, and
+    the 400-char event cut must be marked, not silent (t_000401c5)."""
+    long_handoff = "Handoff: " + "analysis " * 60  # single line, > 400 chars
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", created_by="test")
+        assert kb.complete_task(conn, t, summary=long_handoff)
+        task = kb.get_task(conn, t)
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'completed'", (t,),
+        ).fetchone()
+    assert task.result == long_handoff
+    payload = json.loads(row["payload"])
+    assert payload["result_len"] == len(long_handoff)
+    assert payload["summary"].endswith("…[truncated; full handoff on the run row]")
+    assert payload["summary"].startswith("Handoff:")
+
+
+def test_complete_short_summary_event_is_uncut(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", created_by="test")
+        assert kb.complete_task(conn, t, summary="короткий итог")
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'completed'", (t,),
+        ).fetchone()
+    payload = json.loads(row["payload"])
+    assert payload["summary"] == "короткий итог"
 
 
 def test_block_then_unblock(kanban_home):
