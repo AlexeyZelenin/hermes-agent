@@ -2902,6 +2902,19 @@ async def stream_events(ws: WebSocket):
         except ValueError:
             ws_board = None
 
+        # Auto-vivify guard, mirror of _conn(): connect() below creates the
+        # board dir on first open, so a stale tab reconnecting every 2s with
+        # a removed/foreign slug resurrects a ghost board forever. Unknown
+        # non-default slug → close, never touch the DB layer.
+        if ws_board and ws_board != "default":
+            try:
+                known = (kanban_db.boards_root() / ws_board).is_dir()
+            except Exception:
+                known = False
+            if not known:
+                await ws.close(code=4404)
+                return
+
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)
             try:
