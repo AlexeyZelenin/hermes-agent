@@ -22,7 +22,7 @@ from .sources import build_dispatcher_snapshot, build_run_snapshots, count_runni
 
 def _default_zeus_db_path() -> Path:
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "zeus" / "zeus.db"
+    return home / "roul" / "roul.db"
 
 
 class SupervisorService:

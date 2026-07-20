@@ -1,4 +1,4 @@
-"""Read-only view over the zeus token ledger (``~/.hermes/zeus/zeus.db``).
+"""Read-only view over the zeus token ledger (``~/.hermes/roul/roul.db``).
 
 The per-task token/cost ledger is written by the external *zeus* plugin's
 ``post_api_request`` hook (see ``agent/acp_task_executor.py``); every API turn

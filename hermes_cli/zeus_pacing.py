@@ -1,4 +1,4 @@
-"""Read-only view over the zeus pacing state (``~/.hermes/zeus/zeus.db``).
+"""Read-only view over the zeus pacing state (``~/.hermes/roul/roul.db``).
 
 The per-board, per-subscription *pacing state* is written by the external
 *zeus* pacing controller (the same plugin that owns the token ledger — see

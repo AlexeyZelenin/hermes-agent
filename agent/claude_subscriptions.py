@@ -110,7 +110,7 @@ class Lease:
 
 def db_path() -> Path:
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "zeus" / "zeus.db"
+    return home / "roul" / "roul.db"
 
 
 def connect() -> sqlite3.Connection:
