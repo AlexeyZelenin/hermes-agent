@@ -68,10 +68,10 @@ def _defaults(home: Path) -> dict[str, Any]:
         "home": home,
         "gateway_pid_file": home / "gateway.pid",
         "gateway_log": home / "logs" / "gateway.log",
-        "kanban_db": home / "kanban" / "boards" / "ra" / "kanban.db",
-        "zeus_db": home / "zeus" / "zeus.db",
-        "chat_id_file": home / "zeus" / "telegram_chat_id",
-        "state_file": home / "zeus" / "watchdog.state.json",
+        "kanban_db": home / "roul" / "kanban" / "boards" / "roul" / "kanban.db",
+        "zeus_db": home / "roul" / "roul.db",
+        "chat_id_file": home / "roul" / "telegram_chat_id",
+        "state_file": home / "roul" / "watchdog.state.json",
         "bot_token_env_file": home / ".env",
     }
 

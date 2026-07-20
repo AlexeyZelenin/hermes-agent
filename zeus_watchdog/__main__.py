@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    default_cfg = default_home() / "zeus" / "watchdog.config.json"
+    default_cfg = default_home() / "roul" / "watchdog.config.json"
     config_path = args.config or (default_cfg if default_cfg.is_file() else None)
     cfg = load(config_path=config_path, home=args.home)
 

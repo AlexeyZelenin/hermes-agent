@@ -9,9 +9,9 @@ from zeus_watchdog.config import default_home, load, resolve_chat_id, resolve_to
 def test_defaults_anchor_under_home(tmp_path: Path):
     cfg = load(config_path=None, home=tmp_path)
     assert cfg.home == tmp_path
-    assert cfg.kanban_db == tmp_path / "kanban" / "boards" / "ra" / "kanban.db"
-    assert cfg.zeus_db == tmp_path / "zeus" / "zeus.db"
-    assert cfg.chat_id_file == tmp_path / "zeus" / "telegram_chat_id"
+    assert cfg.kanban_db == tmp_path / "roul" / "kanban" / "boards" / "roul" / "kanban.db"
+    assert cfg.zeus_db == tmp_path / "roul" / "roul.db"
+    assert cfg.chat_id_file == tmp_path / "roul" / "telegram_chat_id"
     assert cfg.debounce_sec == 1800
 
 

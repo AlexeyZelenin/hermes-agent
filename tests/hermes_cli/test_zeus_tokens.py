@@ -63,7 +63,7 @@ def _make_zeus(path: Path, rows=()) -> Path:
 
 def test_default_path_honours_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
-    assert zeus_tokens.default_zeus_db_path() == tmp_path / "h" / "zeus" / "zeus.db"
+    assert zeus_tokens.default_zeus_db_path() == tmp_path / "h" / "roul" / "roul.db"
 
 
 def test_connect_missing_db_returns_none(tmp_path):

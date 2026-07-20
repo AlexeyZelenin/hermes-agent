@@ -522,7 +522,7 @@ def _zeus_doctor_script(name: str) -> Path | None:
     """
     try:
         from hermes_constants import get_default_hermes_root
-        script = Path(get_default_hermes_root()) / "zeus" / name
+        script = Path(get_default_hermes_root()) / "roul" / name
     except Exception:  # noqa: BLE001 — diagnostics must never crash
         return None
     return script if script.is_file() else None

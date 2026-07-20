@@ -34,7 +34,7 @@ exit 0
 def _install(tmp_path, monkeypatch, *, sigs="", status_line="gateway: healthy (all pass)",
              pending_reload=None):
     home = tmp_path / "home"
-    zeus = home / "zeus"
+    zeus = home / "roul"
     zeus.mkdir(parents=True)
     (zeus / "heal_kanban.sh").write_text(HEAL_STUB)
     (zeus / "boot_supervisor.sh").write_text(BOOT_STUB)
@@ -100,7 +100,7 @@ class TestStartupDoctorSection:
         # A missing-keys fault has no deterministic cure: the stub keeps its sigs
         # even after `preflight`, so the re-check must still flag it.
         home = tmp_path / "home"
-        zeus = home / "zeus"
+        zeus = home / "roul"
         zeus.mkdir(parents=True)
         stubborn = HEAL_STUB.replace("preflight) rm -f \"$d/sigs\" ;;", "preflight) : ;;")
         (zeus / "heal_kanban.sh").write_text(stubborn)

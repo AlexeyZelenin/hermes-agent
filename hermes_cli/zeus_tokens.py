@@ -28,7 +28,7 @@ _IN_CHUNK = 500
 def default_zeus_db_path() -> Path:
     """Location of the zeus token ledger, honouring ``HERMES_HOME``."""
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "zeus" / "zeus.db"
+    return home / "roul" / "roul.db"
 
 
 def connect(path: Optional[os.PathLike | str] = None) -> Optional[sqlite3.Connection]:

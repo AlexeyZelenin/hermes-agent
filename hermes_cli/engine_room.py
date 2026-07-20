@@ -200,7 +200,7 @@ def surfaces(specs: Iterable[dict[str, str]] = _SURFACES) -> list[dict[str, Any]
 
 # --- Pillar 3: native telemetry substrate -----------------------------------
 
-DB_ZEUS = "zeus.db"
+DB_ZEUS = "roul.db"
 DB_KANBAN = "kanban.db"
 DB_OTEL = "otel"
 
