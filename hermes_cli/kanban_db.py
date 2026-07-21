@@ -8075,12 +8075,14 @@ def specify_triage_task(
             # IMMEDIATE would raise OperationalError. We also skip the
             # 'commented' event that ``add_comment`` emits, since the
             # 'specified' event below already records the change.
+            # Scrub the author for the same reason ``add_comment`` does:
+            # a lone surrogate here would raise UnicodeEncodeError at INSERT.
             conn.execute(
                 "INSERT INTO task_comments (task_id, author, body, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (
                     task_id,
-                    author.strip(),
+                    _scrub_unencodable(author.strip()),
                     "Specified — updated "
                     + ", ".join(changed_fields)
                     + " and promoted to todo.",
@@ -8350,13 +8352,15 @@ def decompose_triage_task(
         )
 
         # Audit comment + event on the root so the timeline shows the fan-out.
+        # Scrub the author (inline INSERT, so we can't lean on add_comment's
+        # guard): a lone surrogate would raise UnicodeEncodeError at INSERT.
         if author and author.strip():
             conn.execute(
                 "INSERT INTO task_comments (task_id, author, body, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (
                     task_id,
-                    author.strip(),
+                    _scrub_unencodable(author.strip()),
                     "Decomposed into "
                     + ", ".join(child_ids)
                     + ". Root will wake when all children complete.",

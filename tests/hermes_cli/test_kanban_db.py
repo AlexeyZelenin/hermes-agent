@@ -1390,6 +1390,26 @@ def test_add_comment_scrubs_unencodable_surrogates(kanban_home):
         )
 
 
+def test_specify_triage_scrubs_unencodable_author(kanban_home):
+    """specify_triage_task writes its audit comment via an inline INSERT
+    (it's already inside a write_txn, so it can't call add_comment). That
+    inline path must scrub the author too — a lone surrogate there would raise
+    UnicodeEncodeError at INSERT and abort the whole specify txn."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="orig", assignee="a", triage=True)
+        dirty_author = "worker \udcff\udcfe"
+        ok = kb.specify_triage_task(
+            conn, tid, title="specified now", author=dirty_author
+        )
+        assert ok  # promotion + inline audit INSERT did not raise
+
+        author = kb.list_comments(conn, tid)[0].author
+        author.encode("utf-8")  # round-trips cleanly
+        assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in author), (
+            "no lone surrogates should survive the inline-INSERT scrub"
+        )
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
