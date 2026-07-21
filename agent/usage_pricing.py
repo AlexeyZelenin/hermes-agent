@@ -470,12 +470,38 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         "deepseek",
         "deepseek-v4-pro",
     ): PricingEntry(
-        input_cost_per_million=Decimal("1.74"),
-        output_cost_per_million=Decimal("3.48"),
-        cache_read_cost_per_million=Decimal("0.0145"),
+        input_cost_per_million=Decimal("0.435"),
+        output_cost_per_million=Decimal("0.87"),
+        cache_read_cost_per_million=Decimal("0.003625"),
         source="official_docs_snapshot",
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
-        pricing_version="deepseek-pricing-2026-05-12",
+        pricing_version="deepseek-pricing-2026-05-22",
+    ),
+    # Moonshot / Kimi. Runs via the "kimi-coding" subscription plan; priced
+    # here at the metered shadow rate so subscription turns show a notional cost.
+    (
+        "kimi-coding",
+        "k3",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://platform.moonshot.ai/docs/pricing",
+        pricing_version="kimi-k3-pricing-2026-07-21",
+    ),
+    # Z.ai / Zhipu GLM. Runs via the "zai" coding-plan subscription; priced
+    # here at the metered shadow rate so subscription turns show a notional cost.
+    (
+        "zai",
+        "glm-5.2",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.40"),
+        output_cost_per_million=Decimal("4.40"),
+        cache_read_cost_per_million=Decimal("0.26"),
+        source="official_docs_snapshot",
+        source_url="https://docs.z.ai/guides/overview/pricing",
+        pricing_version="glm-5.2-pricing-2026-07-21",
     ),
     # Google Gemini
     (
