@@ -6929,6 +6929,7 @@ def block_task(
                 assignee=_blocked_task.assignee if _blocked_task else None,
                 run_id=run_id,
                 reason=reason,
+                kind=kind,
             )
             return True
 
@@ -7040,6 +7041,7 @@ def block_task(
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
         reason=reason,
+        kind=kind,
     )
     return True
 

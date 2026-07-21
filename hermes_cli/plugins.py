@@ -208,7 +208,11 @@ VALID_HOOKS: Set[str] = {
     # Common kwargs: task_id: str, board: str | None, assignee: str | None,
     #   run_id: int | None, profile_name: str.
     # kanban_task_completed adds: summary: str | None.
-    # kanban_task_blocked adds:   reason: str | None.
+    # kanban_task_blocked adds:   reason: str | None, kind: str | None (the
+    #   typed block reason, one of VALID_BLOCK_KINDS, or None for an un-typed
+    #   block). ``kind`` is what lets an observer tell an operator question
+    #   (needs_input) from an infra failure (capability/transient) and route
+    #   them to different surfaces.
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",

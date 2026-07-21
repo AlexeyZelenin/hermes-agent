@@ -99,6 +99,25 @@ def test_block_fires_hook_with_reason(kanban_home, captured_hooks):
     kw = fired[0][1]
     assert kw["task_id"] == tid
     assert kw["reason"] == "needs human"
+    assert kw["kind"] is None
+
+
+@pytest.mark.parametrize("kind", ["needs_input", "capability", "transient",
+                                  "dependency"])
+def test_block_hook_carries_the_typed_kind(kanban_home, captured_hooks, kind):
+    """An observer must be able to tell an operator question (needs_input)
+    from an infra failure (capability/transient) — every routing branch of
+    block_task therefore reports the kind it stamped."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="why", kind=kind)
+    finally:
+        conn.close()
+    fired = [e for e in captured_hooks if e[0] == "kanban_task_blocked"]
+    assert len(fired) == 1
+    assert fired[0][1]["kind"] == kind
 
 
 def test_no_hook_on_failed_transition(kanban_home, captured_hooks):

@@ -1433,16 +1433,25 @@ KANBAN_BLOCK_SCHEMA = {
                 "description": (
                     "What you need answered or what stopped you, in one or "
                     "two sentences. Don't paste the whole conversation; the "
-                    "human has the board and can ask follow-ups via comments."
+                    "human has the board and can ask follow-ups via comments. "
+                    "With kind='needs_input' this text IS the question the "
+                    "operator is shown, so write it as a question they can "
+                    "answer without opening the code."
                 ),
             },
             "kind": {
                 "type": "string",
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
-                    "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "Why you're blocked — it decides WHO sees this. "
+                    "'needs_input' = you are asking the operator a question; "
+                    "it becomes an entry in their decisions inbox and pings "
+                    "them. 'capability'/'transient' = the environment failed "
+                    "you (dead session, corrupt DB, missing credential); it is "
+                    "filed as a problem for whoever maintains the system and "
+                    "the operator is NOT interrupted, so never use these to "
+                    "ask a question. 'dependency' waits in todo and resumes "
+                    "automatically. Omit only if none apply."
                 ),
             },
             "board": _board_schema_prop(),
