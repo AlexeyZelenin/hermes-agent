@@ -1162,3 +1162,56 @@ class TestConfigDirAttribution:
             assert len(idx) == 3
         finally:
             conn.close()
+
+
+class TestDiscoverConfigDirsSkipsLocks:
+    """A transient dir-lock (``~/.claude-sub-<name>.lock``) must never register
+    as a pocket. It matches the ``.claude-sub-*`` glob and, caught mid-lease,
+    would settle a phantom ``<name>.lock`` row that outlives the lock (t_a9be8831).
+    """
+
+    def _home(self, tmp_path):
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude-sub-work1").mkdir()
+        (tmp_path / ".claude-sub-work1.lock").mkdir()   # transient lease lock
+        (tmp_path / ".codex").mkdir()
+        (tmp_path / ".codex-sub-alt").mkdir()
+        (tmp_path / ".codex-sub-alt.lock").mkdir()
+        return tmp_path
+
+    def test_lock_dirs_are_not_discovered(self, monkeypatch, tmp_path):
+        home = self._home(tmp_path)
+        from pathlib import Path
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        dirs = subs._discover_config_dirs()
+        assert "default" in dirs
+        assert "work1" in dirs
+        assert "codex" in dirs
+        assert "alt" in dirs
+        assert "work1.lock" not in dirs   # the bug: phantom lock pocket
+        assert "alt.lock" not in dirs
+
+    def test_is_pocket_name_rejects_lock_suffix(self):
+        assert subs._is_pocket_name("work1") is True
+        assert subs._is_pocket_name("work1.lock") is False
+        assert subs._is_pocket_name("") is False
+
+    def test_sync_registry_purges_settled_lock_row(self, monkeypatch):
+        # A phantom lock row that a prior sync settled (its dir since gone) is
+        # cleared on the next sync, and a re-lease of work1 does not revive it.
+        conn = subs.connect()
+        try:
+            _insert_sub(conn, "work1", "/x/.claude-sub-work1")
+            _insert_sub(conn, "work1.lock", "/x/.claude-sub-work1.lock")
+        finally:
+            conn.close()
+        monkeypatch.setattr(
+            subs, "_discover_config_dirs",
+            lambda: {"work1": ("/x/.claude-sub-work1", "claude")})
+        rows = subs.sync_registry()
+        names = {r["name"] for r in rows}
+        assert "work1" in names
+        assert "work1.lock" not in names
+        # A second sync (mimicking a fresh lease cycle) keeps it gone.
+        names_again = {r["name"] for r in subs.sync_registry()}
+        assert "work1.lock" not in names_again

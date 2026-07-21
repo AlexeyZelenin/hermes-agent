@@ -332,16 +332,29 @@ def _discover_config_dirs() -> Dict[str, tuple]:
         dirs[DEFAULT_SUB_NAME] = (str(default_dir), PROVIDER_CLAUDE)
     for entry in sorted(home.glob(f"{SUB_DIR_PREFIX}*")):
         name = entry.name[len(SUB_DIR_PREFIX):].strip()
-        if entry.is_dir() and name and name != DEFAULT_SUB_NAME:
+        if entry.is_dir() and _is_pocket_name(name) and name != DEFAULT_SUB_NAME:
             dirs[name] = (str(entry), PROVIDER_CLAUDE)
     codex_default = home / CODEX_HOME_DIR
     if codex_default.is_dir():
         dirs[CODEX_DEFAULT_SUB_NAME] = (str(codex_default), PROVIDER_CODEX)
     for entry in sorted(home.glob(f"{CODEX_SUB_DIR_PREFIX}*")):
         name = entry.name[len(CODEX_SUB_DIR_PREFIX):].strip()
-        if entry.is_dir() and name and name != CODEX_DEFAULT_SUB_NAME:
+        if entry.is_dir() and _is_pocket_name(name) and name != CODEX_DEFAULT_SUB_NAME:
             dirs[name] = (str(entry), PROVIDER_CODEX)
     return dirs
+
+
+def _is_pocket_name(name: str) -> bool:
+    """Whether a discovered dir name is a real pocket, not a transient lock.
+
+    The pool grabs a short-lived directory lock while leasing a pocket, e.g.
+    ``~/.claude-sub-work1.lock`` for a moment while leasing ``work1``. That lock
+    dir matches the ``.claude-sub-*`` glob and, if it happens to exist during a
+    sync, would register a phantom pocket named ``work1.lock`` that never goes
+    away (sync keeps rows whose dir later vanished). Lock-like names are never
+    real pockets, so they are excluded from discovery entirely (t_a9be8831).
+    """
+    return bool(name) and not name.endswith(".lock")
 
 
 def _norm_dir(config_dir: str) -> str:
@@ -406,6 +419,13 @@ def sync_registry(conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, A
     try:
         now = time.time()
         with conn:
+            # Purge phantom lock rows a prior sync may have settled: a lock dir
+            # (``~/.claude-sub-<name>.lock``) is never a real pocket, so a row
+            # named ``<name>.lock`` should never exist. Self-healing - discovery
+            # now skips lock dirs, and this clears any already-registered one
+            # (t_a9be8831). No legitimate pocket name ends in ``.lock``.
+            conn.execute(
+                "DELETE FROM claude_subscriptions WHERE name LIKE '%.lock'")
             for name, (config_dir, provider) in _discover_config_dirs().items():
                 conn.execute(
                     "INSERT INTO claude_subscriptions"

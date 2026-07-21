@@ -535,26 +535,21 @@ def _resolve_codex_usage_credentials(
     return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
 
 
-def _fetch_codex_account_usage(
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> Optional[AccountUsageSnapshot]:
-    token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "User-Agent": "codex-cli",
-    }
-    if account_id:
-        headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
-        response.raise_for_status()
-    payload = response.json() or {}
+def _codex_snapshot_from_payload(payload: dict) -> AccountUsageSnapshot:
+    """Map a Codex ``/usage`` JSON body to an :class:`AccountUsageSnapshot`.
+
+    Shared by the runtime-resolver fetch (``_fetch_codex_account_usage``) and the
+    per-pocket fetch (:func:`fetch_codex_usage_for_config_dir`). Windows carry a
+    stable ``key`` (``five_hour`` / ``seven_day``) so a consumer can match the 5h
+    vs weekly bar without depending on the localised label (t_a9be8831).
+    """
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
-        window = rate_limit.get(key) or {}
+    for src_key, label, key in (
+        ("primary_window", "Session", "five_hour"),
+        ("secondary_window", "Weekly", "seven_day"),
+    ):
+        window = rate_limit.get(src_key) or {}
         used = window.get("used_percent")
         if used is None:
             continue
@@ -563,6 +558,7 @@ def _fetch_codex_account_usage(
                 label=label,
                 used_percent=float(used),
                 reset_at=_parse_dt(window.get("reset_at")),
+                key=key,
             )
         )
     details: list[str] = []
@@ -589,6 +585,75 @@ def _fetch_codex_account_usage(
         windows=tuple(windows),
         details=tuple(details),
     )
+
+
+def _codex_pocket_credentials(config_dir: str) -> Optional[tuple[str, Optional[str]]]:
+    """``(access_token, account_id)`` from a Codex pocket's ``auth.json``, or None.
+
+    Reads the pocket's own login file directly (never the shared singleton), so
+    a specific ``CODEX_HOME`` pocket's usage can be queried. ``account_id`` is
+    best-effort - the Bearer token identifies the account on its own. Returns
+    None when the pocket carries no usable token (logged out / unreadable).
+    """
+    import json
+    from pathlib import Path
+
+    auth_path = Path(config_dir).expanduser() / "auth.json"
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    token = str(tokens.get("access_token") or data.get("OPENAI_API_KEY") or "").strip()
+    if not token:
+        return None
+    account_id = str(tokens.get("account_id") or "").strip() or None
+    return token, account_id
+
+
+def fetch_codex_usage_for_config_dir(config_dir: str) -> Optional[AccountUsageSnapshot]:
+    """Codex quota windows for one ``CODEX_HOME`` pocket, or None.
+
+    Uses the pocket's own stored token (not the shared resolver), so each Codex
+    registry pocket reports its real 5h/weekly limits. Best-effort: a logged-out
+    pocket or any network/parse error yields None so the caller degrades to an
+    honest "no live window" rather than crashing (t_a9be8831).
+    """
+    creds = _codex_pocket_credentials(config_dir)
+    if creds is None:
+        return None
+    token, account_id = creds
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "codex-cli",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(_resolve_codex_usage_url(None), headers=headers)
+        response.raise_for_status()
+    return _codex_snapshot_from_payload(response.json() or {})
+
+
+def _fetch_codex_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "codex-cli",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
+        response.raise_for_status()
+    return _codex_snapshot_from_payload(response.json() or {})
 
 
 @dataclass(frozen=True)
