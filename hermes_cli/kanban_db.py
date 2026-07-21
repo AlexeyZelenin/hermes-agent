@@ -1691,6 +1691,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_expires        INTEGER,
     tenant               TEXT,
     result               TEXT,
+    -- Auto-integration marker (t_ac38cb6d). Set to 'pending' on the done
+    -- transition ONLY for worktree tasks that carry a branch, so the
+    -- dispatcher's post-done merge sweep can find NEW done tasks to land in
+    -- trunk. NULL for every task completed before this shipped and for
+    -- scratch/dir tasks with no branch — the sweep never touches those, so
+    -- pre-existing stranded branches stay for the operator. Advances to
+    -- 'landed' / 'blocked' / 'skipped' as the sweep resolves each branch.
+    integration_status   TEXT,
     idempotency_key      TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
     -- failure, timeout, or crash; reset only on successful completion.
@@ -2807,6 +2815,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "linked_repos" not in cols:
         _add_column_if_missing(conn, "tasks", "linked_repos", "linked_repos TEXT")
+    if "integration_status" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "integration_status", "integration_status TEXT"
+        )
     if "executor" not in cols:
         _add_column_if_missing(conn, "tasks", "executor", "executor TEXT NOT NULL DEFAULT 'hermes-worker'")
     if "idempotency_key" not in cols:
@@ -5620,6 +5632,20 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        # Arm the dispatcher's auto-merge sweep (t_ac38cb6d). ONLY a worktree
+        # task that carries a branch is eligible — its commits live on an
+        # isolated branch the dispatcher can land in trunk. Marking it here, at
+        # the done transition, is the scope gate: tasks completed before this
+        # shipped never got the marker, so the sweep leaves the already-stranded
+        # branches (t_2e1a2936 / t_b92abd8c / t_d27458bb) for the operator. The
+        # merge itself is done by the dispatcher, not this worker process, so a
+        # session that dies right after this txn commits still gets landed.
+        conn.execute(
+            "UPDATE tasks SET integration_status = 'pending' "
+            "WHERE id = ? AND workspace_kind = 'worktree' "
+            "AND branch_name IS NOT NULL AND TRIM(branch_name) <> ''",
+            (task_id,),
+        )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -8633,6 +8659,7 @@ def integrate_task(
     test_cmd: Optional[list[str]] = None,
     run_tests: bool = True,
     prune: bool = True,
+    lock_timeout: Optional[float] = None,
 ):
     """Land a completed task's branch into trunk (merge-queue landing step).
 
@@ -8663,9 +8690,15 @@ def integrate_task(
     landed_repos: list[tuple[Path, Optional[Path]]] = []
     res = None
     for repo_root, worktree in _integration_targets(task, board):
-        with _ti.TrunkLock(repo_root):
+        lock = (
+            _ti.TrunkLock(repo_root, timeout=lock_timeout)
+            if lock_timeout is not None
+            else _ti.TrunkLock(repo_root)
+        )
+        with lock:
             res = _ti.integrate_branch(
-                repo_root, branch, test_cmd=test_cmd, run_tests=run_tests
+                repo_root, branch, test_cmd=test_cmd, run_tests=run_tests,
+                task_id=task_id,
             )
         if not res.outcome.landed:
             break
@@ -8704,6 +8737,96 @@ def integrate_task(
                 {"branch": branch, "outcome": res.outcome.value, "detail": res.detail[:500]},
             )
     return res
+
+
+# Auto-merge sweep (t_ac38cb6d): the DISPATCHER lands done task branches.
+# ---------------------------------------------------------------------------
+# The merge is a dispatcher responsibility, NOT a final step of the worker's
+# ACP session. A worker session routinely dies on a wait/verify turn before it
+# could run a "now merge your branch" step (the phantom pattern, t_222f1e4a),
+# so hanging the merge on the worker loses it. Instead ``complete_task`` arms
+# ``integration_status='pending'`` at the done transition and this per-tick
+# sweep lands the branch — even if the worker crashed the instant after it
+# committed and completed.
+_AUTO_INTEGRATE_LOCK_TIMEOUT = 15.0
+
+
+def _set_integration_status(
+    conn: sqlite3.Connection, task_id: str, status: Optional[str]
+) -> None:
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET integration_status = ? WHERE id = ?",
+            (status, task_id),
+        )
+
+
+def sweep_integrations(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    run_tests: bool = False,
+    lock_timeout: float = _AUTO_INTEGRATE_LOCK_TIMEOUT,
+) -> tuple[list[str], list[str]]:
+    """Land every NEW done task branch waiting for auto-integration.
+
+    Runs inside the dispatcher tick. Selects ``status='done'`` tasks whose
+    ``integration_status`` is ``'pending'`` (armed by :func:`complete_task` at
+    the done transition — so only branches completed after this shipped are ever
+    touched, and the already-stranded ones are left for the operator) and lands
+    each via :func:`integrate_task`.
+
+    The merge is run WITHOUT the landing-gate suite (``run_tests`` defaults
+    ``False``): the per-task DoD gate already ran the task's own tests/lint
+    during its session (that is what let it reach ``done``), and re-running the
+    whole suite synchronously here would freeze the dispatcher tick for the
+    suite's entire duration. Conflict detection — the primary "don't merge
+    broken work" guard — is preserved: a conflicting branch is reopened to
+    ``blocked`` by ``integrate_task`` and never lands. Operators who want the
+    full merged-result gate still have ``hermes kanban integrate``.
+
+    A short ``lock_timeout`` keeps a busy trunk lock (e.g. a manual integrate
+    holding it) from stalling the whole tick — the task just retries next tick.
+
+    Returns ``(landed_ids, blocked_ids)`` for telemetry.
+    """
+    from hermes_cli import trunk_integrator as _ti
+
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'done' "
+        "AND integration_status = 'pending' "
+        "ORDER BY completed_at ASC"
+    ).fetchall()
+    landed: list[str] = []
+    blocked: list[str] = []
+    for row in rows:
+        tid = row["id"]
+        try:
+            res = integrate_task(
+                conn, tid, board=board, run_tests=run_tests,
+                lock_timeout=lock_timeout,
+            )
+        except Exception as exc:  # never let one branch kill the tick
+            _log.warning("auto-integrate: task %s errored: %s", tid, exc)
+            continue
+        if res.outcome.landed:
+            _set_integration_status(conn, tid, "landed")
+            landed.append(tid)
+        elif res.outcome.should_block:
+            # integrate_task already reopened the task to 'blocked' and kept the
+            # branch. Record the merge outcome so it's queryable; a later
+            # operator fix + re-complete re-arms 'pending' via complete_task.
+            _set_integration_status(conn, tid, "blocked")
+            blocked.append(tid)
+        elif res.outcome is _ti.Outcome.DIRTY_ANCHOR:
+            # Anchor busy (a manual land or a dirty tree). Transient — leave
+            # 'pending' so the next tick retries once the anchor is clean.
+            pass
+        else:
+            # NO_BRANCH / ERROR — terminal, nothing to retry. Park it so the
+            # sweep does not spin on it every tick.
+            _set_integration_status(conn, tid, "skipped")
+    return landed, blocked
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -9103,6 +9226,14 @@ class DispatchResult:
     ``reclaimed`` / ``promoted`` as a counter rather than an id list —
     the swept ids are visible via the ``swept_empty`` task event in
     ``hermes kanban tail``."""
+    integrated: list[str] = field(default_factory=list)
+    """Task ids whose branch the dispatcher auto-merged into trunk this tick
+    (t_ac38cb6d). Armed at the done transition by ``complete_task`` and landed
+    by ``sweep_integrations`` — independent of the worker session, which may
+    have already died."""
+    integration_blocked: list[str] = field(default_factory=list)
+    """Task ids the auto-merge sweep reopened to ``blocked`` this tick because
+    their branch hit a merge conflict (branch preserved; operator decides)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -11242,6 +11373,18 @@ def _dispatch_once_locked(
     # despite the create-gate, so the dispatch loop below doesn't trip
     # over them and the board self-heals.
     result.swept_empty = sweep_empty_tasks(conn)
+    # Auto-merge sweep (t_ac38cb6d): land the branch of every NEW done task
+    # (armed by complete_task at the done transition) into trunk. The dispatcher
+    # owns the merge — a worker session that died right after committing still
+    # gets landed. Best-effort and git-only (no landing-gate suite in-tick);
+    # conflicts reopen the task to blocked with its branch preserved.
+    if not dry_run:
+        try:
+            result.integrated, result.integration_blocked = sweep_integrations(
+                conn, board=board
+            )
+        except Exception:  # a sweep failure must never kill the dispatch tick
+            _log.warning("auto-integrate sweep failed", exc_info=True)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
