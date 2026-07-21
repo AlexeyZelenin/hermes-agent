@@ -1,6 +1,6 @@
 """One-session external ACP executor for Kanban tasks; separate from providers."""
 from __future__ import annotations
-import json, os, shlex
+import json, os, re, shlex
 from agent.copilot_acp_client import CopilotACPClient
 
 _DEFAULT = {"claude-code": ("npx", ["--yes", "@agentclientprotocol/claude-agent-acp"]), "codex": ("codex-acp", ["--stdio"])}
@@ -289,6 +289,35 @@ def _run_pooled_session(executor, workspace, prompt, timeout, model, task_id, fo
             subs.release(lease)
         _salvage_partial_output(task_id, board, client)
         subs.mark_limited(lease.name, limited)
+def _claim_base_commit(run_id, board=None):
+    """The run's claim-time base commit, or None when unknown/unrecorded."""
+    if run_id is None:
+        return None
+    from hermes_cli import kanban_db as kb
+    try:
+        with kb.connect_closing(board=board) as conn:
+            row = conn.execute(
+                "SELECT base_commit FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+    except Exception:
+        return None
+    return row["base_commit"] if row else None
+def _git_work_state(workspace, run_id, board=None):
+    """Structural facts about what the run left behind: ``repo`` (the workspace
+    resolves to a git repo), ``dirty`` (working tree has changes) and
+    ``committed`` (a commit landed past the run's claim-time base). ``dirty`` /
+    ``committed`` are None when git could not answer - callers fail open on
+    those so a transient git error never discards a real run."""
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    top = kb._git_toplevel(Path(workspace))
+    if top is None:
+        return {"repo": False, "dirty": None, "committed": None}
+    entries = kb._git_status_porcelain_entries(top)
+    base = _claim_base_commit(run_id, board)
+    return {"repo": True,
+            "dirty": None if entries is None else bool(entries),
+            "committed": kb._git_has_new_commit(top, base) if base else None}
 def _workspace_shows_work(workspace, run_id, board=None):
     """True when this run left visible work in a git-backed workspace - a dirty
     tree or a new commit past the run's claim-time base. A scratch workspace is
@@ -297,29 +326,96 @@ def _workspace_shows_work(workspace, run_id, board=None):
     This is the second half of the phantom-completion guard: it lets a run that
     committed real code but returned an empty handoff string (e.g. crashed right
     after committing) still complete, while a run that produced neither output
-    nor changes is refused. Fail-open on any git uncertainty so a transient git
-    error never discards a real run (t_790b2481)."""
-    from pathlib import Path
-    from hermes_cli import kanban_db as kb
-    top = kb._git_toplevel(Path(workspace))
-    if top is None:
+    nor changes is refused (t_790b2481)."""
+    state = _git_work_state(workspace, run_id, board)
+    if not state["repo"]:
         return False
-    entries = kb._git_status_porcelain_entries(top)
-    if entries is None:
+    if state["dirty"] is None or state["dirty"]:
         return True
-    if entries:
-        return True
-    if run_id is None:
+    return bool(state["committed"])
+def _landed_clean_commit(state):
+    """True when the run's work is durably landed: a git workspace with a clean
+    tree and a new commit past the run's base. This is what makes an otherwise
+    unfinished-looking session safe to complete - the code is in git, so nothing
+    is lost even though the worker stopped mid-thought."""
+    return bool(state["repo"] and state["committed"] and state["dirty"] is False)
+# Terminal handoff marker (t_222f1e4a). The worker prompt asks for it as the
+# final line; its presence is the one POSITIVE completion signal the executor
+# trusts. Absence alone is NOT fatal - prompt compliance is not guaranteed and a
+# missing marker must never discard real work - it only enables the
+# unfinished-turn check below.
+HANDOFF_MARKER = "HANDOFF-COMPLETE"
+_TAIL_CHARS = 400  # closing window scanned for the marker / closing sentence
+# A session that stops mid-flight ends on an intent or a wait ("I'll report when
+# it lands", "Let me run the tests"), not on a report. Matched against the LAST
+# sentence only: a mid-report mention of waiting is normal prose, while the
+# closing sentence is what the session actually ended on. Substring-scanning the
+# whole handoff is the anti-pattern that once discarded committed work.
+_UNFINISHED_PATTERNS = (
+    r"\bi'?ll (report|update|circle back|check back|follow up|wait\b|let it|keep)",
+    r"\bwill report (back|when)\b",
+    r"\bwaiting (on|for) (the|it|that|this|my|a|an)\b",
+    r"\breport(ing)? (back )?(when|once) it\b",
+    r"\bstand(ing)? by\b",
+    r"^(let me|now (i'?ll|let me)|next,? i'?ll|i'?ll now)\b",
+    r"\b(жду|подожду|дождусь|доложу|отчитаюсь)\b",
+    r"^(сейчас|запущу|проверю|посмотрю)\b",
+)
+# ... unless the wait is on the OPERATOR (a legitimate handoff ends that way).
+_OPERATOR_WAIT = r"\b(you|your|operator|reviewer|review|approval|merge|decision)\b"
+_FOOTER_LINE = r"^\[[^\]]*\]$"
+def _final_sentence(text):
+    """Last sentence of the session's closing line, skipping the slash-command
+    footer convention (``[/command]``). The incident handoff arrived as one
+    unbroken paragraph, so splitting on lines alone is not enough."""
+    lines = [ln.strip() for ln in (text or "").strip().splitlines() if ln.strip()]
+    while lines and re.match(_FOOTER_LINE, lines[-1]):
+        lines.pop()
+    if not lines:
+        return ""
+    return re.split(r"(?<=[.!?…])\s+", lines[-1])[-1].strip()[-_TAIL_CHARS:]
+def _strip_marker(text):
+    """The handoff text with the terminal marker removed - the marker is a
+    protocol token for the guard, not something a reviewer needs on the card.
+    The signal itself is kept on the run metadata."""
+    return "\n".join(ln for ln in (text or "").strip().splitlines()
+                     if ln.strip() != HANDOFF_MARKER).strip()
+def _looks_unfinished(text):
+    """True when the session's closing sentence reads as work-in-progress rather
+    than a handoff - the self-pacing 'I'll report when it lands' turn that ended
+    an ACP session mid-task and still marked it done (t_222f1e4a)."""
+    sentence = _final_sentence(text).lower()
+    if not sentence or re.search(_OPERATOR_WAIT, sentence):
         return False
-    try:
-        with kb.connect_closing(board=board) as conn:
-            row = conn.execute(
-                "SELECT base_commit FROM task_runs WHERE id = ?", (run_id,)
-            ).fetchone()
-        base = row["base_commit"] if row else None
-    except Exception:
-        base = None
-    return bool(base and kb._git_has_new_commit(top, base))
+    return any(re.search(p, sentence) for p in _UNFINISHED_PATTERNS)
+def _completion_verdict(text, workspace, run_id, board=None):
+    """Classify an ACP session's output as a real completion or a phantom.
+
+    Returns ``(signal, refusal)`` - ``refusal`` is None to complete, else the
+    phrase naming why completion is refused. Signals, strongest first:
+
+    * ``marker``  - the terminal handoff marker is present: trust it.
+    * ``unfinished`` - the closing sentence is a wait/intent, so the session
+      ended mid-flight. Completing here is the phantom-done this guard exists to
+      kill; refused unless the run nonetheless landed its work durably (clean
+      tree + new commit), which downgrades it to ``unfinished_committed``.
+    * ``empty`` - no text at all and no visible work (t_790b2481).
+    * ``text`` - a plain handoff with no marker: completes, and the signal is
+      stamped on the run so marker-less completions stay measurable.
+    """
+    body = (text or "").strip()
+    if HANDOFF_MARKER in body[-_TAIL_CHARS:]:
+        return "marker", None
+    if _looks_unfinished(body):
+        if _landed_clean_commit(_git_work_state(workspace, run_id, board)):
+            return "unfinished_committed", None
+        return "unfinished", (
+            "ended mid-task on an unfinished turn with no committed work "
+            f"(last message: {_final_sentence(body)!r})"
+        )
+    if not body and not _workspace_shows_work(workspace, run_id, board):
+        return "empty", "produced zero output and no changes"
+    return "text", None
 def run_task(*, executor, task_id, workspace, board=None):
     from hermes_cli import kanban_db as kb
     with kb.connect_closing(board=board) as conn:
@@ -327,7 +423,7 @@ def run_task(*, executor, task_id, workspace, board=None):
         if not task: raise ValueError(f"unknown task {task_id}")
         context, run_id = kb.build_worker_context(conn, task_id), task.current_run_id
     command,args=command_for(executor)
-    prompt=("You are the sole native external coding-harness session for this already-scoped task. Work only in the supplied cwd; do not orchestrate child tasks. Follow project rules and return a concise factual handoff with tests run. Never create test fixtures against live shared or host state: tests that need a kanban board must spin up an isolated one (set HERMES_KANBAN_HOME to a temp dir); tests that touch the OS keychain, credential stores, or other host state must use a temporary/throwaway store (e.g. a temp keychain via `security create-keychain`) or mock the calls - NEVER the real login keychain or live data, which prompts the user and pollutes their system. Clean up in teardown. If the cwd is a git repository and you changed files: run the relevant tests and COMMIT your work (conventional-commits message referencing the task id) before finishing - completing a code task with a dirty tree is a protocol violation; do not push.\n\n"+context)
+    prompt=("You are the sole native external coding-harness session for this already-scoped task. Work only in the supplied cwd; do not orchestrate child tasks. Follow project rules and return a concise factual handoff with tests run. Never create test fixtures against live shared or host state: tests that need a kanban board must spin up an isolated one (set HERMES_KANBAN_HOME to a temp dir); tests that touch the OS keychain, credential stores, or other host state must use a temporary/throwaway store (e.g. a temp keychain via `security create-keychain`) or mock the calls - NEVER the real login keychain or live data, which prompts the user and pollutes their system. Clean up in teardown. If the cwd is a git repository and you changed files: run the relevant tests and COMMIT your work (conventional-commits message referencing the task id) before finishing - completing a code task with a dirty tree is a protocol violation; do not push.\n\nFinishing protocol: this session ENDS when your turn ends - there is no later turn to come back on. Never end a turn waiting on background work and never schedule a wake-up to resume yourself: commit BEFORE you start any verification you intend to leave running, and if a check is still unfinished when you stop, say plainly what is unverified. End your final message with the single line "+HANDOFF_MARKER+" so completion is distinguishable from a session that stopped mid-thought.\n\n"+context)
     # Project-frozen append-system-prompt (HERMES_KANBAN_APPEND_PROMPT): the
     # ACP-path stand-in for a manual `claude --append-system-prompt`. This ACP
     # server takes no such CLI flag, so the guidance rides at the head of the
@@ -360,19 +456,31 @@ def run_task(*, executor, task_id, workspace, board=None):
     if effort: metadata["effort_requested"]=effort
     if subscription: metadata["subscription"]=subscription
     _stamp_session_metadata(metadata, client)
-    # Phantom-completion guard: an external session that returned no handoff text
-    # AND left no visible work (clean/absent git tree, no new commit) is a
-    # zero-output false positive. Completing it here would mark the task done with
-    # nothing to show, so re-block it for another attempt instead. A run with real
-    # output OR real changes still completes normally, so valid paths are untouched
-    # (t_790b2481).
-    if not (text or "").strip() and not _workspace_shows_work(workspace, run_id, board):
+    # Phantom-completion guard (t_790b2481, widened by t_222f1e4a): a zero-output
+    # run with nothing to show, and a run whose session ended mid-task on a
+    # waiting/self-pacing turn without committing, are both false positives.
+    # Completing either marks the task done with a narrative in place of a
+    # handoff, so re-block for another attempt instead. Runs with a real handoff
+    # (or durably committed work) complete unchanged.
+    signal, refusal = _completion_verdict(text, workspace, run_id, board)
+    metadata["handoff_signal"] = signal
+    if refusal:
         with kb.connect_closing(board=board) as conn:
             kb.block_task(conn, task_id, kind="capability", expected_run_id=run_id,
-                          reason=f"External {executor} ACP session produced no output and no changes (phantom completion blocked)")
-        raise RuntimeError(f"External {executor} ACP session produced zero output and no changes; completion blocked")
-    with kb.connect_closing(board=board) as conn:
-        if not kb.complete_task(conn,task_id,summary=text.strip() or f"External {executor} ACP session completed.",metadata=metadata,expected_run_id=run_id): raise RuntimeError("task was reclaimed or terminal")
+                          reason=f"External {executor} ACP session {refusal} (phantom completion blocked)")
+        raise RuntimeError(f"External {executor} ACP session {refusal}; completion blocked")
+    summary = _strip_marker(text) or f"External {executor} ACP session completed."
+    try:
+        with kb.connect_closing(board=board) as conn:
+            if not kb.complete_task(conn,task_id,summary=summary,metadata=metadata,expected_run_id=run_id): raise RuntimeError("task was reclaimed or terminal")
+    except kb.UncommittedWorkError as exc:
+        # The DoD gate refused (dirty tree / no commit). Without this the worker
+        # process would just die with the task still 'running' and the reason
+        # buried in a traceback; block it so the card names what to fix.
+        with kb.connect_closing(board=board) as conn:
+            kb.block_task(conn, task_id, kind="capability", expected_run_id=run_id,
+                          reason=f"DoD gate refused completion ({exc.kind}): {exc.detail}")
+        raise
     return text
 def main():
     return run_task(executor=os.environ["HERMES_KANBAN_EXECUTOR"],task_id=os.environ["HERMES_KANBAN_TASK"],workspace=os.environ["HERMES_KANBAN_WORKSPACE"],board=os.getenv("HERMES_KANBAN_BOARD")) and 0
