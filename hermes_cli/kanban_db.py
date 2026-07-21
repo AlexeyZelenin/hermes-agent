@@ -326,6 +326,9 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+_CTX_MAX_JOURNAL_ENTRIES = 20     # most recent N journal lines shown
+_CTX_MAX_JOURNAL_BYTES  = 300        # a journal line is a ONE-LINER by contract
+_CTX_MAX_DECISIONS      = 10      # most recent N linked decisions shown
 
 # board.json ``agent_limit`` is a pacing-owned technical safety cap, not an
 # operator knob: how many agents actually run is decided by the pacing
@@ -1382,6 +1385,12 @@ class Task:
     # the dashboard drawer above the description so opening a card gives the
     # reader the why without digging.
     context: Optional[str] = None
+    # The question the card answers ("что решаем") — separate from ``context``
+    # (the frame) and ``body`` (the work). NULL = none.
+    question: Optional[str] = None
+    # Verbatim operator quotes that motivated the card — the source of intent,
+    # stored unparaphrased so the card's origin stays checkable. NULL = none.
+    user_quotes: Optional[str] = None
     # Epoch seconds of the last meaningful change to this row (see the SCHEMA_SQL
     # column note). Seeded to ``created_at`` on insert; bumped by a trigger on
     # content edits. Falls back to ``created_at`` when read from a pre-migration
@@ -1491,6 +1500,13 @@ class Task:
             ),
             context=(
                 row["context"] if "context" in keys and row["context"] else None
+            ),
+            question=(
+                row["question"] if "question" in keys and row["question"] else None
+            ),
+            user_quotes=(
+                row["user_quotes"]
+                if "user_quotes" in keys and row["user_quotes"] else None
             ),
             updated_at=(
                 row["updated_at"]
@@ -1788,6 +1804,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- dashboard drawer above the description so a reader gets the why without
     -- digging. Editable via ``set_task_context`` / the dashboard.
     context              TEXT,
+    -- The QUESTION the card answers — "что решаем", one line or a short
+    -- paragraph, kept separate from both ``context`` (the frame) and ``body``
+    -- (the work). NULL = none. Editable via ``set_task_question``.
+    question             TEXT,
+    -- VERBATIM operator quotes that motivated the card ("пользователь сказал
+    -- что хочет такую-то фичу"). The source of intent: when the card's origin
+    -- is later re-litigated, this is the primary evidence, so it is stored
+    -- unparaphrased. NULL = none. Editable via ``set_task_user_quotes``.
+    user_quotes          TEXT,
     -- Wall-clock (epoch seconds) of the last MEANINGFUL change to this task
     -- row — title, body, context, status, assignee, priority, category, result,
     -- paused, model/effort override, tenant. Seeded to ``created_at`` on insert
@@ -1833,6 +1858,39 @@ CREATE TABLE IF NOT EXISTS task_events (
     kind       TEXT NOT NULL,
     payload    TEXT,
     created_at INTEGER NOT NULL
+);
+
+-- Human-readable WORK JOURNAL: one short line per step ("<date> — сделано
+-- то-то"). Distinct from ``task_events`` (machine state transitions, pruned by
+-- age) and from ``task_comments`` (a discussion thread): the journal is the
+-- narrative of HOW the work went, append-only and never pruned, so a card read
+-- months later still explains itself. Written by workers via
+-- ``add_journal_entry`` and by the operator from the dashboard.
+CREATE TABLE IF NOT EXISTS task_journal (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    entry      TEXT NOT NULL,
+    author     TEXT,
+    created_at INTEGER NOT NULL
+);
+
+-- Link from a task to the DECISION it grew out of. Decisions live in a
+-- SEPARATE store owned by the Roul plugin (``~/.hermes/roul/roul.db``), so the
+-- kanban board cannot join against them — the producer pushes a link here
+-- instead, carrying a snapshot of the question/answer text so the card renders
+-- standalone. ``decision_id`` + ``source`` identify the row in the owning
+-- store for drill-down. Snapshot fields are refreshed by the producer when the
+-- decision is answered.
+CREATE TABLE IF NOT EXISTS task_decision_links (
+    task_id     TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'roul',
+    decision_id INTEGER NOT NULL,
+    question    TEXT,
+    answer      TEXT,
+    status      TEXT NOT NULL DEFAULT 'open',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (task_id, source, decision_id)
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -1929,6 +1987,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_journal_task          ON task_journal(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_decision_links_task   ON task_decision_links(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
@@ -2973,6 +3033,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # NULL (no context) — no behaviour change for rows predating the column.
         _add_column_if_missing(conn, "tasks", "context", "context TEXT")
 
+    # Typed card fields (t_a25cb2b3): the question the card answers and the
+    # verbatim operator quotes it grew from. Both optional; existing rows get
+    # NULL and render exactly as before.
+    if "question" not in cols:
+        _add_column_if_missing(conn, "tasks", "question", "question TEXT")
+    if "user_quotes" not in cols:
+        _add_column_if_missing(conn, "tasks", "user_quotes", "user_quotes TEXT")
+
     # DoD commit gate: run-start git HEAD sha, recorded at claim so completion
     # can tell "landed a commit" from "committed nothing". Idempotent
     # (``_add_column_if_missing`` no-ops when present); legacy runs get NULL and
@@ -3010,13 +3078,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # column-presence guard only skips the convenience trigger on the minimal
     # synthetic ``tasks`` tables some tests migrate.
     _watched = (
-        "title", "body", "context", "status", "assignee", "priority",
-        "category", "result", "paused", "model_override", "effort_override",
-        "tenant",
+        "title", "body", "context", "question", "user_quotes", "status",
+        "assignee", "priority", "category", "result", "paused",
+        "model_override", "effort_override", "tenant",
     )
     live_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "updated_at" in live_cols and all(c in live_cols for c in _watched):
         when = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in _watched)
+        # DROP first: a board migrated before a column joined ``_watched`` still
+        # carries the older WHEN clause, and ``CREATE TRIGGER IF NOT EXISTS``
+        # would silently keep it — edits to the new fields would never bump
+        # ``updated_at``. Recreating is cheap and runs once per DB path.
+        conn.execute("DROP TRIGGER IF EXISTS trg_tasks_touch_updated")
         conn.execute(
             f"""
             CREATE TRIGGER IF NOT EXISTS trg_tasks_touch_updated
@@ -3502,6 +3575,8 @@ def create_task(
     append_system_prompt: Optional[str] = None,
     category: Optional[str] = None,
     context: Optional[str] = None,
+    question: Optional[str] = None,
+    user_quotes: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3668,9 +3743,14 @@ def create_task(
     if category is not None and get_category(conn, category) is None:
         category = None
 
-    # Background / "why" context, separate from the work description (body).
-    # Empty/whitespace collapses to NULL so the drawer can cleanly hide it.
+    # Background / "why" context, the question being answered, and the verbatim
+    # operator quotes — all separate from the work description (body).
+    # Empty/whitespace collapses to NULL so the drawer can cleanly hide them.
     context = (str(context).strip() or None) if context is not None else None
+    question = (str(question).strip() or None) if question is not None else None
+    user_quotes = (
+        (str(user_quotes).strip() or None) if user_quotes is not None else None
+    )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3878,8 +3958,8 @@ def create_task(
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        category, context, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        category, context, question, user_quotes, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3909,6 +3989,8 @@ def create_task(
                         session_id,
                         category,
                         context,
+                        question,
+                        user_quotes,
                         now,  # updated_at seeded to created_at on insert
                     ),
                 )
@@ -7408,6 +7490,44 @@ def set_task_category(
     return True, None
 
 
+# Free-text card fields the operator (or a worker) may set independently of the
+# work description. Whitelisted so ``_set_task_text_field`` can never be talked
+# into writing an arbitrary column.
+_TASK_TEXT_FIELDS = ("context", "question", "user_quotes")
+
+
+def _set_task_text_field(
+    conn: sqlite3.Connection,
+    task_id: str,
+    field: str,
+    value: Optional[str],
+    *,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Set (or clear, with an empty/None value) one typed free-text card field.
+
+    Whitespace-only collapses to NULL. Returns ``(True, None)`` on success or
+    ``(False, reason)`` if the task is unknown. Idempotent: writing the same
+    value is a no-op that still reports success.
+    """
+    if field not in _TASK_TEXT_FIELDS:
+        raise ValueError(f"unknown task text field {field!r}")
+    clean = (str(value).strip() or None) if value is not None else None
+    row = conn.execute(
+        f"SELECT {field} FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False, f"task {task_id} not found"
+    if row[field] == clean:
+        return True, None  # idempotent no-op
+    with write_txn(conn):
+        conn.execute(
+            f"UPDATE tasks SET {field} = ? WHERE id = ?", (clean, task_id)
+        )
+        _append_event(conn, task_id, "edited", {"field": field, "actor": actor})
+    return True, None
+
+
 def set_task_context(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7415,66 +7535,169 @@ def set_task_context(
     *,
     actor: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Set (or clear, with an empty/None ``context``) a task's background field.
+    """Set the card's background "why", separate from ``body`` (the work)."""
+    return _set_task_text_field(conn, task_id, "context", context, actor=actor)
 
-    ``context`` is the free-text "why" shown on the card, separate from the
-    work description (``body``). Whitespace-only collapses to NULL. Returns
-    ``(True, None)`` on success or ``(False, reason)`` if the task is unknown.
-    Idempotent: setting the same value is a no-op that still returns success.
+
+def set_task_question(
+    conn: sqlite3.Connection,
+    task_id: str,
+    question: Optional[str],
+    *,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Set the card's QUESTION — "что решаем", separate from context and body."""
+    return _set_task_text_field(conn, task_id, "question", question, actor=actor)
+
+
+def set_task_user_quotes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    user_quotes: Optional[str],
+    *,
+    actor: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Set the VERBATIM operator quotes the card grew from (source of intent)."""
+    return _set_task_text_field(
+        conn, task_id, "user_quotes", user_quotes, actor=actor,
+    )
+
+
+# --- Work journal -----------------------------------------------------------
+
+
+def add_journal_entry(
+    conn: sqlite3.Connection,
+    task_id: str,
+    entry: str,
+    *,
+    author: Optional[str] = None,
+) -> int:
+    """Append one line to the task's work journal. Returns the new row id.
+
+    The journal is the narrative of HOW the work went — one short line per step
+    — and is append-only: unlike ``task_events`` it is never pruned, so a card
+    read months later still explains itself. Raises ``ValueError`` on an empty
+    entry or an unknown task.
     """
-    value = (str(context).strip() or None) if context is not None else None
-    row = conn.execute(
-        "SELECT context FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
+    if not entry or not entry.strip():
+        raise ValueError("journal entry is required")
+    # Same write-path guard as comments: a worker piping surrogateescape-decoded
+    # output must not be able to crash the INSERT or poison every later reader.
+    text = _scrub_unencodable(entry).strip()
+    author_clean = _scrub_unencodable(author).strip() if author else None
+    now = int(time.time())
+    with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        cur = conn.execute(
+            "INSERT INTO task_journal (task_id, entry, author, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, text, author_clean or None, now),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def list_journal(
+    conn: sqlite3.Connection, task_id: str, *, limit: Optional[int] = None,
+) -> list[dict]:
+    """Return the task's journal entries oldest-first (chronological order).
+
+    ``limit`` keeps the most RECENT n entries while preserving that order, so a
+    capped render still reads as a timeline.
+    """
+    rows = conn.execute(
+        "SELECT id, task_id, entry, author, created_at FROM task_journal "
+        "WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    if limit is not None and limit >= 0:
+        rows = rows[-limit:] if limit else []
+    return [dict(r) for r in rows]
+
+
+# --- Decision links ---------------------------------------------------------
+
+
+def link_decision_to_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    decision_id: int,
+    *,
+    source: str = "roul",
+    question: Optional[str] = None,
+    answer: Optional[str] = None,
+    status: str = "open",
+    actor: Optional[str] = None,
+) -> bool:
+    """Record (or refresh) the link from a task to the decision it grew from.
+
+    Decisions are owned by a separate store (the Roul plugin's ``roul.db``), so
+    the board cannot join against them. The producer pushes a link here with a
+    snapshot of the question/answer text, and calls again with the answer once
+    the decision is resolved — the row is upserted on
+    ``(task_id, source, decision_id)``.
+
+    Returns ``False`` when the task is unknown (the link is not recorded);
+    ``True`` on insert or refresh. Emits a ``decision_linked`` event only when
+    the link is new, so re-syncing answers doesn't spam the timeline.
+    """
+    row = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
-        return False, f"task {task_id} not found"
-    if row["context"] == value:
-        return True, None  # idempotent no-op
+        return False
+    src = (str(source).strip() or "roul")
+    q_text = _scrub_unencodable(question).strip() or None if question else None
+    a_text = _scrub_unencodable(answer).strip() or None if answer else None
+    now = int(time.time())
+    existing = conn.execute(
+        "SELECT 1 FROM task_decision_links "
+        "WHERE task_id = ? AND source = ? AND decision_id = ?",
+        (task_id, src, int(decision_id)),
+    ).fetchone()
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET context = ? WHERE id = ?", (value, task_id)
+            "INSERT INTO task_decision_links "
+            "(task_id, source, decision_id, question, answer, status,"
+            " created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, source, decision_id) DO UPDATE SET "
+            "  question = excluded.question,"
+            "  answer = excluded.answer,"
+            "  status = excluded.status,"
+            "  updated_at = excluded.updated_at",
+            (
+                task_id, src, int(decision_id), q_text, a_text,
+                str(status or "open").strip() or "open",
+                now, now,
+            ),
         )
-        _append_event(
-            conn, task_id, "edited",
-            {"field": "context", "actor": actor},
-        )
-    return True, None
+        if existing is None:
+            _append_event(
+                conn, task_id, "decision_linked",
+                {"decision_id": int(decision_id), "source": src, "actor": actor},
+            )
+    return True
 
 
 def list_task_decisions(
     conn: sqlite3.Connection, task_id: str,
 ) -> list[dict]:
-    """Return the recorded ``decisions`` for a task, newest first.
+    """Return the decisions linked to a task, newest-first.
 
-    The ``decisions`` table is owned by a sibling feature (the decisions
-    table / UI-category work, t_6dc73752). This read is deliberately
-    DEFENSIVE so the card can surface related decisions the moment that
-    table lands without this code being the thing that has to change:
-
-      * table absent            → ``[]``
-      * no ``task_id`` column    → ``[]`` (can't scope to this card)
-      * any query/shape error    → ``[]``
-
-    Each decision is returned as a raw column→value dict so the dashboard can
-    render whatever fields exist (e.g. ``summary``, ``rationale``, ``links``,
-    ``created_at``) without this layer pinning the schema.
+    Reads ``task_decision_links`` — the board's own record of "this card grew
+    out of that decision". The decision bodies themselves live in the owning
+    store; each row carries a snapshot of the question/answer so the card can
+    render without a cross-database read.
     """
-    try:
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}
-    except sqlite3.Error:
-        return []
-    if not cols or "task_id" not in cols:
-        return []
-    # Newest-first when the table carries a timestamp; otherwise fall back to
-    # insertion order via the implicit rowid.
-    order = "created_at DESC" if "created_at" in cols else "rowid DESC"
-    try:
-        rows = conn.execute(
-            f"SELECT * FROM decisions WHERE task_id = ? ORDER BY {order}",
-            (task_id,),
-        ).fetchall()
-    except sqlite3.Error:
-        return []
+    rows = conn.execute(
+        "SELECT task_id, source, decision_id, question, answer, status,"
+        "       created_at, updated_at "
+        "FROM task_decision_links WHERE task_id = ? "
+        "ORDER BY created_at DESC, decision_id DESC",
+        (task_id,),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -8205,6 +8428,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_journal WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_decision_links WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -8228,6 +8453,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_journal WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_decision_links WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
@@ -12535,7 +12762,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     Order:
       1. Task title (mandatory).
-      2. Task body (optional opening post, capped at 8 KB).
+      2. Typed card fields — context / question / user quotes (each optional),
+         then the task body (optional opening post, capped at 8 KB), then the
+         linked decisions and the work journal (most recent
+         ``_CTX_MAX_JOURNAL_ENTRIES``).
       3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
          shown; older attempts collapsed into a one-line summary).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
@@ -12610,9 +12840,48 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"- live `{repo}` → work in `{worktree}`{suffix}")
         lines.append("")
 
+    # Typed card fields (t_a25cb2b3), ordered frame → ask → work: why this card
+    # exists, what it decides, and the operator's own words. Each is optional
+    # and costs nothing when unset.
+    if task.context and task.context.strip():
+        lines.append("## Context")
+        lines.append(_cap(task.context))
+        lines.append("")
+
+    if task.question and task.question.strip():
+        lines.append("## Question")
+        lines.append(_cap(task.question))
+        lines.append("")
+
+    if task.user_quotes and task.user_quotes.strip():
+        lines.append("## User quotes (verbatim — the source of intent)")
+        lines.append(_cap(task.user_quotes))
+        lines.append("")
+
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    decision_links = list_task_decisions(conn, task_id)
+    if decision_links:
+        lines.append("## Decisions this task grew from")
+        for d in decision_links[:_CTX_MAX_DECISIONS]:
+            answer = _cap(d.get("answer"), 400)
+            lines.append(
+                f"- [{d.get('status') or 'open'}] "
+                f"{_cap(d.get('question'), 400) or '(no question recorded)'}"
+                + (f" → {answer}" if answer else "")
+            )
+        lines.append("")
+
+    journal = list_journal(conn, task_id, limit=_CTX_MAX_JOURNAL_ENTRIES)
+    if journal:
+        lines.append("## Work journal (most recent last)")
+        for j in journal:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(j["created_at"]))
+            who = f" [{j['author']}]" if j.get("author") else ""
+            lines.append(f"- {stamp}{who} — {_cap(j['entry'], _CTX_MAX_JOURNAL_BYTES)}")
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,

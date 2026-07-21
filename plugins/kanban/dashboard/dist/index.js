@@ -4242,13 +4242,15 @@
     return h("div", { className: "hermes-kanban-view-scroll" },
       // Uncut title — wraps fully, never truncated.
       h("h2", { className: "hermes-kanban-view-title" }, task.title || tx(t, "untitled", "(untitled)")),
-      // Context intro — introduces the reader to what this card is about. Shown
-      // first, above everything, because the board holds many unrelated cards.
-      task.context
-        ? h("div", { className: "hermes-kanban-view-intro" },
-            h("div", { className: "hermes-kanban-view-intro-label" }, tx(t, "context", "Context")),
-            h(MarkdownBlock, { source: task.context, enabled: props.renderMarkdown }))
-        : null,
+      // Typed intro fields — context (the frame), the question being decided,
+      // and the operator's verbatim words. Shown first, above everything,
+      // because the board holds many unrelated cards.
+      typedFieldSpecs(t).map(function (spec) {
+        if (!task[spec.field]) return null;
+        return h("div", { className: "hermes-kanban-view-intro", key: spec.field },
+          h("div", { className: "hermes-kanban-view-intro-label" }, spec.label),
+          h(MarkdownBlock, { source: task[spec.field], enabled: props.renderMarkdown }));
+      }),
       h(TaskViewProps, { task: task, categories: props.categories }),
       // Self-describing body.
       task.body
@@ -4262,6 +4264,7 @@
             h(MarkdownBlock, { source: task.latest_summary, enabled: props.renderMarkdown }))
         : null,
       h(RelatedDecisions, { decisions: data.decisions }),
+      h(JournalSection, { journal: data.journal || [] }),
       h(TaskViewLinks, { data: data, onOpenTask: props.onOpenTask }),
       h(RunHistoryView, { runs: data.runs }),
     );
@@ -4602,10 +4605,13 @@
         homeBusy: props.homeBusy || {},
         onToggle: props.onToggleHomeSub,
       }),
-      h(ContextEditor, {
-        task: t,
-        renderMarkdown: props.renderMarkdown,
-        onPatch: props.onPatch,
+      typedFieldSpecs(i18n).map(function (spec) {
+        return h(TaskTextEditor, Object.assign({
+          key: spec.field,
+          task: t,
+          renderMarkdown: props.renderMarkdown,
+          onPatch: props.onPatch,
+        }, spec));
       }),
       h(RelatedDecisions, {
         decisions: decisions,
@@ -4615,6 +4621,11 @@
         task: t,
         renderMarkdown: props.renderMarkdown,
         onPatch: props.onPatch,
+      }),
+      h(JournalSection, {
+        taskId: t.id,
+        boardSlug: props.boardSlug,
+        journal: props.data.journal || [],
       }),
       h(DependencyEditor, {
         task: t,
@@ -5054,24 +5065,29 @@
     );
   }
 
-  // Background / "why" for the card, separate from the description. Mirrors
-  // BodyEditor but writes the ``context`` field. Shown above the description so
-  // opening a card gives the reader the why without digging.
-  function ContextEditor(props) {
+  // One typed free-text card field (context / question / user_quotes), each
+  // kept SEPARATE from the description so a reader gets the frame, the ask, and
+  // the operator's own words without digging through one prose blob. Mirrors
+  // BodyEditor; the field name is what it PATCHes.
+  function TaskTextEditor(props) {
     const { t } = useI18n();
+    const field = props.field;
+    const current = props.task[field] || "";
     const [editing, setEditing] = useState(false);
-    const [v, setV] = useState(props.task.context || "");
-    useEffect(function () { setV(props.task.context || ""); }, [props.task.context]);
+    const [v, setV] = useState(current);
+    useEffect(function () { setV(props.task[field] || ""); }, [props.task[field], field]);
     const save = function () {
-      props.onPatch({ context: v }).then(function () { setEditing(false); });
+      const patch = {};
+      patch[field] = v;
+      props.onPatch(patch).then(function () { setEditing(false); });
     };
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head-row" },
-        h("span", { className: "hermes-kanban-section-head" }, tx(t, "context", "Context")),
+        h("span", { className: "hermes-kanban-section-head" }, props.label),
         editing
           ? h("div", { className: "flex gap-1" },
               h(Button, { onClick: save, size: "sm" }, tx(t, "save", "Save")),
-              h(Button, { onClick: function () { setEditing(false); setV(props.task.context || ""); },
+              h(Button, { onClick: function () { setEditing(false); setV(current); },
                 size: "sm",
               }, tx(t, "cancel", "Cancel")),
             )
@@ -5079,30 +5095,56 @@
               type: "button",
               onClick: function () { setEditing(true); },
               className: "hermes-kanban-edit-link",
-              title: "Edit context",
+              title: "Edit " + props.label,
             }, tx(t, "edit", "edit")),
       ),
       editing
         ? h("textarea", {
             className: "hermes-kanban-textarea",
             value: v,
-            rows: 5,
-            placeholder: tx(t, "contextPlaceholder",
-              "Why this task exists — background, the reader needs this to make sense of the card"),
+            rows: props.rows || 5,
+            placeholder: props.placeholder,
             onChange: function (e) { setV(e.target.value); },
           })
-        : props.task.context
-          ? h(MarkdownBlock, { source: props.task.context, enabled: props.renderMarkdown })
-          : h("div", { className: "text-xs text-muted-foreground italic" },
-              tx(t, "noContext", "— no context —")),
+        : current
+          ? h(MarkdownBlock, { source: current, enabled: props.renderMarkdown })
+          : h("div", { className: "text-xs text-muted-foreground italic" }, props.empty),
     );
   }
 
-  // Read-only "Related decisions" section: decisions recorded against this
-  // card (the "что нарешали" the operator wants visible without digging).
-  // The backend read is defensive, so ``decisions`` is simply empty until the
-  // sibling decisions-table feature lands; render nothing in that case rather
-  // than an empty placeholder that would just add noise.
+  // Labels/placeholders for the typed fields, so the drawer and the read-only
+  // popup name them identically.
+  function typedFieldSpecs(t) {
+    return [
+      {
+        field: "context",
+        label: tx(t, "context", "Context"),
+        empty: tx(t, "noContext", "— no context —"),
+        placeholder: tx(t, "contextPlaceholder",
+          "Why this task exists — background, the reader needs this to make sense of the card"),
+      },
+      {
+        field: "question",
+        label: tx(t, "question", "Question"),
+        empty: tx(t, "noQuestion", "— no question —"),
+        rows: 3,
+        placeholder: tx(t, "questionPlaceholder",
+          "What are we deciding here? One or two sentences."),
+      },
+      {
+        field: "user_quotes",
+        label: tx(t, "userQuotes", "User quotes"),
+        empty: tx(t, "noUserQuotes", "— no quotes —"),
+        placeholder: tx(t, "userQuotesPlaceholder",
+          "Verbatim — exactly how the request was phrased. The source of intent."),
+      },
+    ];
+  }
+
+  // Read-only "Related decisions" section: the decisions this card grew out of.
+  // Decisions live in their own store and are pushed here as links carrying a
+  // snapshot of the question/answer, so a card explains its own origin. Nothing
+  // linked → render nothing rather than an empty placeholder.
   function RelatedDecisions(props) {
     const { t } = useI18n();
     const decisions = props.decisions || [];
@@ -5111,29 +5153,84 @@
       h("div", { className: "hermes-kanban-section-head" },
         `${tx(t, "relatedDecisions", "Related Decisions")} (${decisions.length})`),
       decisions.map(function (d, i) {
-        // Render defensively — the decisions schema is owned elsewhere, so
-        // pick common fields when present and never assume any single one.
-        const summary = d.summary || d.title || d.decision || null;
-        const rationale = d.rationale || d.reason || d.body || null;
         const when = d.created_at != null && timeAgo ? timeAgo(d.created_at) : null;
-        const links = Array.isArray(d.links) ? d.links : null;
-        return h("div", { key: d.id != null ? d.id : i, className: "hermes-kanban-comment" },
+        return h("div", { key: d.decision_id != null ? d.decision_id : i, className: "hermes-kanban-comment" },
           h("div", { className: "hermes-kanban-comment-head" },
             h("span", { className: "hermes-kanban-comment-author" },
-              summary || tx(t, "decision", "decision")),
+              d.question || tx(t, "decision", "decision")),
+            h(Badge, { variant: "outline" }, d.status || "open"),
             when ? h("span", { className: "hermes-kanban-comment-ago" }, when) : null,
           ),
-          rationale
-            ? h(MarkdownBlock, { source: rationale, enabled: props.renderMarkdown })
-            : null,
-          links && links.length
-            ? h("div", { className: "hermes-kanban-deps-chips" },
-                links.map(function (lk, j) {
-                  return h("span", { key: j, className: "hermes-kanban-dep-chip" }, String(lk));
-                }))
+          d.answer
+            ? h(MarkdownBlock, { source: d.answer, enabled: props.renderMarkdown })
             : null,
         );
       }),
+    );
+  }
+
+  // Work journal — one short line per step, oldest first. Read-only when no
+  // ``taskId`` is given (the view popup); the drawer passes one and gets an
+  // inline composer. The POST returns the refreshed journal, so the section
+  // updates without reloading the whole drawer.
+  function JournalSection(props) {
+    const { t } = useI18n();
+    const [entries, setEntries] = useState(props.journal || []);
+    const [draft, setDraft] = useState("");
+    const [busy, setBusy] = useState(false);
+    useEffect(function () { setEntries(props.journal || []); }, [props.journal]);
+    const editable = !!props.taskId;
+    const submit = function () {
+      const entry = draft.trim();
+      if (!entry || busy) return;
+      setBusy(true);
+      SDK.fetchJSON(
+        withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/journal`, props.boardSlug),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ entry }),
+        },
+      ).then(function (d) {
+        setEntries(d.journal || []);
+        setDraft("");
+      }).finally(function () { setBusy(false); });
+    };
+    if (!editable && entries.length === 0) return null;
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" },
+        `${tx(t, "journal", "Journal")}${entries.length ? ` (${entries.length})` : ""}`),
+      entries.length === 0
+        ? h("div", { className: "text-xs text-muted-foreground italic" },
+            tx(t, "noJournal", "— no journal entries —"))
+        : entries.map(function (j) {
+            const when = j.created_at != null && timeAgo ? timeAgo(j.created_at) : null;
+            return h("div", { key: j.id, className: "hermes-kanban-comment" },
+              h("div", { className: "hermes-kanban-comment-head" },
+                j.author
+                  ? h("span", { className: "hermes-kanban-comment-author" }, j.author)
+                  : null,
+                when ? h("span", { className: "hermes-kanban-comment-ago" }, when) : null,
+              ),
+              h("div", { className: "text-sm" }, j.entry),
+            );
+          }),
+      editable
+        ? h("div", { className: "hermes-kanban-drawer-comment-row" },
+            h(Input, {
+              value: draft,
+              onChange: function (e) { setDraft(e.target.value); },
+              onKeyDown: function (e) {
+                if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
+              },
+              placeholder: tx(t, "addJournal",
+                "One line: what was done… (Enter to submit)"),
+              className: "h-8 text-sm flex-1",
+            }),
+            h(Button, { onClick: submit, size: "sm", disabled: busy },
+              tx(t, "add", "Add")),
+          )
+        : null,
     );
   }
 

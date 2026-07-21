@@ -747,10 +747,11 @@ def get_task(
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
             "child_results": child_results,
-            # Related decisions recorded for this card (empty until the sibling
-            # decisions-table feature lands; read is defensive — see
-            # kanban_db.list_task_decisions).
+            # Decisions this card grew out of, pushed here by the owning
+            # decisions store (see kanban_db.link_decision_to_task).
             "decisions": kanban_db.list_task_decisions(conn, task_id),
+            # Work journal — one line per step, oldest first.
+            "journal": kanban_db.list_journal(conn, task_id),
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(
@@ -774,6 +775,10 @@ class CreateTaskBody(BaseModel):
     body: Optional[str] = None
     # Background / "why" for the card, separate from the work description.
     context: Optional[str] = None
+    # What the card decides ("что решаем").
+    question: Optional[str] = None
+    # Verbatim operator quotes the card grew from (source of intent).
+    user_quotes: Optional[str] = None
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
@@ -826,6 +831,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_max_turns=payload.goal_max_turns,
             category=payload.category,
             context=payload.context,
+            question=payload.question,
+            user_quotes=payload.user_quotes,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -1019,9 +1026,11 @@ class UpdateTaskBody(BaseModel):
     priority: Optional[int] = None
     title: Optional[str] = None
     body: Optional[str] = None
-    # Background / "why" for the card. Empty string clears it; None leaves it
-    # untouched (same convention as ``category``).
+    # Typed card fields. Empty string clears; None leaves untouched (same
+    # convention as ``category``).
     context: Optional[str] = None
+    question: Optional[str] = None
+    user_quotes: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
     # First-class pause toggle. True pauses (dispatcher skips, status
@@ -1136,13 +1145,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             if not ok:
                 raise HTTPException(status_code=400, detail=err or "invalid category")
 
-        # --- context ------------------------------------------------------
-        # Background / "why" field. Empty string clears it (→ NULL); a
-        # non-empty value sets it. None leaves it untouched.
-        if payload.context is not None:
-            ok, err = kanban_db.set_task_context(
-                conn, task_id, payload.context, actor="dashboard",
-            )
+        # --- typed text fields ---------------------------------------------
+        # Background / "why", the question being decided, and the verbatim
+        # operator quotes. Empty string clears (→ NULL); a non-empty value
+        # sets it; None leaves it untouched.
+        for setter, value in (
+            (kanban_db.set_task_context, payload.context),
+            (kanban_db.set_task_question, payload.question),
+            (kanban_db.set_task_user_quotes, payload.user_quotes),
+        ):
+            if value is None:
+                continue
+            ok, err = setter(conn, task_id, value, actor="dashboard")
             if not ok:
                 raise HTTPException(status_code=404, detail=err or "task not found")
 
@@ -1353,6 +1367,33 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
             conn, task_id, author=payload.author or "dashboard", body=payload.body,
         )
         return {"ok": True}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Work journal — one line per step (t_a25cb2b3)
+# ---------------------------------------------------------------------------
+
+class JournalBody(BaseModel):
+    entry: str
+    author: Optional[str] = "dashboard"
+
+
+@router.post("/tasks/{task_id}/journal")
+def add_journal_entry(task_id: str, payload: JournalBody,
+                      board: Optional[str] = Query(None)):
+    if not payload.entry.strip():
+        raise HTTPException(status_code=400, detail="entry is required")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        kanban_db.add_journal_entry(
+            conn, task_id, payload.entry, author=payload.author or "dashboard",
+        )
+        return {"ok": True, "journal": kanban_db.list_journal(conn, task_id)}
     finally:
         conn.close()
 

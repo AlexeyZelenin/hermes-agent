@@ -1,21 +1,23 @@
-"""Structural card fields: task CONTEXT ("why") + RELATED DECISIONS (t_cd5e8574).
+"""Typed card fields: context / question / user quotes, journal, decision links.
 
-Two additions land here:
+The card is a set of TYPED fields instead of one prose blob (t_cd5e8574 landed
+``context``; t_a25cb2b3 adds the rest), so a reader can later reconstruct WHY
+the task exists and HOW the work went:
 
-  * ``tasks.context`` — a free-text background/"why" field kept SEPARATE from
-    ``body`` (the work description), so opening a card shows the reader the why
-    without digging. Exercised at the DB layer (``kanban_db``) and through the
-    dashboard plugin's REST surface (create / patch / get).
+  * ``tasks.context`` / ``tasks.question`` / ``tasks.user_quotes`` — the frame,
+    the ask, and the operator's verbatim words, each separate from ``body``
+    (the work description).
+  * ``task_journal`` — append-only one-line-per-step work log.
+  * ``task_decision_links`` — "this card grew out of that decision". Decisions
+    live in a store this database cannot join against (the Roul plugin's
+    ``roul.db``), so the owning store pushes a link carrying a snapshot of the
+    question/answer.
 
-  * ``kanban_db.list_task_decisions`` — a DEFENSIVE read of a sibling-owned
-    ``decisions`` table (t_6dc73752). It must degrade to ``[]`` when the table
-    is absent or lacks a ``task_id`` column, and return card-scoped rows
-    newest-first when the table exists. The dashboard surfaces these on the
-    card so the reader sees "что нарешали" without digging.
-
-The plugin router is attached to a bare FastAPI app (mirroring
-``test_kanban_dashboard_plugin.py``) so the REST surface is testable without
-the full dashboard. All state is an isolated per-test ``HERMES_HOME``.
+Exercised at the DB layer (``kanban_db``), through the dashboard plugin's REST
+surface, and in the worker context dump. The plugin router is attached to a
+bare FastAPI app (mirroring ``test_kanban_dashboard_plugin.py``) so the REST
+surface is testable without the full dashboard. All state is an isolated
+per-test ``HERMES_HOME``.
 """
 
 from __future__ import annotations
@@ -68,123 +70,215 @@ def client(kanban_home):
     return TestClient(app)
 
 
-def _make_decisions_table(with_task_id: bool = True) -> None:
-    """Create a stand-in ``decisions`` table on the active board's DB.
-
-    Simulates the sibling feature (t_6dc73752) so the defensive reader has a
-    real table to scope against. ``with_task_id=False`` builds a table missing
-    the scoping column to exercise the graceful-empty path.
-    """
-    with kb.connect() as conn:
-        if with_task_id:
-            conn.execute(
-                "CREATE TABLE decisions ("
-                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                "  task_id TEXT,"
-                "  summary TEXT,"
-                "  rationale TEXT,"
-                "  created_at INTEGER"
-                ")"
-            )
-        else:
-            conn.execute(
-                "CREATE TABLE decisions (id INTEGER PRIMARY KEY, note TEXT)"
-            )
-        conn.commit()
-
-
-def _insert_decision(task_id: str, summary: str, rationale: str, created_at: int) -> None:
-    with kb.connect() as conn:
-        conn.execute(
-            "INSERT INTO decisions (task_id, summary, rationale, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, summary, rationale, created_at),
-        )
-        conn.commit()
-
-
 # ---------------------------------------------------------------------------
-# DB layer — context field
+# DB layer — typed text fields
 # ---------------------------------------------------------------------------
 
 
-def test_create_task_stores_context(kanban_home):
+def test_create_task_stores_typed_fields(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(
             conn, title="T", body="do the work",
             context="why: operator asked for it",
+            question="do we split the blob into fields?",
+            user_quotes="«у каждой задачи должен быть контекст»",
         )
         task = kb.get_task(conn, tid)
     assert task.context == "why: operator asked for it"
-    # Context is a SEPARATE field from the work description.
+    assert task.question == "do we split the blob into fields?"
+    assert task.user_quotes == "«у каждой задачи должен быть контекст»"
+    # Each is a SEPARATE field from the work description.
     assert task.body == "do the work"
 
 
-def test_context_whitespace_collapses_to_none(kanban_home):
+@pytest.mark.parametrize("field", ["context", "question", "user_quotes"])
+def test_typed_field_whitespace_collapses_to_none(kanban_home, field):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="T", context="   \n  ")
+        tid = kb.create_task(conn, title="T", **{field: "   \n  "})
         task = kb.get_task(conn, tid)
-    assert task.context is None
+    assert getattr(task, field) is None
 
 
-def test_create_task_without_context_is_none(kanban_home):
+def test_create_task_without_typed_fields_is_none(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="T")
         task = kb.get_task(conn, tid)
-    assert task.context is None
+    assert (task.context, task.question, task.user_quotes) == (None, None, None)
 
 
-def test_set_task_context_set_clear_idempotent_and_unknown(kanban_home):
+@pytest.mark.parametrize(
+    "field,setter_name",
+    [
+        ("context", "set_task_context"),
+        ("question", "set_task_question"),
+        ("user_quotes", "set_task_user_quotes"),
+    ],
+)
+def test_setters_set_clear_idempotent_and_unknown(kanban_home, field, setter_name):
+    setter = getattr(kb, setter_name)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="T")
 
-        ok, err = kb.set_task_context(conn, tid, "background story")
+        ok, err = setter(conn, tid, "some text")
         assert ok and err is None
-        assert kb.get_task(conn, tid).context == "background story"
+        assert getattr(kb.get_task(conn, tid), field) == "some text"
 
         # Idempotent: same value again is a no-op success.
-        ok, err = kb.set_task_context(conn, tid, "background story")
+        ok, err = setter(conn, tid, "some text")
         assert ok and err is None
 
         # Empty string clears back to NULL.
-        ok, err = kb.set_task_context(conn, tid, "")
+        ok, err = setter(conn, tid, "")
         assert ok and err is None
-        assert kb.get_task(conn, tid).context is None
+        assert getattr(kb.get_task(conn, tid), field) is None
 
         # Unknown task id fails cleanly.
-        ok, err = kb.set_task_context(conn, "t_nope", "x")
+        ok, err = setter(conn, "t_nope", "x")
         assert not ok
         assert "not found" in (err or "")
 
 
+def test_editing_a_typed_field_bumps_updated_at(kanban_home):
+    """The touch trigger must watch the new columns, not just the old ones."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="T")
+        conn.execute("UPDATE tasks SET updated_at = 1 WHERE id = ?", (tid,))
+        conn.commit()
+        kb.set_task_question(conn, tid, "what are we deciding?")
+        assert kb.get_task(conn, tid).updated_at > 1
+
+
+def test_set_task_text_field_rejects_unknown_column(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="T")
+        with pytest.raises(ValueError):
+            kb._set_task_text_field(conn, tid, "status", "done")
+
+
 # ---------------------------------------------------------------------------
-# DB layer — defensive decisions read
+# DB layer — work journal
 # ---------------------------------------------------------------------------
 
 
-def test_list_task_decisions_no_table_returns_empty(kanban_home):
+def test_journal_appends_in_chronological_order(kanban_home):
     with kb.connect() as conn:
-        assert kb.list_task_decisions(conn, "t_any") == []
+        tid = kb.create_task(conn, title="T")
+        assert kb.list_journal(conn, tid) == []
+        kb.add_journal_entry(conn, tid, "read the schema", author="glm")
+        kb.add_journal_entry(conn, tid, "added the columns", author="glm")
+        rows = kb.list_journal(conn, tid)
+    assert [r["entry"] for r in rows] == ["read the schema", "added the columns"]
+    assert all(r["author"] == "glm" for r in rows)
 
 
-def test_list_task_decisions_missing_task_id_col_returns_empty(kanban_home):
-    _make_decisions_table(with_task_id=False)
+def test_journal_limit_keeps_most_recent_in_order(kanban_home):
     with kb.connect() as conn:
-        assert kb.list_task_decisions(conn, "t_any") == []
+        tid = kb.create_task(conn, title="T")
+        for i in range(5):
+            kb.add_journal_entry(conn, tid, f"step {i}")
+        rows = kb.list_journal(conn, tid, limit=2)
+    assert [r["entry"] for r in rows] == ["step 3", "step 4"]
 
 
-def test_list_task_decisions_returns_scoped_rows_newest_first(kanban_home):
-    _make_decisions_table(with_task_id=True)
-    _insert_decision("t_a", "older", "r1", created_at=100)
-    _insert_decision("t_a", "newer", "r2", created_at=200)
-    _insert_decision("t_b", "other card", "r3", created_at=300)
-
+def test_journal_rejects_empty_entry_and_unknown_task(kanban_home):
     with kb.connect() as conn:
-        rows = kb.list_task_decisions(conn, "t_a")
+        tid = kb.create_task(conn, title="T")
+        with pytest.raises(ValueError):
+            kb.add_journal_entry(conn, tid, "   ")
+        with pytest.raises(ValueError):
+            kb.add_journal_entry(conn, "t_nope", "orphan line")
 
-    # Scoped to t_a only, newest-first by created_at.
-    assert [r["summary"] for r in rows] == ["newer", "older"]
-    assert all(r["task_id"] == "t_a" for r in rows)
+
+def test_deleting_a_task_removes_its_journal_and_links(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="T")
+        kb.add_journal_entry(conn, tid, "step")
+        kb.link_decision_to_task(conn, tid, 1, question="q?")
+        assert kb.delete_task(conn, tid)
+        assert kb.list_journal(conn, tid) == []
+        assert kb.list_task_decisions(conn, tid) == []
+
+
+# ---------------------------------------------------------------------------
+# DB layer — decision links
+# ---------------------------------------------------------------------------
+
+
+def test_link_decision_unknown_task_is_refused(kanban_home):
+    with kb.connect() as conn:
+        assert kb.link_decision_to_task(conn, "t_nope", 1, question="q?") is False
+
+
+def test_link_decision_upserts_and_returns_newest_first(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="T")
+        assert kb.link_decision_to_task(conn, tid, 1, question="older?")
+        assert kb.link_decision_to_task(conn, tid, 2, question="newer?")
+        # Re-pushing the SAME decision refreshes it instead of duplicating.
+        assert kb.link_decision_to_task(
+            conn, tid, 1, question="older?", answer="да", status="answered",
+        )
+        rows = kb.list_task_decisions(conn, tid)
+
+    assert len(rows) == 2
+    by_id = {r["decision_id"]: r for r in rows}
+    assert by_id[1]["answer"] == "да"
+    assert by_id[1]["status"] == "answered"
+    assert by_id[2]["status"] == "open"
+
+
+def test_link_decision_is_scoped_to_its_task(kanban_home):
+    with kb.connect() as conn:
+        a = kb.create_task(conn, title="A")
+        b = kb.create_task(conn, title="B")
+        kb.link_decision_to_task(conn, a, 1, question="mine")
+        kb.link_decision_to_task(conn, b, 2, question="theirs")
+        assert [r["question"] for r in kb.list_task_decisions(conn, a)] == ["mine"]
+
+
+def test_first_link_emits_event_and_refresh_does_not(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="T")
+        kb.link_decision_to_task(conn, tid, 1, question="q?")
+        kb.link_decision_to_task(conn, tid, 1, question="q?", answer="a")
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert kinds.count("decision_linked") == 1
+
+
+# ---------------------------------------------------------------------------
+# Worker context — the typed fields must reach the worker
+# ---------------------------------------------------------------------------
+
+
+def test_worker_context_renders_typed_fields_journal_and_decisions(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="T", body="the work",
+            context="the frame", question="the ask",
+            user_quotes="«точная цитата»",
+        )
+        kb.link_decision_to_task(
+            conn, tid, 7, question="sqlite или postgres?", answer="sqlite",
+            status="answered",
+        )
+        kb.add_journal_entry(conn, tid, "schema landed", author="glm")
+        text = kb.build_worker_context(conn, tid)
+
+    assert "## Context" in text and "the frame" in text
+    assert "## Question" in text and "the ask" in text
+    assert "«точная цитата»" in text
+    assert "sqlite или postgres?" in text and "sqlite" in text
+    assert "schema landed" in text
+    # Ordering: frame → ask → quotes → work.
+    assert text.index("## Context") < text.index("## Question") < text.index("## Body")
+
+
+def test_worker_context_omits_unset_typed_sections(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="T", body="the work")
+        text = kb.build_worker_context(conn, tid)
+    for head in ("## Context", "## Question", "## User quotes", "## Work journal"):
+        assert head not in text
 
 
 # ---------------------------------------------------------------------------
@@ -192,50 +286,89 @@ def test_list_task_decisions_returns_scoped_rows_newest_first(kanban_home):
 # ---------------------------------------------------------------------------
 
 
-def test_api_create_and_get_task_context(client):
+def test_api_create_and_get_task_typed_fields(client):
     r = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "Card", "body": "work", "context": "the why"},
+        json={
+            "title": "Card", "body": "work", "context": "the why",
+            "question": "the ask", "user_quotes": "«как просил»",
+        },
     )
     assert r.status_code == 200, r.text
     tid = r.json()["task"]["id"]
-    assert r.json()["task"]["context"] == "the why"
+    assert r.json()["task"]["question"] == "the ask"
 
     got = client.get(f"/api/plugins/kanban/tasks/{tid}")
     assert got.status_code == 200
-    assert got.json()["task"]["context"] == "the why"
-    # Empty by default — the sibling decisions table isn't present.
+    task = got.json()["task"]
+    assert task["context"] == "the why"
+    assert task["user_quotes"] == "«как просил»"
+    # Nothing linked / logged yet.
     assert got.json()["decisions"] == []
+    assert got.json()["journal"] == []
 
 
-def test_api_patch_sets_and_clears_context(client):
+def test_api_patch_sets_and_clears_typed_fields(client):
     tid = client.post(
         "/api/plugins/kanban/tasks", json={"title": "Card"},
     ).json()["task"]["id"]
 
-    r = client.patch(
-        f"/api/plugins/kanban/tasks/{tid}", json={"context": "added later"},
+    for field in ("context", "question", "user_quotes"):
+        r = client.patch(
+            f"/api/plugins/kanban/tasks/{tid}", json={field: "added later"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["task"][field] == "added later"
+
+        # Empty string clears it back to null.
+        r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={field: ""})
+        assert r.status_code == 200
+        assert r.json()["task"][field] is None
+
+
+def test_api_journal_append_and_read_back(client):
+    tid = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Card"},
+    ).json()["task"]["id"]
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{tid}/journal",
+        json={"entry": "разобрался со схемой"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["task"]["context"] == "added later"
+    assert [e["entry"] for e in r.json()["journal"]] == ["разобрался со схемой"]
 
-    # Empty string clears it back to null.
-    r = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"context": ""})
-    assert r.status_code == 200
-    assert r.json()["task"]["context"] is None
+    got = client.get(f"/api/plugins/kanban/tasks/{tid}")
+    assert [e["entry"] for e in got.json()["journal"]] == ["разобрался со схемой"]
 
 
-def test_api_get_task_surfaces_related_decisions(client):
+def test_api_journal_rejects_empty_and_unknown_task(client):
+    tid = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Card"},
+    ).json()["task"]["id"]
+    assert client.post(
+        f"/api/plugins/kanban/tasks/{tid}/journal", json={"entry": "  "},
+    ).status_code == 400
+    assert client.post(
+        "/api/plugins/kanban/tasks/t_nope/journal", json={"entry": "x"},
+    ).status_code == 404
+
+
+def test_api_get_task_surfaces_linked_decisions(client, kanban_home):
     tid = client.post(
         "/api/plugins/kanban/tasks", json={"title": "Card"},
     ).json()["task"]["id"]
 
-    _make_decisions_table(with_task_id=True)
-    _insert_decision(tid, "chose sqlite", "simplest durable store", created_at=100)
+    with kb.connect() as conn:
+        kb.link_decision_to_task(
+            conn, tid, 42, question="chose sqlite?", answer="simplest durable store",
+            status="answered",
+        )
 
     got = client.get(f"/api/plugins/kanban/tasks/{tid}")
     assert got.status_code == 200
     decisions = got.json()["decisions"]
     assert len(decisions) == 1
-    assert decisions[0]["summary"] == "chose sqlite"
+    assert decisions[0]["decision_id"] == 42
+    assert decisions[0]["answer"] == "simplest durable store"
     assert decisions[0]["task_id"] == tid
