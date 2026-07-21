@@ -52,10 +52,19 @@ def _set_created_at(kb, ids):
 
 
 def _write_zeus_ranks(home, ranks, board="default"):
-    """Create a minimal zeus.db/task_flags carrying the given {task_id: rank}."""
-    zeus_dir = os.path.join(home, "zeus")
-    os.makedirs(zeus_dir, exist_ok=True)
-    conn = sqlite3.connect(os.path.join(zeus_dir, "zeus.db"))
+    """Create a minimal ledger ``task_flags`` table with {task_id: rank}.
+
+    The path comes from the production reader (``default_zeus_db_path``)
+    rather than a literal: the ledger moved from ``<home>/zeus/zeus.db`` to
+    ``<home>/roul/roul.db`` (b39917412), and a stale literal seeds a file
+    nobody reads — the ranks then silently do nothing.
+    """
+    from hermes_cli.zeus_tokens import default_zeus_db_path
+
+    db = default_zeus_db_path()
+    assert str(db).startswith(str(home)), f"ledger path escaped test home: {db}"
+    os.makedirs(db.parent, exist_ok=True)
+    conn = sqlite3.connect(str(db))
     try:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS task_flags ("

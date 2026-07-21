@@ -25,6 +25,20 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import run_slash
 
 
+def _only_worker_dead(worker_pid: int):
+    """``_pid_alive`` stub that kills exactly one pid and nothing else.
+
+    ``detect_crashed_workers`` asks about two pids per running task: the
+    worker pid and — via ``_claim_owner_alive`` — the dispatcher that owns
+    the claim. A blanket ``lambda pid: False`` reports the dispatcher dead
+    too, which routes the task into the service-restart carve-out
+    (3c674449a): released as ``killed_by_restart``, no failure counted, and
+    absent from the ``crashed`` return. Tests that mean "the worker crashed"
+    must leave the dispatcher alive.
+    """
+    return lambda pid: int(pid or 0) != worker_pid
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -1511,7 +1525,7 @@ def test_multiple_attempts_preserved_as_runs(kanban_home):
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, 98765)
         original_alive = _kb._pid_alive
-        _kb._pid_alive = lambda pid: False
+        _kb._pid_alive = _only_worker_dead(98765)
         try:
             kb.detect_crashed_workers(conn)
         finally:
@@ -1541,7 +1555,7 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
         kb._set_worker_pid(conn, tid, 98765)
-        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(_kb, "_pid_alive", _only_worker_dead(98765))
         assert kb.detect_crashed_workers(conn) == [tid]
 
         kb.claim_task(conn, tid)
@@ -1582,7 +1596,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
         kb._set_worker_pid(conn, tid, 98765)
-        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(_kb, "_pid_alive", _only_worker_dead(98765))
         assert kb.detect_crashed_workers(conn) == [tid]
 
         kb.claim_task(conn, tid)
@@ -2093,8 +2107,12 @@ def test_completed_event_payload_carries_summary(kanban_home):
         events = kb.list_events(conn, tid)
         comp = [e for e in events if e.kind == "completed"]
         assert len(comp) == 1
-        # First-line-only, within the 400-char cap, preserved verbatim.
-        assert comp[0].payload["summary"] == "handoff line 1"
+        # First line only — and since the rest of the handoff was dropped,
+        # the cut is marked rather than silent (d75d113df), so a reviewer
+        # knows to open the run row for the full text.
+        assert comp[0].payload["summary"] == (
+            "handoff line 1 …[truncated; full handoff on the run row]"
+        )
     finally:
         conn.close()
 
@@ -3726,10 +3744,16 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    calls = {"connect": 0, "to_thread": 0}
+    # Connects are attributed to the ``to_thread`` callable that made them,
+    # and the run is bounded by *dispatch ticks*, not by a raw ``to_thread``
+    # count. The old raw counters broke twice as unrelated per-tick probes
+    # were added (review probe f55d94a1e, skip-report a33495129) — this test's
+    # claim is only about the dispatch path, so it counts only that.
+    dispatch_connects: list[int] = []  # connects made by _tick_once, per tick
+    connects_in_fn = {"current": 0}
 
     def _connect(*args, **kwargs):
-        calls["connect"] += 1
+        connects_in_fn["current"] += 1
         if corrupt_exc == "guard":
             raise _kb.KanbanDbCorruptError(
                 corrupt_db,
@@ -3739,17 +3763,17 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         raise sqlite3.DatabaseError("file is not a database")
 
     async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
-        calls["to_thread"] += 1
-        result = fn(*args, **kwargs)
-        if calls["to_thread"] >= 6:
-            runner._running = False
+        name = getattr(fn, "__name__", "")
+        outer, connects_in_fn["current"] = connects_in_fn["current"], 0
+        try:
+            result = fn(*args, **kwargs)
+        finally:
+            inner = connects_in_fn["current"]
+            connects_in_fn["current"] = outer
+        if name == "_tick_once":
+            dispatch_connects.append(inner)
+            if len(dispatch_connects) >= 2:
+                runner._running = False
         return result
 
     async def _sleep(_delay):
@@ -3771,13 +3795,10 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # The point of the fix: the first dispatch tick opens the board once and
+    # hits the corruption; the second one does not touch it at all, because
+    # the corrupt fingerprint is now on the disabled list.
+    assert dispatch_connects == [1, 0]
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(

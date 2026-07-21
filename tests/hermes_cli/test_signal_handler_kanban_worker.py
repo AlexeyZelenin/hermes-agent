@@ -79,31 +79,17 @@ def _synthetic_worker_script() -> str:
 
 
 def _is_alive_like_dispatcher(pid: int) -> bool:
-    """Mirrors hermes_cli/kanban_db.py:_pid_alive on Linux.
+    """Ask the *production* liveness probe, not a copy of it.
 
-    A zombie is treated as dead — the dispatcher's _pid_alive checks
-    /proc/<pid>/status for State: Z. We replicate that here so a clean
-    os._exit followed by zombie-state is correctly counted as dead.
+    The question this test asks is "would the dispatcher still consider the
+    worker alive?", so it calls the dispatcher's own ``_pid_alive``. An
+    earlier hand-rolled copy here only knew the Linux ``/proc`` zombie check;
+    on macOS the exited-but-unreaped child still answered ``kill(pid, 0)``
+    and the test read a clean ``os._exit(0)`` as "still alive".
     """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    if sys.platform == "linux":
-        try:
-            with open(f"/proc/{pid}/status") as f:
-                for line in f:
-                    if line.startswith("State:"):
-                        if "Z" in line.split(":", 1)[1]:
-                            return False
-                        break
-        except (FileNotFoundError, PermissionError, OSError):
-            pass
-    return True
+    from hermes_cli.kanban_db import _pid_alive
+
+    return _pid_alive(pid)
 
 
 def _spawn_synthetic(env_overrides: dict) -> subprocess.Popen:
