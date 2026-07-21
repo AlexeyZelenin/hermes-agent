@@ -2677,6 +2677,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_board_capped": res.skipped_board_capped,
             "auto_assigned_default": res.auto_assigned_default,
+            "integrated": res.integrated,
+            "integration_blocked": res.integration_blocked,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2697,6 +2699,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if res.integrated:
+        print(f"Auto-merged:  {', '.join(res.integrated)}")
+    if res.integration_blocked:
+        print(f"Merge-blocked: {', '.join(res.integration_blocked)}")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "

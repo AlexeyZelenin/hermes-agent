@@ -226,6 +226,7 @@ def integrate_branch(
     test_cmd: Optional[Sequence[str]] = None,
     test_timeout: int = 3600,
     run_tests: bool = True,
+    task_id: Optional[str] = None,
 ) -> IntegrationResult:
     """Merge ``branch`` into ``trunk`` on the primary checkout, gated by tests.
 
@@ -236,8 +237,10 @@ def integrate_branch(
        → ``ALREADY_LANDED`` (idempotent, non-destructive).
     3. Refuse a dirty primary checkout (``DIRTY_ANCHOR``) rather than clobber
        uncommitted work.
-    4. Check out trunk, ``git merge --no-ff``. Conflict → abort, restore the
-       original branch, ``CONFLICT``.
+    4. Check out trunk and land the branch: fast-forward when trunk has not
+       diverged (no merge-commit noise), otherwise a ``--no-ff`` merge commit
+       referencing ``task_id``. A merge conflict → abort, restore the original
+       branch, ``CONFLICT``.
     5. Run the landing-gate suite on the merged tree. Red → hard-reset trunk to
        its pre-merge tip, restore the original branch, ``TESTS_FAILED``.
     6. Green → leave the primary on the advanced trunk → ``LANDED``.
@@ -286,18 +289,26 @@ def integrate_branch(
             detail=f"could not checkout trunk: {(co.stderr or co.stdout).strip()}",
         )
 
-    merge = _git(
-        repo_root,
-        ["merge", "--no-ff", "--no-edit", "-m",
-         f"Merge branch '{branch}' into {trunk}", branch],
-    )
-    if merge.returncode != 0:
-        _git(repo_root, ["merge", "--abort"])
-        _restore()
-        return IntegrationResult(
-            Outcome.CONFLICT, branch, trunk,
-            detail=(merge.stdout or merge.stderr).strip()[:500],
+    # Fast-forward when trunk has not diverged from the branch base — a clean
+    # land with no merge-commit noise. ``--ff-only`` never touches the tree on
+    # failure, so a diverged history just falls through to an explicit merge
+    # commit (which carries the task id for traceability). The already-ancestor
+    # case is handled above, so here the branch always has something to land.
+    ff = _git(repo_root, ["merge", "--ff-only", branch])
+    if ff.returncode != 0:
+        task_ref = f" (task {task_id})" if task_id else ""
+        merge = _git(
+            repo_root,
+            ["merge", "--no-ff", "--no-edit", "-m",
+             f"Merge branch '{branch}' into {trunk}{task_ref}", branch],
         )
+        if merge.returncode != 0:
+            _git(repo_root, ["merge", "--abort"])
+            _restore()
+            return IntegrationResult(
+                Outcome.CONFLICT, branch, trunk,
+                detail=(merge.stdout or merge.stderr).strip()[:500],
+            )
 
     merged_sha = _rev(repo_root, "HEAD")
 

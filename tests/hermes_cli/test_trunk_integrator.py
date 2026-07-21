@@ -125,11 +125,29 @@ def test_land_leaves_primary_on_trunk(repo):
     assert _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
 
 
-def test_merge_commit_is_no_ff(repo):
+def test_strictly_ahead_branch_fast_forwards(repo):
+    # Trunk has not diverged, so the land is a fast-forward: no merge-commit
+    # noise, trunk simply advances to the branch tip (one-parent commit).
     _make_task_branch(repo, "zeus/t_a", "a.txt", "alpha\n")
+    branch_tip = _git(repo, "rev-parse", "zeus/t_a").stdout.strip()
     res = integrate_branch(repo, "zeus/t_a", test_cmd=["true"])
+    assert res.merged_sha == branch_tip
     parents = _git(repo, "rev-list", "--parents", "-n", "1", res.merged_sha).stdout.split()
-    assert len(parents) == 3, "landed commit should be a 2-parent merge commit"
+    assert len(parents) == 2, "fast-forward should not create a merge commit"
+
+
+def test_diverged_history_lands_with_task_referencing_merge_commit(repo):
+    # Trunk advances on a DIFFERENT file after the branch is cut -> histories
+    # diverge with no conflict, so a fast-forward is impossible and a merge
+    # commit is required; it must carry the task id for traceability.
+    _make_task_branch(repo, "zeus/t_a", "a.txt", "alpha\n")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "b.txt", "beta\n", "main advances b")
+    res = integrate_branch(repo, "zeus/t_a", test_cmd=["true"], task_id="t_a")
+    assert res.outcome is Outcome.LANDED
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", res.merged_sha).stdout.split()
+    assert len(parents) == 3, "diverged land should be a 2-parent merge commit"
+    assert "(task t_a)" in _git(repo, "log", "-1", "--pretty=%B", "main").stdout
 
 
 # ── integrate_branch: idempotency ────────────────────────────────────────────
