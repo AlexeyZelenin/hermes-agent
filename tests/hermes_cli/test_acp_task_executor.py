@@ -125,7 +125,10 @@ def test_acp_worker_completes_claimed_task_with_single_session(monkeypatch, kanb
 
 
 def test_acp_worker_reports_turn_usage_via_post_api_request_hook(monkeypatch, kanban_conn, tmp_path):
-    """External-session token usage must reach zeus.db accounting via the plugin hook."""
+    """Per-turn token usage the client fires through its usage_sink must reach
+    zeus.db accounting via the plugin hook, tagged with the ACP provider and the
+    leased subscription. This is the live path that replaces the old
+    fire-once-at-session-end report (a running card no longer reads 0 tokens)."""
     from agent import acp_task_executor as executor
     import hermes_cli.plugins as plugins
 
@@ -136,18 +139,22 @@ def test_acp_worker_reports_turn_usage_via_post_api_request_hook(monkeypatch, ka
     class FakeClient:
         last_session_id = "acp-session-1"
         last_model = "claude-opus-4-8"
-        last_turn_usage = {
-            "input_tokens": 10,
-            "output_tokens": 5,
-            "cache_read_tokens": 2,
-            "cache_write_tokens": 1,
-            "total_tokens": 18,
-        }
+        last_turn_usage = None
+        last_context = None
 
         def __init__(self, **kwargs):
-            pass
+            # The executor wires a usage_sink; drive it like the real turn loop.
+            self._usage_sink = kwargs.get("usage_sink")
 
         def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            self._usage_sink({
+                "usage": {"input_tokens": 10, "output_tokens": 5,
+                          "cache_read_tokens": 2, "cache_write_tokens": 1,
+                          "total_tokens": 18},
+                "context": {"context_used": 1500, "context_size": 200000},
+                "model": self.last_model, "session_id": self.last_session_id,
+                "effort": "", "kind": "final",
+            })
             return "Implemented and tested.", ""
 
     recorded = {}
@@ -169,7 +176,9 @@ def test_acp_worker_reports_turn_usage_via_post_api_request_hook(monkeypatch, ka
     assert recorded["session_id"] == "acp-session-1"
     assert recorded["model"] == "claude-opus-4-8"
     assert recorded["provider"] == "acp-claude-code"
+    assert recorded["api_mode"] == "acp"
     assert recorded["usage"]["total_tokens"] == 18
+    assert recorded["context_used"] == 1500
 
 
 def test_effort_override_exported_in_spawn_env(monkeypatch, tmp_path):

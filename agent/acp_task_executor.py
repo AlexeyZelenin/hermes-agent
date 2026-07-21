@@ -75,25 +75,43 @@ def _stamp_session_metadata(metadata, client):
     for key in ("context_used", "context_size", "context_remaining", "cost_usd", "cost_currency"):
         if context.get(key) is not None:
             metadata[key] = context[key]
-def _report_usage(client, executor, task_id, subscription=None):
-    """Best-effort turn accounting: the post_api_request hook lands usage in zeus.db token_usage."""
-    usage = getattr(client, "last_turn_usage", None)
-    if not usage: return
-    context = getattr(client, "last_context", None) or {}
+def _make_usage_sink(task_id, executor, subscription=None):
+    """Build a CopilotACPClient usage_sink that lands per-turn token usage in
+    zeus.db token_usage via the post_api_request plugin hook AS THE RUN
+    PROGRESSES. The client fires it live: a provisional total-only row on each
+    growing usage_update (so a running card shows climbing tokens instead of 0)
+    and a reconciling billing-split row at each turn settle. Recording per turn
+    replaces the old fire-once-at-session-end path, so a running acp-claude-code
+    task no longer reads 0 live tokens. Best-effort: a hook failure never
+    disturbs the ACP session.
+
+    The metered API-hook path is not double-counted: an ACP subprocess talks to
+    the provider directly and never crosses the Hermes API, so this hook is the
+    ONLY writer for the session - the two paths are mutually exclusive."""
+    from hermes_cli.plugins import discover_plugins, invoke_hook
     try:
-        from hermes_cli.plugins import discover_plugins, invoke_hook
         discover_plugins()
-        invoke_hook("post_api_request", task_id=task_id,
-                    session_id=getattr(client, "last_session_id", "") or "",
-                    provider=f"acp-{executor}", api_mode="acp",
-                    model=_clean_model(getattr(client, "last_model", "")) or executor, usage=usage,
-                    subscription=subscription or "",
-                    effort=getattr(client, "last_effort", "") or "",
-                    context_used=context.get("context_used"),
-                    context_size=context.get("context_size"),
-                    cost_usd=context.get("cost_usd"))
     except Exception:
         pass
+
+    def _sink(payload):
+        usage = payload.get("usage") or {}
+        if not any(usage.get(k) for k in ("total_tokens", "input_tokens", "output_tokens")):
+            return
+        context = payload.get("context") or {}
+        try:
+            invoke_hook("post_api_request", task_id=task_id,
+                        session_id=payload.get("session_id") or "",
+                        provider=f"acp-{executor}", api_mode="acp",
+                        model=_clean_model(payload.get("model")) or executor, usage=usage,
+                        subscription=subscription or "",
+                        effort=payload.get("effort") or "",
+                        context_used=context.get("context_used"),
+                        context_size=context.get("context_size"),
+                        cost_usd=context.get("cost_usd"))
+        except Exception:
+            pass
+    return _sink
 def _contributed_worker_env(task_id, board=None, subscription=None, run_id=None):
     """Plugin-contributed env for a spawning ACP worker, merged before spawn.
 
@@ -117,11 +135,12 @@ def _contributed_worker_env(task_id, board=None, subscription=None, run_id=None)
             merged.update({str(k): str(v) for k, v in result.items()})
     return merged
 def _new_client(command, args, workspace, model, extra_env=None, effort=None,
-                tool_activity_sink=None):
+                tool_activity_sink=None, usage_sink=None):
     return CopilotACPClient(acp_command=command, acp_args=args, acp_cwd=workspace,
                             allow_permissions=True, session_model=model,
                             session_effort=effort, extra_env=extra_env,
-                            tool_activity_sink=tool_activity_sink)
+                            tool_activity_sink=tool_activity_sink,
+                            usage_sink=usage_sink)
 def _tool_feed_enabled():
     """Live tool-call feed is on unless explicitly disabled. It only writes on a
     tool's first sighting and status transitions, so volume is bounded; the flag
@@ -248,7 +267,8 @@ def _run_pooled_session(executor, workspace, prompt, timeout, model, task_id, fo
         command, args = command_for(executor)
         extra_env = _contributed_worker_env(task_id, board, None, run_id) or None
         client = _new_client(command, args, workspace, model, extra_env=extra_env,
-                             effort=effort, tool_activity_sink=tool_activity_sink)
+                             effort=effort, tool_activity_sink=tool_activity_sink,
+                             usage_sink=_make_usage_sink(task_id, executor, None))
         text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
         return text, client, None
     while True:
@@ -265,7 +285,8 @@ def _run_pooled_session(executor, workspace, prompt, timeout, model, task_id, fo
             extra_env[env_var] = lease.config_dir
             client = _new_client(command, args, workspace, model,
                                  extra_env=extra_env,
-                                 effort=effort, tool_activity_sink=tool_activity_sink)
+                                 effort=effort, tool_activity_sink=tool_activity_sink,
+                                 usage_sink=_make_usage_sink(task_id, executor, lease.name))
             text, _ = client._run_prompt(prompt, timeout_seconds=timeout, follow_up=follow_up)
             # A completed session/prompt is structurally NOT a limit/auth death:
             # the request succeeded and this is the task's handoff. Substring-
@@ -444,9 +465,9 @@ def run_task(*, executor, task_id, workspace, board=None):
             # limit rotation. An empty vendor pool degrades to a bare session.
             text,client,subscription=_run_pooled_session(executor,workspace,prompt,timeout,model,task_id,follow_up,board,effort,tool_sink,run_id)
         else:
-            client=_new_client(command,args,workspace,model,effort=effort,tool_activity_sink=tool_sink)
+            client=_new_client(command,args,workspace,model,effort=effort,tool_activity_sink=tool_sink,
+                               usage_sink=_make_usage_sink(task_id,executor,None))
             text,_=client._run_prompt(prompt,timeout_seconds=timeout,follow_up=follow_up)
-        _report_usage(client,executor,task_id,subscription)
     except Exception as exc:
         with kb.connect_closing(board=board) as conn: kb.block_task(conn,task_id,reason=f"External {executor} ACP session failed: {exc}",kind="capability",expected_run_id=run_id)
         raise

@@ -466,6 +466,126 @@ def test_run_prompt_captures_mode_effort_and_context_window(tmp_path):
     assert client.last_turn_usage["total_tokens"] == 42
 
 
+def _usage_sink_client(sink):
+    return CopilotACPClient(acp_command="x", acp_args=[], acp_cwd=".", usage_sink=sink)
+
+
+def test_usage_sink_emits_live_deltas_then_reconciles_to_billing_total():
+    """The usage_sink sees a live total-only row per growing usage_update
+    (throttled by _LIVE_USAGE_MIN_DELTA) and one reconciling billing-split row
+    at turn settle. Invariant: SUM(total) == the turn's true billing total, and
+    the prompt/completion split lands intact on the final row."""
+    rows = []
+    client = _usage_sink_client(rows.append)
+    client.last_model = "claude-opus-4-8"
+    client.last_session_id = "s1"
+
+    client._turn_recorded_total = 0
+    client._emit_live_usage({"used": 1500, "size": 200000})   # delta 1500 -> emit
+    client._emit_live_usage({"used": 1800, "size": 200000})   # delta 300 < 1000 -> skip
+    client._emit_live_usage({"used": 3000, "size": 200000})   # delta 1200 -> emit
+    client.last_turn_usage = {"input_tokens": 4000, "output_tokens": 500,
+                              "cache_read_tokens": 1000, "cache_write_tokens": 0,
+                              "total_tokens": 5500}
+    client.last_context = {"context_used": 3000, "context_size": 200000}
+    client._emit_final_turn_usage()
+
+    live = [r for r in rows if r["kind"] == "live"]
+    final = [r for r in rows if r["kind"] == "final"]
+    assert [r["usage"]["total_tokens"] for r in live] == [1500, 1500]
+    assert all(r["usage"]["input_tokens"] == 0 for r in live)
+    assert len(final) == 1
+    assert final[0]["usage"]["input_tokens"] == 4000
+    assert final[0]["usage"]["output_tokens"] == 500
+    assert final[0]["usage"]["total_tokens"] == 5500 - 3000  # residual only
+    assert sum(r["usage"]["total_tokens"] for r in rows) == 5500
+    assert final[0]["context"]["context_used"] == 3000
+
+
+def test_usage_sink_final_only_when_no_live_updates():
+    """A turn whose usage_updates never crossed the delta threshold records the
+    full billing usage on the settle row alone (SUM still equals the total)."""
+    rows = []
+    client = _usage_sink_client(rows.append)
+    client._turn_recorded_total = 0
+    client.last_turn_usage = {"input_tokens": 30, "output_tokens": 12,
+                              "cache_read_tokens": 0, "cache_write_tokens": 0,
+                              "total_tokens": 42}
+    client._emit_final_turn_usage()
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "final"
+    assert rows[0]["usage"]["total_tokens"] == 42
+
+
+def test_usage_sink_no_rows_when_turn_reported_no_usage():
+    """No usage anywhere in the turn -> the sink is never called (no zero rows)."""
+    rows = []
+    client = _usage_sink_client(rows.append)
+    client._turn_recorded_total = 0
+    client.last_turn_usage = None
+    client._emit_final_turn_usage()
+    client._emit_live_usage({"used": 0})
+    assert rows == []
+
+
+_FAKE_ACP_SERVER_USAGE = r'''
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "sess-1"}})
+    elif method == "session/prompt":
+        # Two live usage_updates (climbing context), then a settle result whose
+        # accumulated billing total exceeds the final context occupancy.
+        for used in (2000, 5000):
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "sess-1", "update": {
+                    "sessionUpdate": "usage_update", "used": used, "size": 200000}}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess-1", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "done"}}}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "stopReason": "end_turn",
+            "usage": {"totalTokens": 12000, "inputTokens": 9000,
+                      "outputTokens": 1000, "cachedReadTokens": 2000}}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+'''
+
+
+def test_run_prompt_fires_usage_sink_live_and_at_settle(tmp_path):
+    """End-to-end through the real transport: a live usage_update stream plus a
+    settle result drive the usage_sink so accounting grows DURING the turn and
+    the SUM reconciles to the authoritative billing total."""
+    server = tmp_path / "fake_acp_usage.py"
+    server.write_text(_FAKE_ACP_SERVER_USAGE)
+    rows = []
+    client = CopilotACPClient(
+        acp_command=_sys.executable, acp_args=[str(server)], acp_cwd=str(tmp_path),
+        usage_sink=rows.append,
+    )
+    text, _ = client._run_prompt("do the task", timeout_seconds=15)
+
+    assert "done" in text
+    live = [r for r in rows if r["kind"] == "live"]
+    final = [r for r in rows if r["kind"] == "final"]
+    assert [r["usage"]["total_tokens"] for r in live] == [2000, 3000]  # deltas
+    assert len(final) == 1
+    assert final[0]["usage"]["input_tokens"] == 9000
+    assert final[0]["usage"]["output_tokens"] == 1000
+    assert sum(r["usage"]["total_tokens"] for r in rows) == 12000
+
+
 _FAKE_ACP_SERVER_LIMIT_MIDTURN = r'''
 import json, sys
 for line in sys.stdin:

@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
+# Minimum growth in a live ``usage_update``'s ``used`` before a provisional
+# usage row is emitted. Bounds the row count for a long turn (``used`` climbs
+# monotonically to the final context size) while keeping the card's live token
+# count fresh within roughly one API call's worth of tokens.
+_LIVE_USAGE_MIN_DELTA = 1000
+
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
@@ -706,6 +712,7 @@ class CopilotACPClient:
         session_effort: str | None = None,
         extra_env: dict[str, str] | None = None,
         tool_activity_sink: Callable[[dict[str, Any]], None] | None = None,
+        usage_sink: Callable[[dict[str, Any]], None] | None = None,
         **_: Any,
     ):
         self.api_key = api_key or "copilot-acp"
@@ -733,6 +740,18 @@ class CopilotACPClient:
         # mid-run. Best-effort: a sink exception is swallowed (never breaks
         # the transport). None keeps the pure chat-completion path unchanged.
         self._tool_activity_sink = tool_activity_sink
+        # Optional per-turn usage sink. Invoked live from the turn loop: a
+        # provisional total-only row on each growing ``usage_update`` and one
+        # reconciling row (real prompt/completion split) at turn settle, so a
+        # caller can land token usage in accounting AS THE RUN PROGRESSES
+        # rather than only after the whole session ends. None keeps the pure
+        # chat-completion path unchanged. Best-effort: a sink exception is
+        # swallowed (never breaks the transport).
+        self._usage_sink = usage_sink
+        # Running total of ``total_tokens`` already emitted for the current
+        # turn (live provisional rows). The settle row's total is reduced by
+        # this so SUM(total_tokens) equals the turn's true billing total.
+        self._turn_recorded_total = 0
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -879,6 +898,7 @@ class CopilotACPClient:
         self.last_turn_usage = None
         self.last_context = None
         self._last_usage_update = None
+        self._turn_recorded_total = 0
         self.last_tool_calls = {}
         # Streamed agent output captured live, so a mid-turn crash (usage
         # limit / auth death) can still salvage the partial work instead of
@@ -1069,6 +1089,9 @@ class CopilotACPClient:
             self._live_text_parts = text_parts
 
             def _prompt_turn(turn_text: str) -> None:
+                # Provisional live rows for THIS turn start from zero; the
+                # settle row below reconciles against exactly what they emitted.
+                self._turn_recorded_total = 0
                 result = _request(
                     "session/prompt",
                     {
@@ -1083,6 +1106,7 @@ class CopilotACPClient:
                     self._last_usage_update,
                 )
                 self.last_context = _context_state(self._last_usage_update)
+                self._emit_final_turn_usage()
 
             _prompt_turn(prompt_text)
 
@@ -1144,6 +1168,73 @@ class CopilotACPClient:
         except Exception:
             logger.debug("ACP tool_activity_sink raised; ignoring", exc_info=True)
 
+    def _fire_usage_sink(
+        self, usage: dict[str, int], context: dict[str, Any] | None, kind: str
+    ) -> None:
+        """Deliver one usage row to the configured sink. ``kind`` is 'live'
+        (a provisional total-only delta mid-turn) or 'final' (the reconciling
+        billing split at turn settle). Sink failures are swallowed."""
+        if self._usage_sink is None:
+            return
+        payload = {
+            "usage": usage,
+            "context": context or {},
+            "model": self.last_model,
+            "session_id": self.last_session_id,
+            "effort": self.last_effort,
+            "kind": kind,
+        }
+        try:
+            self._usage_sink(payload)
+        except Exception:
+            logger.debug("ACP usage_sink raised; ignoring", exc_info=True)
+
+    def _emit_live_usage(self, update: dict[str, Any]) -> None:
+        """Emit a provisional per-turn usage delta from a live usage_update.
+
+        The adapter streams ``usage_update`` with ``used`` = current context
+        occupancy, climbing through the turn. We record the positive delta
+        since the last emission as a total-only row so the running
+        SUM(total_tokens) tracks live growth (the card's 'is this task alive?'
+        signal). The authoritative prompt/completion split lands on the
+        reconciling row at turn settle (_emit_final_turn_usage), whose total is
+        reduced by these provisional totals so the SUM stays billing-accurate.
+        """
+        if self._usage_sink is None:
+            return
+        used = _usage_int(update.get("used"))
+        delta = used - self._turn_recorded_total
+        if delta < _LIVE_USAGE_MIN_DELTA:
+            return
+        self._turn_recorded_total = used
+        self._fire_usage_sink(
+            {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+             "cache_write_tokens": 0, "total_tokens": delta},
+            _context_state(update), "live",
+        )
+
+    def _emit_final_turn_usage(self) -> None:
+        """Reconcile the turn's provisional live rows against the authoritative
+        billing usage from the session/prompt result. Records the real
+        prompt/completion/cache split with ``total_tokens`` reduced by whatever
+        the live rows already contributed this turn, so SUM(total_tokens)
+        equals the turn's true billing total and SUM(prompt/completion) equal
+        the true splits. No-op when the turn reported no usage at all."""
+        if self._usage_sink is None:
+            return
+        usage = self.last_turn_usage
+        if not usage:
+            return
+        final = dict(usage)
+        total = _usage_int(usage.get("total_tokens"))
+        final["total_tokens"] = max(total - self._turn_recorded_total, 0)
+        self._turn_recorded_total = max(total, self._turn_recorded_total)
+        if not any(_usage_int(final.get(k)) for k in
+                   ("total_tokens", "input_tokens", "output_tokens",
+                    "cache_read_tokens", "cache_write_tokens")):
+            return
+        self._fire_usage_sink(final, self.last_context, "final")
+
     def _handle_server_message(
         self,
         msg: dict[str, Any],
@@ -1163,6 +1254,7 @@ class CopilotACPClient:
             kind = str(update.get("sessionUpdate") or "").strip()
             if kind == "usage_update":
                 self._last_usage_update = dict(update)
+                self._emit_live_usage(update)
                 return True
             if kind in ("tool_call", "tool_call_update"):
                 self._capture_tool_call(kind, update)
