@@ -596,7 +596,14 @@ CREATE INDEX idx_usage_task ON token_usage(task_id);
 
 def _seed_zeus_cli(home: Path, rows):
     import sqlite3
-    db = home / "zeus" / "zeus.db"
+    from hermes_cli.zeus_tokens import default_zeus_db_path
+
+    # Ask the reader where the ledger lives instead of hard-coding it: the
+    # path moved from ``<home>/zeus/zeus.db`` to ``<home>/roul/roul.db``
+    # (b39917412) and a stale literal here silently seeds nothing, so every
+    # cost assertion sees "no ledger" instead of failing loudly.
+    db = default_zeus_db_path()
+    assert db.is_relative_to(home), f"ledger path escaped the test home: {db}"
     db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db))
     conn.executescript(_ZEUS_SCHEMA)

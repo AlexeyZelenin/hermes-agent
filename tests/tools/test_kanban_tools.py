@@ -1700,7 +1700,13 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
         run1 = kb.latest_run(conn, worker_env)
         kb._set_worker_pid(conn, worker_env, 98765)
         monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        # Kill ONLY the worker pid. A blanket ``lambda pid: False`` also makes
+        # the claim-owning dispatcher (this test process) look dead, which
+        # sends the task down the service-restart carve-out (3c674449a):
+        # released to ``ready`` as ``killed_by_restart``, no failure counted,
+        # and NOT in the ``crashed`` return. We want a genuine crash here —
+        # dead worker, live dispatcher.
+        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: int(pid or 0) != 98765)
         assert kb.detect_crashed_workers(conn) == [worker_env]
 
         kb.claim_task(conn, worker_env)
