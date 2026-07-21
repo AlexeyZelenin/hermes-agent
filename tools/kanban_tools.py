@@ -936,6 +936,11 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
+    # Typed card fields — the frame, the ask, and the requester's own words.
+    # All optional; an omitted field stays NULL and costs nothing downstream.
+    context = args.get("context")
+    question = args.get("question")
+    user_quotes = args.get("user_quotes")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
@@ -1001,6 +1006,9 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
+                context=context,
+                question=question,
+                user_quotes=user_quotes,
                 assignee=str(assignee),
                 parents=tuple(parents),
                 tenant=tenant,
@@ -1559,6 +1567,28 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "context": {
+                "type": "string",
+                "description": (
+                    "Optional 2-3 sentence FRAME: why this card exists / "
+                    "what it is about. Separate from ``body`` (the work)."
+                ),
+            },
+            "question": {
+                "type": "string",
+                "description": (
+                    "Optional — what is actually being decided or asked, "
+                    "in one or two sentences."
+                ),
+            },
+            "user_quotes": {
+                "type": "string",
+                "description": (
+                    "Optional VERBATIM quotes of how the requester phrased "
+                    "it. Copy the words, do not paraphrase — this is the "
+                    "record of where the task came from."
                 ),
             },
             "tenant": {
