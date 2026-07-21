@@ -969,3 +969,215 @@ def test_empty_handoff_still_completes_when_workspace_has_changes(monkeypatch, k
         executor="claude-code", task_id=task_id, workspace=str(repo), board="test"
     )
     assert kb.get_task(kanban_conn, task_id).status == "done"
+
+
+# --- Completion signal: a narrative is not a handoff (t_222f1e4a) -------------
+
+_INCIDENT_TAIL = (
+    "Baseline `test_nightly_e2e` fails at HEAD too (pre-existing). Re-running it "
+    "in my tree to confirm parity:I'll wait for the nightly run rather than poll."
+    "Waiting on the nightly-e2e run (~205s). I'll report when it lands."
+)
+
+
+def test_unfinished_turn_detected_on_the_closing_sentence():
+    """The real phantom-done handoff (t_5a5bfe8b): one unbroken paragraph whose
+    last sentence is a self-pacing promise, not a report."""
+    from agent import acp_task_executor as executor
+
+    assert executor._final_sentence(_INCIDENT_TAIL) == "I'll report when it lands."
+    assert executor._looks_unfinished(_INCIDENT_TAIL)
+
+
+def test_real_handoffs_are_not_flagged_unfinished():
+    """No false positives on the shapes real completions actually end with -
+    an operator-facing wait, a slash-command footer, prose that merely mentions
+    waiting mid-report."""
+    from agent import acp_task_executor as executor
+
+    for text in (
+        "Committed on branch x. Waiting on your review before merging.",
+        "Done: 9/9 green.\n\n➡️ NEXT\n   - review/merge the branch\n\n[/code-review]",
+        "While waiting for the baseline I checked the cron. All committed, tests pass.",
+        "Implemented and tested.",
+    ):
+        assert not executor._looks_unfinished(text), text
+
+
+def test_waiting_turn_without_committed_work_is_refused(monkeypatch, kanban_conn, tmp_path):
+    """A session that ended mid-task on a wait, with nothing landed in git, must
+    be re-blocked - completing it stores a narrative as the task result."""
+    from agent import acp_task_executor as executor
+
+    task_id = kb.create_task(kanban_conn, title="Self-paced run", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            return _INCIDENT_TAIL, ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    with pytest.raises(RuntimeError, match="unfinished turn"):
+        executor.run_task(
+            executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+        )
+    task = kb.get_task(kanban_conn, task_id)
+    assert task.status == "blocked"
+    assert not task.result
+
+
+def test_waiting_turn_completes_when_the_work_was_committed(monkeypatch, kanban_conn, tmp_path):
+    """Fail-open half: the same unfinished-looking tail completes when the run
+    landed its work durably (clean tree + a commit past the run's base) - the
+    code is in git, so nothing is lost by accepting the stop."""
+    from agent import acp_task_executor as executor
+    import json as _json
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "base")
+
+    task_id = kb.create_task(kanban_conn, title="Committed then stopped",
+                             assignee="external", workspace_kind="worktree",
+                             workspace_path=str(repo))
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            (repo / "fix.py").write_text("x = 1\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-m", "fix")
+            return _INCIDENT_TAIL, ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(repo), board="test"
+    )
+    assert kb.get_task(kanban_conn, task_id).status == "done"
+    run = kanban_conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    assert _json.loads(run["metadata"])["handoff_signal"] == "unfinished_committed"
+
+
+def test_terminal_marker_completes_and_is_kept_off_the_card(monkeypatch, kanban_conn, tmp_path):
+    """The marker is the positive completion signal: it wins over the
+    unfinished-tail check, is recorded on the run, and is stripped from the
+    stored handoff so the card stays readable."""
+    from agent import acp_task_executor as executor
+    import json as _json
+
+    task_id = kb.create_task(kanban_conn, title="Marker run", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    handoff = "Fixed and committed (abc1234). Tests: 9/9.\n" + executor.HANDOFF_MARKER
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            return handoff, ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    assert executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+    ) == handoff
+    task = kb.get_task(kanban_conn, task_id)
+    assert task.status == "done"
+    assert executor.HANDOFF_MARKER not in (task.result or "")
+    assert "Tests: 9/9." in task.result
+    run = kanban_conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    assert _json.loads(run["metadata"])["handoff_signal"] == "marker"
+
+
+def test_worker_prompt_carries_the_finishing_protocol(monkeypatch, kanban_conn, tmp_path):
+    """The other half of the fix: the worker is told the session ends with its
+    turn, so it must commit before backgrounding anything and never self-pace."""
+    from agent import acp_task_executor as executor
+
+    task_id = kb.create_task(kanban_conn, title="Prompt check", assignee="external")
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            seen["prompt"] = prompt
+            return "Done." + "\n" + executor.HANDOFF_MARKER, ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    executor.run_task(
+        executor="claude-code", task_id=task_id, workspace=str(tmp_path), board="test"
+    )
+    prompt = seen["prompt"]
+    assert "never schedule a wake-up" in prompt
+    assert "commit BEFORE you start any verification" in prompt
+    assert executor.HANDOFF_MARKER in prompt
+
+
+def test_dod_gate_refusal_blocks_the_task_instead_of_crashing(monkeypatch, kanban_conn, tmp_path):
+    """A run that reports success but leaves the repo dirty is refused by the DoD
+    gate; the executor must turn that into a typed block with the gate's reason,
+    not die with the task stuck in 'running'."""
+    from agent import acp_task_executor as executor
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "base")
+
+    task_id = kb.create_task(kanban_conn, title="Dirty run", assignee="external",
+                             workspace_kind="worktree", workspace_path=str(repo))
+    assert kb.claim_task(kanban_conn, task_id, claimer="test-lock") is not None
+    monkeypatch.setattr(kb, "connect_closing", lambda *, board=None: _connection_context(kanban_conn))
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def _run_prompt(self, prompt, *, timeout_seconds, follow_up=None):
+            (repo / "fix.py").write_text("x = 1\n", encoding="utf-8")
+            return "All done, tests pass.\n" + executor.HANDOFF_MARKER, ""
+
+    monkeypatch.setattr(executor, "CopilotACPClient", FakeClient)
+    monkeypatch.setattr(executor, "command_for", lambda name: ("fake-acp", ["--stdio"]))
+
+    with pytest.raises(kb.UncommittedWorkError):
+        executor.run_task(
+            executor="claude-code", task_id=task_id, workspace=str(repo), board="test"
+        )
+    task = kb.get_task(kanban_conn, task_id)
+    assert task.status == "blocked"
+    assert task.block_kind == "capability"
