@@ -783,6 +783,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
+    # --- service-bounce ---
+    p_bounce = sub.add_parser(
+        "service-bounce",
+        help="Open a window in which SIGTERM'd workers count as bounced, not crashed",
+    )
+    p_bounce.add_argument("reason",
+                          help="Why writers are being stopped (e.g. db_heal, rolling_restart)")
+    p_bounce.add_argument("--ttl", type=int, default=None,
+                          help=f"Window length in seconds "
+                               f"(default: {kb._SERVICE_BOUNCE_DEFAULT_TTL_SECONDS})")
+
     # --- daemon (deprecated) ---
     p_daemon = sub.add_parser(
         "daemon",
@@ -1048,6 +1059,21 @@ def kanban_command(args: argparse.Namespace) -> int:
     # alpha.
     if action == "boards":
         return _dispatch_boards(args)
+
+    # Writing the bounce marker touches no DB, and the caller is typically
+    # about to stop every writer *because* the DB is unhealthy — so it must
+    # return before the init_db() auto-bootstrap further down.
+    if action == "service-bounce":
+        ttl = getattr(args, "ttl", None)
+        if not kb.mark_service_bounce(args.reason, ttl_seconds=ttl):
+            print(
+                f"kanban: could not write {kb.service_bounce_marker_path()}",
+                file=sys.stderr,
+            )
+            return 1
+        window = ttl or kb._SERVICE_BOUNCE_DEFAULT_TTL_SECONDS
+        print(f"service-bounce window open for {window}s ({args.reason})")
+        return 0
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD

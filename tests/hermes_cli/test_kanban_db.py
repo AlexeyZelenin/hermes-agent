@@ -1130,6 +1130,209 @@ def test_orphan_with_live_owning_dispatcher_still_counts_as_crash(
 
 
 # ---------------------------------------------------------------------------
+# Service-bounce SIGTERM carve-out (t_2c6d4c89). A partial bounce — the
+# overseer stopping every writer before a DB heal, a rolling restart —
+# SIGTERMs the worker while its dispatcher survives to reap it, so the exit
+# reads ``signaled``/15 and the orphan carve-out above cannot see it. Spare it
+# only on positive evidence: an open bounce marker, and a signal this
+# dispatcher did not send.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clean_exit_registries(monkeypatch):
+    """Isolate the process-global reap / dispatcher-kill registries."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_recent_worker_exits", {})
+    monkeypatch.setattr(_kb, "_dispatcher_killed_workers", {})
+    return _kb
+
+
+def _run_signalled_worker(conn, tid, host, dispatcher_pid, pid, signum):
+    """Put ``tid`` back on a worker that then dies of ``signum``; return crash ids."""
+    import hermes_cli.kanban_db as _kb
+
+    kb.claim_task(conn, tid, claimer=f"{host}:{dispatcher_pid}")
+    conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+    conn.commit()
+    # Raw wait status of a signal death: low 7 bits hold the signal number.
+    _kb._record_worker_exit(pid, signum)
+    return kb.detect_crashed_workers(conn)
+
+
+def test_service_bounce_sigterm_requeues_without_counting_failure(
+    kanban_home, monkeypatch, clean_exit_registries,
+):
+    """A worker SIGTERM'd inside an open service-bounce window is released to
+    ``ready`` without counting a failure — even though its dispatcher is alive
+    and reaped it, so the exit classified as ``signaled`` rather than the
+    ``unknown`` the orphan carve-out keys on."""
+    _kb = clean_exit_registries
+    live_dispatcher = 88888
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: int(pid) == live_dispatcher)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="bounced", assignee="a")
+
+        # Far more bounces than DEFAULT_FAILURE_LIMIT (2): if any counted as
+        # a failure the task would end up blocked.
+        for i in range(6):
+            assert _kb.mark_service_bounce("db_heal", ttl_seconds=60)
+            crashed = _run_signalled_worker(
+                conn, tid, host, live_dispatcher, 51000 + i, 15,
+            )
+            assert tid not in crashed, f"bounce {i}: SIGTERM in-window is not a crash"
+            killed = getattr(
+                _kb.detect_crashed_workers, "_last_restart_killed", []
+            )
+            assert tid in killed, f"bounce {i}: expected in restart_killed"
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"bounce {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"bounce {i}: service bounce must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        assert task.last_failure_error and (
+            "service bounce" in task.last_failure_error
+        )
+        # The stamped error must not look like a quota/auth blocker, or the
+        # respawn guard would park the card instead of retrying it.
+        assert not _kb._RESPAWN_BLOCKER_RE.search(task.last_failure_error)
+
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "killed_by_restart" in outcomes
+        assert "crashed" not in outcomes
+
+        payloads = [
+            json.loads(r["payload"]) for r in conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id=? AND kind='killed_by_restart'", (tid,),
+            ).fetchall()
+        ]
+        assert payloads and all(p["signal"] == 15 for p in payloads)
+        assert all(p["bounce_reason"] == "db_heal" for p in payloads)
+
+
+def test_sigterm_outside_bounce_window_still_counts_as_crash(
+    kanban_home, monkeypatch, clean_exit_registries,
+):
+    """No marker (or an expired one) → a SIGTERM is a genuine crash and trips
+    the breaker. The carve-out needs positive evidence, never a bare signal."""
+    _kb = clean_exit_registries
+    live_dispatcher = 88888
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: int(pid) == live_dispatcher)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="terminated", assignee="a")
+
+        # First hit: no marker at all. Second: a marker that already expired.
+        assert _kb._active_service_bounce() is None
+        crashed = _run_signalled_worker(conn, tid, host, live_dispatcher, 52000, 15)
+        assert tid in crashed, "SIGTERM with no bounce window is a real crash"
+
+        # Second hit: a marker whose window has already elapsed.
+        _kb.mark_service_bounce("stale", ttl_seconds=1)
+        marker = _kb.service_bounce_marker_path()
+        record = json.loads(marker.read_text(encoding="utf-8"))
+        record["started_at"] = time.time() - 3600
+        marker.write_text(json.dumps(record), encoding="utf-8")
+        assert _kb._active_service_bounce() is None, "expired marker must not count"
+        assert not marker.exists(), "an expired marker is unlinked on read"
+        crashed = _run_signalled_worker(conn, tid, host, live_dispatcher, 52001, 15)
+        assert tid in crashed, "SIGTERM after the window closed is a real crash"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"unattributed SIGTERMs should still trip the breaker, got "
+            f"{task.status}"
+        )
+
+
+def test_bounce_window_does_not_absolve_deaths_that_predate_it(
+    kanban_home, monkeypatch, clean_exit_registries,
+):
+    """The window is half-open on the left: a worker already reaped before the
+    marker was stamped died of something else, so it keeps counting."""
+    _kb = clean_exit_registries
+    _kb._record_worker_exit(60000, 15)
+    _kb.mark_service_bounce("db_heal", ttl_seconds=60)
+    assert _kb._service_bounce_kill(60000, "signaled", 15) is None
+    # A worker reaped after the stamp is attributable.
+    _kb._record_worker_exit(60001, 15)
+    assert _kb._service_bounce_kill(60001, "signaled", 15) is not None
+
+
+def test_dispatcher_sigterm_counts_as_failure_inside_bounce_window(
+    kanban_home, monkeypatch, clean_exit_registries,
+):
+    """A reclaim's own SIGTERM keeps counting even while a bounce window is
+    open — the dispatcher records the kills it issues, so a genuine reclaim
+    can never be laundered into a bounce casualty."""
+    _kb = clean_exit_registries
+    live_dispatcher = 88888
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: int(pid) == live_dispatcher)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="reclaimed", assignee="a")
+        _kb.mark_service_bounce("db_heal", ttl_seconds=60)
+
+        for i, pid in enumerate((53000, 53001)):
+            # Go through the real reclaim helper so the test covers the
+            # wiring, not just the registry.
+            sent: list[tuple[int, int]] = []
+            _kb._terminate_reclaimed_worker(
+                pid, f"{host}:{live_dispatcher}",
+                signal_fn=lambda p, s: sent.append((p, s)),
+            )
+            assert sent, "reclaim must have signalled the worker"
+            crashed = _run_signalled_worker(
+                conn, tid, host, live_dispatcher, pid, 15,
+            )
+            assert tid in crashed, (
+                f"hit {i}: a reclaim SIGTERM is a genuine failure"
+            )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"reclaims must still trip the breaker, got {task.status}"
+        )
+
+
+def test_sigkill_inside_bounce_window_still_counts_as_crash(
+    kanban_home, monkeypatch, clean_exit_registries,
+):
+    """SIGKILL is excluded from the carve-out: it is the OOM killer's (and the
+    reclaim escalation's) signature, and those are real failures."""
+    _kb = clean_exit_registries
+    live_dispatcher = 88888
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: int(pid) == live_dispatcher)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="oom", assignee="a")
+        _kb.mark_service_bounce("rolling_restart", ttl_seconds=60)
+
+        crashed = _run_signalled_worker(conn, tid, host, live_dispatcher, 54000, 9)
+        assert tid in crashed, "an OOM kill stays a crash even mid-bounce"
+
+
+# ---------------------------------------------------------------------------
 # UTF-8 crash class (t_bad68065, resolved under t_e5997536): a single comment
 # row with undecodable bytes must NOT crash readers (list_comments /
 # build_worker_context), and the write path must never introduce such a row.

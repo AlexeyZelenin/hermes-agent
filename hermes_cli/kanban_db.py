@@ -8968,6 +8968,150 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
+def _worker_exit_reaped_at(pid: int) -> Optional[float]:
+    """Epoch seconds at which ``pid`` was reaped, or None if not in the registry."""
+    entry = _recent_worker_exits.get(int(pid))
+    return None if entry is None else entry[1]
+
+
+# ── dispatcher-initiated kills ─────────────────────────────────────────
+#
+# The reclaim and max-runtime paths SIGTERM workers themselves. Those are
+# genuine reclaims/timeouts and must keep counting as failures even when a
+# service bounce happens to be in flight — so the dispatcher remembers which
+# pids IT signalled and never spares them. Same bounded-registry shape as
+# ``_recent_worker_exits``.
+_dispatcher_killed_workers: "dict[int, float]" = {}
+
+
+def _record_dispatcher_kill(pid: Optional[int]) -> None:
+    """Remember that this dispatcher signalled ``pid`` (reclaim / timeout)."""
+    if not pid or int(pid) <= 0:
+        return
+    now = time.time()
+    _dispatcher_killed_workers[int(pid)] = now
+    cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
+    if len(_dispatcher_killed_workers) > _RECENT_WORKER_EXITS_MAX // 2:
+        for _pid in [p for p, t in _dispatcher_killed_workers.items() if t < cutoff]:
+            _dispatcher_killed_workers.pop(_pid, None)
+
+
+def _dispatcher_killed(pid: int) -> bool:
+    """True when this dispatcher signalled ``pid`` within the registry TTL."""
+    stamped = _dispatcher_killed_workers.get(int(pid))
+    if stamped is None:
+        return False
+    return (time.time() - stamped) <= _RECENT_WORKER_EXIT_TTL_SECONDS
+
+
+# ── service-bounce window ──────────────────────────────────────────────
+#
+# A worker can be SIGTERM'd by something that is neither the task nor this
+# dispatcher: the overseer's ``heal_kanban.sh`` stops every writer
+# (``pkill -f "venv/bin/hermes -p"``) before recovering a corrupt DB, and a
+# rolling service bounce signals workers without necessarily taking the
+# gateway down with them. The dispatcher survives, reaps its own child, and
+# sees ``signaled``/SIGTERM — indistinguishable from a task-level crash
+# unless the bouncer says so. So the bouncer says so: it stamps a marker
+# file naming a bounded window, and ``detect_crashed_workers`` spares
+# SIGTERM deaths reaped inside that window (see the
+# ``killed_by_restart`` branch there).
+#
+# Same shape as the gateway's takeover / planned-stop markers
+# (``gateway.status``): a short-lived file written BEFORE the kill, expiring
+# on its own TTL so a crashed bouncer can grief at most one window.
+_SERVICE_BOUNCE_MARKER_FILENAME = ".worker-bounce.json"
+_SERVICE_BOUNCE_DEFAULT_TTL_SECONDS = 120
+# Signals a service bounce uses to stop workers. SIGKILL is deliberately
+# absent: it is also the OOM-killer's and the reclaim escalation's signature,
+# and those are real failures that must keep counting.
+_SERVICE_BOUNCE_SIGNALS = frozenset({1, 2, 15})  # SIGHUP, SIGINT, SIGTERM
+
+
+def service_bounce_marker_path() -> Path:
+    """Path of the service-bounce marker (host-level, beside the board root)."""
+    return kanban_home() / _SERVICE_BOUNCE_MARKER_FILENAME
+
+
+def mark_service_bounce(
+    reason: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+) -> bool:
+    """Open a service-bounce window: workers SIGTERM'd now aren't crashes.
+
+    Call this immediately BEFORE stopping workers out of band (DB heal,
+    rolling restart, operator bounce). Returns True when the marker was
+    written; a failed write is non-fatal (the caller proceeds with the kill,
+    the deaths just count as crashes like they did before).
+    """
+    ttl = int(ttl_seconds) if ttl_seconds else _SERVICE_BOUNCE_DEFAULT_TTL_SECONDS
+    record = {
+        "reason": str(reason)[:200],
+        "started_at": time.time(),
+        "ttl_seconds": ttl,
+        "pid": os.getpid(),
+    }
+    try:
+        path = service_bounce_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def _active_service_bounce(now: Optional[float] = None) -> Optional[dict]:
+    """Return the live service-bounce record, or None when no window is open.
+
+    An expired marker is unlinked on read so a stale window can never widen
+    the carve-out beyond its TTL.
+    """
+    path = service_bounce_marker_path()
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    try:
+        started_at = float(record["started_at"])
+        ttl = int(record.get("ttl_seconds") or _SERVICE_BOUNCE_DEFAULT_TTL_SECONDS)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (now if now is not None else time.time()) > started_at + ttl:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    record["started_at"] = started_at
+    record["ttl_seconds"] = ttl
+    return record
+
+
+def _service_bounce_kill(pid: int, kind: str, code: Optional[int]) -> Optional[dict]:
+    """Return the bounce record when ``pid``'s death is attributable to it.
+
+    Attributable means all of: the worker was *signalled* with one of the
+    graceful stop signals, this dispatcher did not send that signal, and the
+    reap happened at or after an open bounce window started. A death reaped
+    BEFORE the marker was written predates the bounce, so the window is
+    half-open on the left.
+    """
+    if kind != "signaled" or code not in _SERVICE_BOUNCE_SIGNALS:
+        return None
+    if _dispatcher_killed(pid):
+        return None
+    reaped_at = _worker_exit_reaped_at(pid)
+    if reaped_at is None:
+        return None
+    record = _active_service_bounce()
+    if record is None or reaped_at < record["started_at"]:
+        return None
+    return record
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
@@ -9117,6 +9261,9 @@ def _terminate_reclaimed_worker(
         return info
 
     info["termination_attempted"] = True
+    # Claim the kill before sending it: a reclaim SIGTERM must keep counting
+    # as a failure even if a service bounce is open at the same moment.
+    _record_dispatcher_kill(pid)
     try:
         kill(int(pid), signal.SIGTERM)
     except ProcessLookupError:
@@ -9309,6 +9456,9 @@ def enforce_max_runtime(
             os.kill if hasattr(os, "kill") else None
         )
         if kill is not None:
+            # Same as the reclaim path: a timeout kill is ours, so it must
+            # never be mistaken for a service-bounce casualty.
+            _record_dispatcher_kill(pid)
             try:
                 kill(pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
@@ -9672,6 +9822,17 @@ def detect_crashed_workers(
     returned via the ``_last_restart_killed`` function attribute. A genuine
     worker crash — whose owning dispatcher is still alive — keeps the old
     ``crashed`` + ``_record_task_failure`` path.
+
+    That orphan carve-out only covers a bounce that killed the dispatcher
+    too. A *partial* bounce — the overseer stopping every writer before a DB
+    heal, a rolling restart — SIGTERMs the worker while its dispatcher lives
+    on, so the exit is ``signaled``/15 rather than ``unknown``. Those get the
+    same ``killed_by_restart`` treatment, but only on positive evidence: the
+    bouncer must have stamped a service-bounce marker (``mark_service_bounce``)
+    whose window covers the reap, and the signal must not be one this
+    dispatcher sent. Reclaims and max-runtime timeouts SIGTERM workers
+    themselves and are recorded as dispatcher-initiated, so they keep counting
+    as failures even mid-bounce.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
@@ -9708,6 +9869,7 @@ def detect_crashed_workers(
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            _bounce = _service_bounce_kill(pid, kind, code)
             rate_limited_exit = False
             restart_killed_exit = False
             # Read the worker log tail once so an abnormal death can (a) carry a
@@ -9792,6 +9954,37 @@ def detect_crashed_workers(
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "service_restart": True,
+                }
+            elif _bounce is not None:
+                # The worker was SIGTERM'd (not SIGKILL'd) by something that
+                # is neither this dispatcher nor the task, while a service
+                # bounce window was open — the overseer stopping every writer
+                # before a DB heal, or a rolling restart. Our own dispatcher
+                # is still alive, so it reaped the child and the exit reads
+                # ``signaled`` rather than ``unknown``: the orphan carve-out
+                # above cannot see this case. Same verdict though — a service
+                # bounce is not a task-level failure, so requeue WITHOUT
+                # counting one. Kills the dispatcher itself issued (reclaim,
+                # max-runtime) are excluded by ``_service_bounce_kill``, so
+                # genuine reclaims and timeouts keep counting even mid-bounce.
+                protocol_violation = False
+                restart_killed_exit = True
+                # The bounce reason stays out of ``last_failure_error``: it is
+                # operator-supplied text and could collide with the respawn
+                # guard's quota/auth blocker regex and park the card forever.
+                # It is carried in the event payload instead.
+                error_text = (
+                    f"killed by service bounce — pid {pid} got signal {code} "
+                    f"inside the bounce window; requeued without counting a "
+                    f"failure"
+                )
+                event_kind = "killed_by_restart"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "service_restart": True,
+                    "signal": code,
+                    "bounce_reason": _bounce.get("reason"),
                 }
             else:
                 protocol_violation = False
