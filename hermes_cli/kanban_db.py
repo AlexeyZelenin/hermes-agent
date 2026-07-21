@@ -1296,6 +1296,11 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    # Absolute roots of the EXTRA repos this task edits (beyond the one holding
+    # ``workspace_path``), frozen from the linked project's non-primary folders
+    # at create time. Each is materialized as its own linked worktree on
+    # ``branch_name`` so a two-repo card is isolated in both. None = single-repo.
+    linked_repos: Optional[list] = None
     executor: str = "hermes-worker"
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -1395,6 +1400,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        linked_repos_value: Optional[list] = None
+        if "linked_repos" in keys and row["linked_repos"]:
+            try:
+                parsed = json.loads(row["linked_repos"])
+                if isinstance(parsed, list):
+                    linked_repos_value = [str(p) for p in parsed if p] or None
+            except Exception:
+                linked_repos_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1410,6 +1423,7 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            linked_repos=linked_repos_value,
             executor=(row["executor"] if "executor" in keys and row["executor"] else "hermes-worker"),
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1665,6 +1679,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Extra repositories this task edits, as a JSON array of absolute repo
+    -- roots, frozen from the linked project's non-primary folders at create
+    -- time (projects.db is per-profile and unreachable at dispatch time).
+    -- Each gets its OWN linked worktree at <repo>/.worktrees/<task-id> on the
+    -- task's branch, so a card spanning two repos is isolated in both instead
+    -- of editing one live shared checkout. NULL = single-repo task.
+    linked_repos         TEXT,
     executor             TEXT NOT NULL DEFAULT 'hermes-worker',
     claim_lock           TEXT,
     claim_expires        INTEGER,
@@ -2784,6 +2805,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "linked_repos" not in cols:
+        _add_column_if_missing(conn, "tasks", "linked_repos", "linked_repos TEXT")
     if "executor" not in cols:
         _add_column_if_missing(conn, "tasks", "executor", "executor TEXT NOT NULL DEFAULT 'hermes-worker'")
     if "idempotency_key" not in cols:
@@ -3530,9 +3553,35 @@ def create_task(
     # Primary repo of a project-linked worktree task whose path we still need to
     # derive (a fresh worktree dir under the repo, computed once task_id exists).
     project_repo: Optional[str] = None
+    # Extra repo roots the task edits, frozen from the project's non-primary
+    # folders; each gets its own worktree on the task's branch at dispatch.
+    linked_repos: Optional[list[str]] = None
     if project_id is not None:
         project_id = str(project_id).strip() or None
-    if project_id:
+    if not project_id and workspace_path is None:
+        # No explicit link: inherit the project BOUND TO THIS BOARD, if any.
+        # This is what turns a whole board's tasks into isolated worktree tasks
+        # (t_dad8773c) — without it every card lands in a scratch cwd and the
+        # workers all edit one shared live checkout, which caps safe
+        # parallelism at a single agent. An explicit ``workspace_path`` means
+        # the caller has already chosen a checkout, so we leave it alone.
+        # Read from the ROOT projects store: the board is shared across
+        # profiles, so a card filed by a worker must inherit the same binding
+        # the gateway would have applied.
+        try:
+            from hermes_cli import projects_db as _pdb
+
+            with _pdb.connect_closing(_pdb.board_projects_db_path()) as _pconn:
+                project_obj = _pdb.project_for_board(
+                    _pconn, board if board else get_current_board()
+                )
+            if project_obj is not None:
+                project_id = project_obj.id
+        except Exception:
+            # projects.db is optional infrastructure — a board with no
+            # resolvable project store simply keeps the legacy scratch flow.
+            project_obj = None
+    if project_id and project_obj is None:
         try:
             from hermes_cli import projects_db as _pdb
 
@@ -3540,6 +3589,7 @@ def create_task(
                 project_obj = _pdb.get_project(_pconn, project_id)
         except Exception:
             project_obj = None
+    if project_id:
         if project_obj is None:
             # A project id/slug that doesn't resolve must not crash task
             # creation or persist a dangling reference — drop the link and
@@ -3559,6 +3609,11 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+            if workspace_kind == "worktree":
+                # Freeze the project's OTHER repos onto the task. Cards that
+                # span two repos (engine + plugin) need isolation in both, and
+                # the dispatcher cannot re-read the per-profile projects.db.
+                linked_repos = _project_extra_repos(project_obj) or None
 
     parents = tuple(p for p in parents if p)
     executor = str(executor or (project_obj.executor if project_obj else None) or read_board_metadata(board if board else get_current_board()).get("executor") or "hermes-worker").strip().lower()
@@ -3806,13 +3861,13 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, executor, model_override,
+                        branch_name, project_id, linked_repos, executor, model_override,
                         effort_override, append_system_prompt,
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
                         category, context, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3827,6 +3882,7 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        json.dumps(linked_repos) if linked_repos else None,
                         executor,
                         model_override,
                         effort_override,
@@ -8247,6 +8303,64 @@ def _git_current_branch(path: Path) -> Optional[str]:
     return branch or None
 
 
+def _project_extra_repos(project) -> list[str]:
+    """Absolute git-repo roots of a project's NON-primary folders.
+
+    The primary folder anchors the task's own worktree (the worker's cwd);
+    every other folder that resolves to a git repo root gets a sibling worktree
+    on the same branch, so a card spanning two repos is isolated in both.
+    Folders that aren't git repos (docs, asset dirs) are skipped — there is
+    nothing to branch there.
+    """
+    primary_root: Optional[Path] = None
+    if getattr(project, "primary_path", None):
+        primary_root = _git_toplevel(Path(str(project.primary_path)).expanduser())
+    roots: list[str] = []
+    for folder in getattr(project, "folders", None) or []:
+        raw = str(getattr(folder, "path", "") or "").strip()
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            continue
+        root = _git_toplevel(candidate)
+        if root is None or (primary_root is not None and root == primary_root):
+            continue
+        if str(root) not in roots:
+            roots.append(str(root))
+    return roots
+
+
+def _task_repo_worktrees(task: Task) -> list[tuple[Path, Path]]:
+    """``(repo_root, worktree_path)`` for every EXTRA repo the task edits.
+
+    Deterministic and side-effect free — the paths are derivable before the
+    worktrees exist, so the worker prompt can name them without depending on
+    dispatch order.
+    """
+    pairs: list[tuple[Path, Path]] = []
+    for raw in task.linked_repos or []:
+        repo = Path(str(raw)).expanduser()
+        pairs.append((repo, repo / ".worktrees" / task.id))
+    return pairs
+
+
+def _materialize_linked_worktrees(task: Task, branch_name: str) -> None:
+    """Create the per-repo worktrees for a multi-repo task.
+
+    Failures raise: a missing isolated checkout would silently push the worker
+    back onto the shared live tree, which is the exact race this exists to
+    prevent.
+    """
+    for repo, target in _task_repo_worktrees(task):
+        repo_root = _git_toplevel(repo)
+        if repo_root is None:
+            raise ValueError(
+                f"task {task.id} linked repo {str(repo)!r} is not a git repo"
+            )
+        _ensure_git_worktree(repo_root, target, branch_name)
+
+
 def _is_linked_worktree_checkout(path: Path) -> bool:
     git_dir = _git_dir(path)
     common_dir = _git_common_dir(path)
@@ -8325,7 +8439,24 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
-    """Resolve + materialize a linked git worktree for ``task``.
+    """Resolve + materialize every git worktree ``task`` works in.
+
+    The task's own checkout (the worker's cwd) plus one worktree per entry in
+    ``linked_repos``, all on the same branch. This is the single choke point:
+    the dispatcher calls it directly rather than through
+    :func:`resolve_workspace`, so the multi-repo materialization has to live
+    here or a two-repo card would silently get only its primary checkout and
+    fall back to editing the other repo's shared tree.
+    """
+    path, branch_name = _resolve_primary_worktree(task, board=board)
+    _materialize_linked_worktrees(task, branch_name)
+    return path, branch_name
+
+
+def _resolve_primary_worktree(
+    task: Task, *, board: Optional[str] = None
+) -> tuple[Path, str]:
+    """Resolve + materialize the linked git worktree that is ``task``'s cwd.
 
     When ``task.workspace_path`` is unset, the anchor is the board's
     ``default_workdir`` (a persistent project checkout). This keeps every
@@ -8425,6 +8556,27 @@ def _integration_anchor(task: Task, board: Optional[str]) -> tuple[Path, Optiona
     return repo_root, wt
 
 
+def _integration_targets(
+    task: Task, board: Optional[str]
+) -> list[tuple[Path, Optional[Path]]]:
+    """Every ``(repo_root, worktree)`` the task's branch has to land in.
+
+    The anchor repo first, then one entry per ``linked_repos`` entry — a card
+    that edited two repos carries the same branch in both and must land in both.
+    """
+    from hermes_cli.trunk_integrator import main_worktree_root
+
+    targets = [_integration_anchor(task, board)]
+    seen = {str(targets[0][0])}
+    for repo, worktree in _task_repo_worktrees(task):
+        root = main_worktree_root(repo) or repo
+        if str(root) in seen:
+            continue
+        seen.add(str(root))
+        targets.append((root, worktree))
+    return targets
+
+
 def _prune_task_worktree(repo_root: Path, worktree: Optional[Path], branch: str) -> None:
     """Remove a landed task's worktree + branch (branch hygiene after a land)."""
     if worktree is not None and Path(worktree).exists():
@@ -8484,13 +8636,18 @@ def integrate_task(
 ):
     """Land a completed task's branch into trunk (merge-queue landing step).
 
-    Serialized under the repo's trunk lock. On a green merge the branch is
+    Serialized under each repo's trunk lock. On a green merge the branch is
     merged into trunk, its worktree + branch pruned, and an
     ``integration_landed`` event recorded. On a conflict or red suite the task
     is reopened to ``blocked`` with its branch preserved. Idempotent: a branch
     already in trunk is a no-op that still prunes.
 
-    Returns the :class:`trunk_integrator.IntegrationResult`.
+    A multi-repo task (``linked_repos``) lands the SAME branch in every repo it
+    was given a worktree in, stopping at the first repo that refuses — landing
+    only some repos of a two-repo card would leave trunk half-applied.
+
+    Returns the :class:`trunk_integrator.IntegrationResult` of the repo that
+    refused, or of the anchor repo when everything landed.
     """
     from hermes_cli import trunk_integrator as _ti
 
@@ -8503,16 +8660,21 @@ def integrate_task(
             _ti.Outcome.NO_BRANCH, "", "", detail="task has no branch to integrate"
         )
 
-    repo_root, worktree = _integration_anchor(task, board)
-
-    with _ti.TrunkLock(repo_root):
-        res = _ti.integrate_branch(
-            repo_root, branch, test_cmd=test_cmd, run_tests=run_tests
-        )
+    landed_repos: list[tuple[Path, Optional[Path]]] = []
+    res = None
+    for repo_root, worktree in _integration_targets(task, board):
+        with _ti.TrunkLock(repo_root):
+            res = _ti.integrate_branch(
+                repo_root, branch, test_cmd=test_cmd, run_tests=run_tests
+            )
+        if not res.outcome.landed:
+            break
+        landed_repos.append((repo_root, worktree))
 
     if res.outcome.landed:
         if prune:
-            _prune_task_worktree(repo_root, worktree, branch)
+            for landed_root, landed_worktree in landed_repos:
+                _prune_task_worktree(landed_root, landed_worktree, branch)
         with write_txn(conn):
             _append_event(
                 conn, task_id, "integration_landed",
@@ -8520,6 +8682,7 @@ def integrate_task(
                     "branch": branch, "trunk": res.trunk,
                     "merged_sha": res.merged_sha, "outcome": res.outcome.value,
                     "pruned": bool(prune),
+                    "repos": [str(r) for r, _ in landed_repos],
                 },
             )
         sha = f" @ {res.merged_sha[:12]}" if res.merged_sha else ""
@@ -8600,9 +8763,62 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        p, _branch = _resolve_worktree_workspace(task, board=board)
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
+
+
+def relink_board_tasks(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, dry_run: bool = False
+) -> list[str]:
+    """Retro-fit a board's UNSTARTED backlog onto its bound project's worktrees.
+
+    Binding a project to a board only affects tasks created afterwards: the
+    repo, branch and extra repos are frozen onto the row at create time so the
+    dispatcher never needs the per-profile projects.db. A board converted after
+    it has been running therefore keeps a backlog of scratch tasks that still
+    edit the shared live checkout — and raising ``agent_limit`` above 1 would
+    let exactly those race each other. Run this once after binding.
+
+    Only tasks that have not started are touched (``triage`` / ``todo`` /
+    ``ready`` / ``blocked``, no ``workspace_path`` yet): a running or finished
+    task already has a materialized workspace and re-pointing it would strand
+    work. Returns the ids converted (or that would be, when ``dry_run``).
+    """
+    board_slug = board or get_current_board()
+    from hermes_cli import projects_db as _pdb
+
+    with _pdb.connect_closing(_pdb.board_projects_db_path()) as pconn:
+        project = _pdb.project_for_board(pconn, board_slug)
+    if project is None or not project.primary_path:
+        return []
+    linked = _project_extra_repos(project) or None
+    rows = conn.execute(
+        "SELECT id, title FROM tasks WHERE workspace_kind = 'scratch' "
+        "AND (workspace_path IS NULL OR workspace_path = '') "
+        "AND status IN ('triage', 'todo', 'ready', 'blocked')"
+    ).fetchall()
+    converted = [r["id"] for r in rows]
+    if dry_run or not converted:
+        return converted
+    with write_txn(conn):
+        for row in rows:
+            conn.execute(
+                "UPDATE tasks SET workspace_kind = 'worktree', workspace_path = ?, "
+                "branch_name = ?, project_id = ?, linked_repos = ? WHERE id = ?",
+                (
+                    os.path.join(str(project.primary_path), ".worktrees", row["id"]),
+                    _pdb.branch_name_for(project, row["id"], title=row["title"] or ""),
+                    project.id,
+                    json.dumps(linked) if linked else None,
+                    row["id"],
+                ),
+            )
+            _append_event(
+                conn, row["id"], "workspace_relinked",
+                {"project": project.slug, "repos": [str(project.primary_path)] + (linked or [])},
+            )
+    return converted
 
 
 def set_workspace_path(
@@ -12153,6 +12369,24 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+def _worker_checkouts(task: Task) -> list[tuple[str, str, bool]]:
+    """``(live_repo, worktree, is_cwd)`` triples to show a worktree worker.
+
+    Pure path arithmetic — no git calls, and no dependency on the worktrees
+    already existing, so the prompt renders identically before and after
+    dispatch materializes them.
+    """
+    if (task.workspace_kind or "") != "worktree":
+        return []
+    out: list[tuple[str, str, bool]] = []
+    if task.workspace_path:
+        wt = Path(task.workspace_path)
+        repo = wt.parent.parent if wt.parent.name == ".worktrees" else wt
+        out.append((str(repo), str(wt), True))
+    out.extend((str(repo), str(wt), False) for repo, wt in _task_repo_worktrees(task))
+    return out
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
@@ -12215,6 +12449,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    checkouts = _worker_checkouts(task)
+    if checkouts:
+        lines.append("## Repos — isolated per-task worktrees")
+        lines.append(
+            "Edit code ONLY inside the checkouts below. They are this task's "
+            "private git worktrees"
+            + (f" on branch `{task.branch_name}`" if task.branch_name else "")
+            + ". The shared live checkouts they were cut from are OFF-LIMITS: "
+            "other workers edit those in parallel, so writing there silently "
+            "overwrites their work. Never rewrite a path back to the live repo "
+            "root — resolve every file under its worktree path."
+        )
+        for repo, worktree, is_cwd in checkouts:
+            suffix = " ← your cwd" if is_cwd else ""
+            lines.append(f"- live `{repo}` → work in `{worktree}`{suffix}")
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")
