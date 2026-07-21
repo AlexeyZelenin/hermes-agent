@@ -893,6 +893,132 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
 
 
+# ── classify_worker_crash: one test per disposition branch ────────────────
+#
+# The classifier is pure — the caller resolves ``kind``/``code`` (from
+# ``_classify_worker_exit``), ``bounce`` (from ``_service_bounce_kill``),
+# ``owner_alive`` (from ``_claim_owner_alive``) and ``log_tail``, and this maps
+# them to a ``_CrashVerdict``. So these tests need no DB / process state.
+
+def test_classify_worker_crash_clean_exit_is_protocol_violation():
+    v = kb.classify_worker_crash(
+        111, "clean_exit", 0, "host:9",
+        bounce=None, owner_alive=None, log_tail=None,
+    )
+    assert v.protocol_violation is True
+    assert not v.rate_limited and not v.restart_killed
+    assert v.event_kind == "protocol_violation"
+    # Durable marker copied into run metadata for the violation-only streak.
+    assert v.event_payload["protocol_violation"] is True
+    assert v.event_payload["exit_code"] == 0
+    assert "kanban_complete" in v.error_text
+
+
+def test_classify_worker_crash_rate_limited():
+    v = kb.classify_worker_crash(
+        222, "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE, "host:9",
+        bounce=None, owner_alive=None, log_tail=None,
+    )
+    assert v.rate_limited is True
+    assert not v.protocol_violation and not v.restart_killed
+    assert v.event_kind == "rate_limited"
+    assert v.event_payload["exit_code"] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert "quota wall" in v.error_text
+
+
+def test_classify_worker_crash_unknown_owner_gone_is_restart_kill():
+    v = kb.classify_worker_crash(
+        333, "unknown", None, "host:dead",
+        bounce=None, owner_alive=False, log_tail=None,
+    )
+    assert v.restart_killed is True
+    assert not v.protocol_violation and not v.rate_limited
+    assert v.event_kind == "killed_by_restart"
+    assert v.event_payload["service_restart"] is True
+    assert "owning dispatcher" in v.error_text
+
+
+def test_classify_worker_crash_unknown_owner_alive_is_crash():
+    # An unknown death whose owning dispatcher is still alive is a real crash,
+    # NOT a restart kill. Owner-alive True *and* None both fall through here.
+    for owner in (True, None):
+        v = kb.classify_worker_crash(
+            333, "unknown", None, "host:9",
+            bounce=None, owner_alive=owner, log_tail=None,
+        )
+        assert v.event_kind == "crashed"
+        assert not v.restart_killed
+        # No exit_kind/exit_code stamped for an unknown death.
+        assert "exit_kind" not in v.event_payload
+        assert v.error_text == "pid 333 not alive"
+
+
+def test_classify_worker_crash_service_bounce_is_restart_kill():
+    bounce = {"reason": "db-heal", "started_at": 1.0, "ttl_seconds": 120}
+    v = kb.classify_worker_crash(
+        444, "signaled", 15, "host:9",
+        bounce=bounce, owner_alive=True, log_tail=None,
+    )
+    assert v.restart_killed is True
+    assert not v.protocol_violation and not v.rate_limited
+    assert v.event_kind == "killed_by_restart"
+    assert v.event_payload["service_restart"] is True
+    assert v.event_payload["signal"] == 15
+    assert v.event_payload["bounce_reason"] == "db-heal"
+    # Operator-supplied bounce reason must NOT leak into last_failure_error.
+    assert "db-heal" not in v.error_text
+    assert "service bounce" in v.error_text
+
+
+def test_classify_worker_crash_nonzero_exit_is_crash():
+    v = kb.classify_worker_crash(
+        555, "nonzero_exit", 1, "host:9",
+        bounce=None, owner_alive=None, log_tail=None,
+    )
+    assert v.event_kind == "crashed"
+    assert not (v.protocol_violation or v.rate_limited or v.restart_killed)
+    assert v.error_text == "pid 555 exited with code 1"
+    assert v.event_payload["exit_kind"] == "nonzero_exit"
+    assert v.event_payload["exit_code"] == 1
+
+
+def test_classify_worker_crash_signaled_without_bounce_is_crash():
+    v = kb.classify_worker_crash(
+        666, "signaled", 9, "host:9",
+        bounce=None, owner_alive=True, log_tail=None,
+    )
+    assert v.event_kind == "crashed"
+    assert not v.restart_killed
+    assert v.error_text == "pid 666 killed by signal 9"
+    assert v.event_payload["exit_kind"] == "signaled"
+    assert v.event_payload["exit_code"] == 9
+
+
+def test_classify_worker_crash_log_tail_upgrades_error_text():
+    # A recognized fatal reason in the log tail replaces the bare exit text so
+    # the parked card shows the real cause (quota wall) not "exited with code 1".
+    v = kb.classify_worker_crash(
+        777, "nonzero_exit", 1, "host:9",
+        bounce=None, owner_alive=None,
+        log_tail="Codex provider quota exhausted (429)",
+    )
+    assert v.event_kind == "crashed"
+    assert "quota exhausted" in v.error_text
+    assert v.error_text != "pid 777 exited with code 1"
+
+
+def test_classify_worker_crash_precedence_rate_limit_beats_bounce():
+    # A rate-limit sentinel exit is classified as rate_limited even if a bounce
+    # record is somehow present — the branch order matches the original chain.
+    bounce = {"reason": "x", "started_at": 1.0, "ttl_seconds": 120}
+    v = kb.classify_worker_crash(
+        888, "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE, "host:9",
+        bounce=bounce, owner_alive=False, log_tail=None,
+    )
+    assert v.rate_limited is True
+    assert v.event_kind == "rate_limited"
+
+
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):

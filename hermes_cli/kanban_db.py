@@ -9994,6 +9994,433 @@ def _post_gave_up_diagnostics(
         pass
 
 
+# Static corrective sentence for the clean-exit-but-still-running case. It is
+# surfaced to the retry worker via the prior-attempt error in
+# ``build_worker_context`` (guidance approach from #61817): overwhelmingly the
+# work itself succeeded and only the terminal kanban call was skipped, so a
+# retry usually completes.
+_PROTOCOL_VIOLATION_ERROR = (
+    "worker exited cleanly (rc=0) without calling "
+    "kanban_complete or kanban_block — protocol violation. "
+    "If the prior run already did the work, verify it and "
+    "report the result via kanban_complete; a run that ends "
+    "without a terminal kanban call counts as failed no "
+    "matter what it did."
+)
+
+
+@dataclass
+class _CrashVerdict:
+    """How ``detect_crashed_workers`` should record and requeue a dead worker.
+
+    Produced by ``classify_worker_crash``. Exactly one of ``rate_limited`` /
+    ``restart_killed`` is true for a clean release; ``protocol_violation`` flags
+    the clean-exit-but-still-running case (accounted against its own streak);
+    all three false means a genuine crash that counts against the breaker.
+    """
+    error_text: str
+    event_kind: str
+    event_payload: dict
+    protocol_violation: bool = False
+    rate_limited: bool = False
+    restart_killed: bool = False
+
+
+def classify_worker_crash(
+    pid: int,
+    kind: str,
+    code: Optional[int],
+    claim_lock: Optional[str],
+    *,
+    bounce: Optional[dict],
+    owner_alive: Optional[bool],
+    log_tail: Optional[str],
+) -> _CrashVerdict:
+    """Classify a dead worker's exit into one of six dispositions.
+
+    Pure function: the caller resolves the I/O-bearing inputs (``kind``/``code``
+    from ``_classify_worker_exit``, ``bounce`` from ``_service_bounce_kill``,
+    ``owner_alive`` from ``_claim_owner_alive``, ``log_tail`` from
+    ``worker_log_tail``) and this maps them to a ``_CrashVerdict``. The six
+    branches, in precedence order:
+
+    1. ``clean_exit`` — rc=0 while still ``running``: protocol violation.
+    2. ``rate_limited`` — quota-wall sentinel exit: requeue, no failure counted.
+    3. ``unknown`` + owning dispatcher gone: service-restart kill (orphaned).
+    4. attributable service-bounce SIGTERM: partial-bounce restart kill.
+    5. ``nonzero_exit`` / ``signaled`` / other: a genuine crash (default).
+
+    The precedence matches the original ``if/elif`` chain exactly; ``bounce`` is
+    only ever non-None for a ``signaled`` exit, so it never collides with (3).
+    """
+    if kind == "clean_exit":
+        # rc=0 while the task is still ``running``: the worker exited without
+        # calling ``kanban_complete`` / ``kanban_block``. The payload's
+        # ``protocol_violation`` key is a durable marker — ``_end_run`` copies
+        # it into the run metadata, from which the violation-only retry budget
+        # is later derived.
+        return _CrashVerdict(
+            error_text=_PROTOCOL_VIOLATION_ERROR,
+            event_kind="protocol_violation",
+            event_payload={
+                "pid": pid, "claimer": claim_lock,
+                "exit_code": code, "protocol_violation": True,
+            },
+            protocol_violation=True,
+        )
+    if kind == "rate_limited":
+        # Provider rate-limited / exhausted quota (EX_TEMPFAIL sentinel). NOT a
+        # task failure — the account just hit a wall. The caller releases the
+        # task to ``ready`` and the respawn guard defers it until the window
+        # clears, WITHOUT counting a failure, so a long quota window can't trip
+        # the breaker and permanently block the card.
+        return _CrashVerdict(
+            error_text=(
+                f"pid {pid} exited rate-limited (quota wall) — "
+                f"requeued without counting a failure"
+            ),
+            event_kind="rate_limited",
+            event_payload={"pid": pid, "claimer": claim_lock, "exit_code": code},
+            rate_limited=True,
+        )
+    if kind == "unknown" and owner_alive is False:
+        # Not reaped by this dispatcher (unknown exit) AND the dispatcher that
+        # owned the claim is itself gone: the signature of a gateway/overseer
+        # restart that took its worker children down with it. NOT a task-level
+        # failure — released to ``ready`` without counting one, so a service
+        # restart can never trip the give-up breaker. A genuine crash's owning
+        # dispatcher is still alive (owner-alive True/None) and misses this.
+        return _CrashVerdict(
+            error_text=(
+                f"killed by service restart — owning dispatcher "
+                f"({claim_lock}) is gone; requeued without "
+                f"counting a failure"
+            ),
+            event_kind="killed_by_restart",
+            event_payload={
+                "pid": pid, "claimer": claim_lock, "service_restart": True,
+            },
+            restart_killed=True,
+        )
+    if bounce is not None:
+        # SIGTERM'd by something that is neither this dispatcher nor the task
+        # while a service bounce window was open (overseer stopping writers
+        # before a DB heal, or a rolling restart). Our dispatcher survived and
+        # reaped the child, so the exit reads ``signaled`` not ``unknown`` — the
+        # orphan carve-out above misses it. Same verdict: requeue without
+        # counting. Dispatcher-issued kills (reclaim, max-runtime) are excluded
+        # by ``_service_bounce_kill``, so they keep counting even mid-bounce.
+        # The bounce reason stays OUT of ``error_text`` (operator text could
+        # collide with the respawn guard's blocker regex and park the card
+        # forever); it rides in the event payload instead.
+        return _CrashVerdict(
+            error_text=(
+                f"killed by service bounce — pid {pid} got signal {code} "
+                f"inside the bounce window; requeued without counting a "
+                f"failure"
+            ),
+            event_kind="killed_by_restart",
+            event_payload={
+                "pid": pid, "claimer": claim_lock, "service_restart": True,
+                "signal": code, "bounce_reason": bounce.get("reason"),
+            },
+            restart_killed=True,
+        )
+    # Default: a genuine crash — nonzero exit, uncaught signal, or an unknown
+    # death whose owning dispatcher is still alive.
+    return _crashed_verdict(pid, kind, code, claim_lock, log_tail)
+
+
+def _crashed_verdict(
+    pid: int,
+    kind: str,
+    code: Optional[int],
+    claim_lock: Optional[str],
+    log_tail: Optional[str],
+) -> _CrashVerdict:
+    """Build the ``crashed`` verdict for a genuine task-level failure.
+
+    The default disposition of ``classify_worker_crash``: a nonzero exit, an
+    uncaught signal, or an ``unknown`` death whose owning dispatcher is still
+    alive. Counts against the circuit breaker.
+    """
+    if kind == "nonzero_exit":
+        error_text = f"pid {pid} exited with code {code}"
+    elif kind == "signaled":
+        error_text = f"pid {pid} killed by signal {code}"
+    else:
+        error_text = f"pid {pid} not alive"
+    # Upgrade the bare exit text with a reason parsed from the log tail when we
+    # recognize one (e.g. a provider quota wall). This is what the circuit
+    # breaker later stamps as the park reason, so a parked card reads "Codex
+    # quota exhausted (429), retry in 6d" instead of "exited with code 1".
+    reason = classify_fatal_log(log_tail)
+    if reason:
+        error_text = reason
+    event_payload: dict = {"pid": pid, "claimer": claim_lock}
+    if code is not None and kind != "unknown":
+        event_payload["exit_kind"] = kind
+        event_payload["exit_code"] = code
+    return _CrashVerdict(
+        error_text=error_text,
+        event_kind="crashed",
+        event_payload=event_payload,
+    )
+
+
+def _record_worker_release(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    pid: int,
+    verdict: _CrashVerdict,
+    log_tail: Optional[str],
+) -> dict:
+    """Persist a released worker's run outcome + event and stamp its error.
+
+    Runs inside ``detect_crashed_workers``'s open write txn (after the row's
+    ``running`` → ``ready`` UPDATE won its race). Returns a routing record for
+    the orchestrator to bucket into rate-limited / restart-killed / crashed.
+    """
+    # Rate-limited requeues and service-restart kills are clean releases, not
+    # crashes — record a matching run outcome so the board history doesn't show
+    # a phantom crash for a quota wall or a gateway bounce.
+    if verdict.rate_limited:
+        run_outcome = "rate_limited"
+    elif verdict.restart_killed:
+        run_outcome = "killed_by_restart"
+    else:
+        run_outcome = "crashed"
+    run_id = _end_run(
+        conn, row["id"],
+        outcome=run_outcome, status=run_outcome,
+        error=verdict.error_text,
+        metadata=dict(verdict.event_payload),
+    )
+    _append_event(
+        conn, row["id"], verdict.event_kind,
+        verdict.event_payload,
+        run_id=run_id,
+    )
+    if verdict.rate_limited:
+        # Stamp the failure-error column so ``check_respawn_guard`` recognizes
+        # this as a quota blocker and defers the respawn until the window clears
+        # — WITHOUT touching ``consecutive_failures`` (that's the whole point:
+        # no breaker trip on a throttle).
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            (verdict.error_text[:500], row["id"]),
+        )
+        return {"outcome": "rate_limited", "task_id": row["id"]}
+    if verdict.restart_killed:
+        # Service-restart kill: stamp a NON-quota, NON-auth error string (so
+        # ``check_respawn_guard``'s blocker regex won't trap it) purely so the
+        # card badge tooltip and the retry worker's context can show why the
+        # prior run vanished. The task stays at ``ready`` for immediate respawn
+        # and — the whole point — ``consecutive_failures`` is left untouched, so
+        # a gateway/overseer bounce can never trip the breaker.
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            (verdict.error_text[:500], row["id"]),
+        )
+        return {"outcome": "restart_killed", "task_id": row["id"]}
+    if verdict.protocol_violation:
+        # Stamp the failure error now: a below-budget violation never reaches
+        # ``_record_task_failure`` (which stamps this column for every other
+        # failure kind), yet the board UI and the retry worker's context still
+        # need the violation message + the corrective guidance it carries.
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            (verdict.error_text[:500], row["id"]),
+        )
+    return {
+        "outcome": "crashed",
+        "task_id": row["id"],
+        "detail": (
+            row["id"], pid, row["claim_lock"],
+            verdict.protocol_violation, verdict.error_text, log_tail,
+        ),
+    }
+
+
+def _reclaim_one_worker(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    host_prefix: str,
+    board: Optional[str],
+) -> Optional[dict]:
+    """Reclaim a single ``running`` row whose worker PID is dead.
+
+    Returns None when the row is skipped (foreign host, launch grace, still
+    alive) or the release lost its race; otherwise the routing record from
+    ``_record_worker_release``. Runs inside the caller's open write txn.
+    """
+    # Only check liveness for claims owned by this host.
+    lock = row["claim_lock"] or ""
+    if not lock.startswith(host_prefix):
+        return None
+    # Skip liveness check inside the launch-window grace period so a
+    # freshly-spawned worker isn't reclaimed before its PID is visible on /proc.
+    started_at = row["started_at"] if "started_at" in row.keys() else None
+    if started_at is not None:
+        grace = _resolve_crash_grace_seconds()
+        if time.time() - started_at < grace:
+            return None
+    if _pid_alive(row["worker_pid"]):
+        return None
+
+    pid = int(row["worker_pid"])
+    kind, code = _classify_worker_exit(pid)
+    # Read the worker log tail once so an abnormal death can (a) carry a
+    # human-readable reason instead of a bare exit code and (b) attach the tail
+    # to the ``gave_up`` comment. Best-effort file I/O.
+    log_tail = None
+    try:
+        log_tail = worker_log_tail(row["id"], board=board)
+    except Exception:
+        log_tail = None
+    verdict = classify_worker_crash(
+        pid, kind, code, row["claim_lock"],
+        bounce=_service_bounce_kill(pid, kind, code),
+        owner_alive=_claim_owner_alive(row["claim_lock"]),
+        log_tail=log_tail,
+    )
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+        "claim_expires = NULL, worker_pid = NULL "
+        "WHERE id = ? AND status = 'running' "
+        "  AND worker_pid = ? AND claim_lock IS ?",
+        (row["id"], pid, row["claim_lock"]),
+    )
+    if cur.rowcount != 1:
+        return None
+    return _record_worker_release(conn, row, pid, verdict, log_tail)
+
+
+def _account_crashed_failures(
+    conn: sqlite3.Connection,
+    crash_details: "list[tuple[str, int, str, bool, str, Optional[str]]]",
+    *,
+    board: Optional[str],
+) -> "list[str]":
+    """Account each crashed task outside the main txn; return auto-blocked ids.
+
+    Each crash transitions the task ready → blocked with a ``gave_up`` event on
+    top of the ``crashed``/``protocol_violation`` event already emitted, when
+    the breaker trips. ``_record_task_failure`` needs its own write_txn so it
+    can't nest inside the reclaim txn — hence this post-txn pass.
+
+    Protocol-violation crashes (clean exit, no terminal tool call) get a BOUNDED
+    retry, not an immediate trip: empirically ~96% of these tasks complete on a
+    later run (a goal-mode finalize nudge, or the model simply emitting
+    kanban_complete/kanban_block next time), so blocking on the first occurrence
+    just churned them through the respawn cycle. The retry budget is a
+    violation-only streak (``_protocol_violation_streak``): earlier timeouts /
+    nonzero exits neither consume nor extend it, and a below-budget violation
+    does not tick the unified ``consecutive_failures`` counter, so the two
+    budgets stay independent. A per-task ``max_retries`` overrides the violation
+    bound with the same top precedence it has for every other failure kind.
+    Systemic same-error crashes still trip immediately.
+    """
+    auto_blocked: list[str] = []
+    if not crash_details:
+        return auto_blocked
+    # Fingerprint errors to detect systemic failures.
+    _fp_counts: dict[str, int] = {}
+    for _, _, _, _, err_text, _ in crash_details:
+        fp = _error_fingerprint(err_text)
+        _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
+    for tid, pid, claimer, protocol_violation, error_text, log_tail in crash_details:
+        if protocol_violation:
+            if _account_protocol_violation(
+                conn, tid, pid, claimer, error_text, log_tail, board=board,
+            ):
+                auto_blocked.append(tid)
+            continue
+        fp = _error_fingerprint(error_text)
+        is_systemic = _fp_counts.get(fp, 0) >= 3
+        tripped = _record_task_failure(
+            conn, tid,
+            error=error_text,
+            outcome="crashed",
+            failure_limit=1 if is_systemic else None,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"pid": pid, "claimer": claimer},
+        )
+        if tripped:
+            auto_blocked.append(tid)
+            _post_gave_up_diagnostics(
+                conn, tid, board=board, reason=error_text,
+                log_tail=log_tail,
+            )
+    return auto_blocked
+
+
+def _account_protocol_violation(
+    conn: sqlite3.Connection,
+    tid: str,
+    pid: int,
+    claimer: str,
+    error_text: str,
+    log_tail: Optional[str],
+    *,
+    board: Optional[str],
+) -> bool:
+    """Account one protocol-violation crash against its bounded retry streak.
+
+    Returns True when the violation streak reached its bound and the breaker
+    tripped (task auto-blocked); False when the task is still below budget (left
+    at ``ready`` for another retry) or was deleted mid-loop. See
+    ``_account_crashed_failures`` for why violations get their own budget.
+    """
+    streak = _protocol_violation_streak(conn, tid)
+    trow = conn.execute(
+        "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
+    ).fetchone()
+    if trow is None:
+        return False  # task deleted mid-loop
+    task_override = (
+        trow["max_retries"] if "max_retries" in trow.keys() else None
+    )
+    violation_limit = (
+        int(task_override)
+        if task_override is not None
+        else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+    )
+    if streak < violation_limit:
+        # Below budget: the task is already back at ``ready`` (respawn allowed)
+        # with ``last_failure_error`` stamped. Deliberately no
+        # ``_record_task_failure`` call — a below-budget violation must not
+        # consume the unified failure budget, just as other failure kinds don't
+        # consume this one.
+        return False
+    # Streak reached the bound: trip the breaker. ``force_trip`` skips the
+    # threshold resolution inside ``_record_task_failure`` because the decision
+    # — including the per-task ``max_retries`` override — was already made
+    # against the violation streak above.
+    tripped = _record_task_failure(
+        conn, tid,
+        error=error_text,
+        outcome="crashed",
+        failure_limit=violation_limit,
+        force_trip=True,
+        release_claim=False,
+        end_run=False,
+        event_payload_extra={
+            "pid": pid,
+            "claimer": claimer,
+            "protocol_violations": streak,
+            "protocol_violation_limit": violation_limit,
+        },
+    )
+    if tripped:
+        _post_gave_up_diagnostics(
+            conn, tid, board=board, reason=error_text,
+            log_tail=log_tail,
+        )
+    return bool(tripped)
+
+
 def detect_crashed_workers(
     conn: sqlite3.Connection, *, board: Optional[str] = None,
 ) -> list[str]:
@@ -10053,12 +10480,11 @@ def detect_crashed_workers(
     crashed: list[str] = []
     rate_limited: list[str] = []
     restart_killed: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
-    # clean-exit-but-still-running case, which is accounted against its
-    # own bounded violation streak instead of the unified failure
-    # counter (see the post-txn loop below).
+    # Per-crash details collected inside the main txn, used after it closes to
+    # run ``_record_task_failure`` (which needs its own write_txn so can't
+    # nest). ``protocol_violation`` (4th element) flags the
+    # clean-exit-but-still-running case, accounted against its own bounded
+    # violation streak instead of the unified failure counter.
     crash_details: list[tuple[str, int, str, bool, str, Optional[str]]] = []
     # (task_id, pid, claimer, protocol_violation, error_text, log_tail)
     with write_txn(conn):
@@ -10068,324 +10494,18 @@ def detect_crashed_workers(
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
+            res = _reclaim_one_worker(conn, row, host_prefix, board)
+            if res is None:
                 continue
-            # Skip liveness check inside the launch-window grace period
-            # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
-            if started_at is not None:
-                grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
-                    continue
-            if _pid_alive(row["worker_pid"]):
-                continue
-
-            pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
-            _bounce = _service_bounce_kill(pid, kind, code)
-            rate_limited_exit = False
-            restart_killed_exit = False
-            # Read the worker log tail once so an abnormal death can (a) carry a
-            # human-readable reason instead of a bare exit code and (b) attach
-            # the tail to the ``gave_up`` comment. Best-effort file I/O.
-            _log_tail = None
-            try:
-                _log_tail = worker_log_tail(row["id"], board=board)
-            except Exception:
-                _log_tail = None
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
-                )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            elif (
-                kind == "unknown"
-                and _claim_owner_alive(row["claim_lock"]) is False
-            ):
-                # The worker was NOT reaped by this dispatcher (unknown exit)
-                # AND the dispatcher/gateway that owned the claim is itself
-                # gone. That is the signature of a gateway/overseer restart:
-                # the service bounce took its worker children down with it,
-                # and a fresh dispatcher (empty reap registry) now finds the
-                # orphaned ``running`` rows. This is NOT a task-level failure,
-                # so — exactly like the rate-limited path — release the task
-                # back to ``ready`` WITHOUT counting a failure, so a service
-                # restart can never increment ``consecutive_failures`` or trip
-                # the give-up breaker. Contrast a genuine crash, whose owning
-                # dispatcher is still alive (owner-alive is True/None).
-                protocol_violation = False
-                restart_killed_exit = True
-                error_text = (
-                    f"killed by service restart — owning dispatcher "
-                    f"({row['claim_lock']}) is gone; requeued without "
-                    f"counting a failure"
-                )
-                event_kind = "killed_by_restart"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "service_restart": True,
-                }
-            elif _bounce is not None:
-                # The worker was SIGTERM'd (not SIGKILL'd) by something that
-                # is neither this dispatcher nor the task, while a service
-                # bounce window was open — the overseer stopping every writer
-                # before a DB heal, or a rolling restart. Our own dispatcher
-                # is still alive, so it reaped the child and the exit reads
-                # ``signaled`` rather than ``unknown``: the orphan carve-out
-                # above cannot see this case. Same verdict though — a service
-                # bounce is not a task-level failure, so requeue WITHOUT
-                # counting one. Kills the dispatcher itself issued (reclaim,
-                # max-runtime) are excluded by ``_service_bounce_kill``, so
-                # genuine reclaims and timeouts keep counting even mid-bounce.
-                protocol_violation = False
-                restart_killed_exit = True
-                # The bounce reason stays out of ``last_failure_error``: it is
-                # operator-supplied text and could collide with the respawn
-                # guard's quota/auth blocker regex and park the card forever.
-                # It is carried in the event payload instead.
-                error_text = (
-                    f"killed by service bounce — pid {pid} got signal {code} "
-                    f"inside the bounce window; requeued without counting a "
-                    f"failure"
-                )
-                event_kind = "killed_by_restart"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "service_restart": True,
-                    "signal": code,
-                    "bounce_reason": _bounce.get("reason"),
-                }
+            if res["outcome"] == "rate_limited":
+                rate_limited.append(res["task_id"])
+            elif res["outcome"] == "restart_killed":
+                restart_killed.append(res["task_id"])
             else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                # Upgrade the bare exit text with a reason parsed from the log
-                # tail when we recognize one (e.g. a provider quota wall). This
-                # is what the circuit breaker later stamps as the park reason,
-                # so a parked card reads "Codex quota exhausted (429), retry in
-                # 6d" instead of "exited with code 1".
-                _reason = classify_fatal_log(_log_tail)
-                if _reason:
-                    error_text = _reason
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
-
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
-            )
-            if cur.rowcount == 1:
-                # Rate-limited requeues and service-restart kills are clean
-                # releases, not crashes — record a matching run outcome so the
-                # board history doesn't show a phantom crash for a quota wall
-                # or a gateway bounce.
-                if rate_limited_exit:
-                    _run_outcome = "rate_limited"
-                elif restart_killed_exit:
-                    _run_outcome = "killed_by_restart"
-                else:
-                    _run_outcome = "crashed"
-                run_id = _end_run(
-                    conn, row["id"],
-                    outcome=_run_outcome, status=_run_outcome,
-                    error=error_text,
-                    metadata=dict(event_payload),
-                )
-                _append_event(
-                    conn, row["id"], event_kind,
-                    event_payload,
-                    run_id=run_id,
-                )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
-                    conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
-                    )
-                    rate_limited.append(row["id"])
-                elif restart_killed_exit:
-                    # Service-restart kill: stamp a NON-quota, NON-auth error
-                    # string (so ``check_respawn_guard``'s blocker regex won't
-                    # trap it) purely so the card badge tooltip and the retry
-                    # worker's context can show why the prior run vanished. The
-                    # task stays at ``ready`` for immediate respawn and — the
-                    # whole point — ``consecutive_failures`` is left untouched,
-                    # so a gateway/overseer bounce can never trip the breaker.
-                    conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
-                    )
-                    restart_killed.append(row["id"])
-                else:
-                    if protocol_violation:
-                        # Stamp the failure error now: a below-budget
-                        # violation never reaches ``_record_task_failure``
-                        # (which stamps this column for every other failure
-                        # kind), yet the board UI and the retry worker's
-                        # context still need the violation message + the
-                        # corrective guidance it carries.
-                        conn.execute(
-                            "UPDATE tasks SET last_failure_error = ? "
-                            "WHERE id = ?",
-                            (error_text[:500], row["id"]),
-                        )
-                    crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text, _log_tail)
-                    )
-    # Outside the main txn: account each crashed task and maybe trip the
-    # breaker (the task transitions ready → blocked with a ``gave_up`` event
-    # on top of the event we already emitted).
-    #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
-    # complete on a later run (a goal-mode finalize nudge, or the model simply
-    # emitting kanban_complete/kanban_block next time), so blocking on the first
-    # occurrence just churned them through the respawn cycle. The retry budget
-    # is a violation-only streak (``_protocol_violation_streak``): earlier
-    # timeouts / nonzero exits neither consume nor extend it, and a
-    # below-budget violation does not tick the unified
-    # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
-    auto_blocked: list[str] = []
-    if crash_details:
-        # Fingerprint errors to detect systemic failures.
-        _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text, _ in crash_details:
-            fp = _error_fingerprint(err_text)
-            _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text, log_tail in crash_details:
-            if protocol_violation:
-                streak = _protocol_violation_streak(conn, tid)
-                trow = conn.execute(
-                    "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
-                ).fetchone()
-                if trow is None:
-                    continue  # task deleted mid-loop
-                task_override = (
-                    trow["max_retries"] if "max_retries" in trow.keys() else None
-                )
-                violation_limit = (
-                    int(task_override)
-                    if task_override is not None
-                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
-                )
-                if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
-                    # Deliberately no ``_record_task_failure`` call — a
-                    # below-budget violation must not consume the unified
-                    # failure budget, just as other failure kinds don't
-                    # consume this one.
-                    continue
-                # Streak reached the bound: trip the breaker. ``force_trip``
-                # skips the threshold resolution inside
-                # ``_record_task_failure`` because the decision — including
-                # the per-task ``max_retries`` override — was already made
-                # against the violation streak above.
-                tripped = _record_task_failure(
-                    conn, tid,
-                    error=error_text,
-                    outcome="crashed",
-                    failure_limit=violation_limit,
-                    force_trip=True,
-                    release_claim=False,
-                    end_run=False,
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
-                )
-                if tripped:
-                    auto_blocked.append(tid)
-                    _post_gave_up_diagnostics(
-                        conn, tid, board=board, reason=error_text,
-                        log_tail=log_tail,
-                    )
-                continue
-            fp = _error_fingerprint(error_text)
-            is_systemic = _fp_counts.get(fp, 0) >= 3
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
-                failure_limit=1 if is_systemic else None,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer},
-            )
-            if tripped:
-                auto_blocked.append(tid)
-                _post_gave_up_diagnostics(
-                    conn, tid, board=board, reason=error_text,
-                    log_tail=log_tail,
-                )
+                crashed.append(res["task_id"])
+                crash_details.append(res["detail"])
+    # Outside the main txn: account each crashed task and maybe trip the breaker.
+    auto_blocked = _account_crashed_failures(conn, crash_details, board=board)
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this
