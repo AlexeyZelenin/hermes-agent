@@ -1044,6 +1044,29 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_stores_typed_card_fields(worker_env):
+    """A planner can fill the frame / ask / verbatim quotes at create time."""
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "typed child",
+        "assignee": "peer",
+        "context": "the operator wants structured cards",
+        "question": "split the blob into fields?",
+        "user_quotes": "«точная цитата пользователя»",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.context == "the operator wants structured cards"
+        assert child.question == "split the blob into fields?"
+        assert child.user_quotes == "«точная цитата пользователя»"
+    finally:
+        conn.close()
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen

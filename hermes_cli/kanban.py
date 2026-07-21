@@ -336,6 +336,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--context", default=None,
                           help="Optional background / 'why' shown on the card, "
                                "separate from --body (the work description)")
+    p_create.add_argument("--question", default=None,
+                          help="Optional 'what we're deciding' — the question the "
+                               "card answers, separate from --context and --body")
+    p_create.add_argument("--user-quotes", dest="user_quotes", default=None,
+                          help="Optional VERBATIM operator quotes the card grew "
+                               "from — the source of intent, stored unparaphrased")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -557,6 +563,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
+
+    p_journal = sub.add_parser(
+        "journal",
+        help="Append a one-line work-journal entry (or list the journal)",
+    )
+    p_journal.add_argument("task_id")
+    p_journal.add_argument("text", nargs="*",
+                           help="The entry — ONE short line. Omit to list the journal.")
+    p_journal.add_argument("--author", default=None,
+                           help="Author name (default: $HERMES_PROFILE or 'user')")
 
     p_complete = sub.add_parser("complete", help="Mark one or more tasks done")
     p_complete.add_argument("task_ids", nargs="+",
@@ -1176,6 +1192,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
             "context":  _cmd_context,
+            "journal":  _cmd_journal,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "sub":      _cmd_sub,
@@ -1567,6 +1584,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             title=args.title,
             body=args.body,
             context=getattr(args, "context", None),
+            question=getattr(args, "question", None),
+            user_quotes=getattr(args, "user_quotes", None),
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
@@ -2145,6 +2164,25 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
+    return 0
+
+
+def _cmd_journal(args: argparse.Namespace) -> int:
+    """Append a one-line journal entry, or print the journal when no text given."""
+    entry = " ".join(args.text or ()).strip()
+    with kb.connect_closing() as conn:
+        if not entry:
+            for row in kb.list_journal(conn, args.task_id):
+                stamp = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(row["created_at"]),
+                )
+                who = f" [{row['author']}]" if row["author"] else ""
+                print(f"{stamp}{who} — {row['entry']}")
+            return 0
+        kb.add_journal_entry(
+            conn, args.task_id, entry, author=args.author or _profile_author(),
+        )
+    print(f"Journal entry added to {args.task_id}")
     return 0
 
 
@@ -3319,6 +3357,7 @@ Common subcommands:
   `stats`               Per-status / per-assignee counts
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
+  `journal <id> [line]` Append a one-line work-journal entry (no line = list)
   `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
