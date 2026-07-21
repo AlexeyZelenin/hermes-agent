@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -49,6 +49,18 @@ def projects_db_path() -> Path:
     home. Tests pass an explicit ``db_path`` to :func:`connect`.
     """
     return get_hermes_home() / "projects.db"
+
+
+def board_projects_db_path() -> Path:
+    """Root-anchored projects DB, used for BOARD bindings only.
+
+    A kanban board is root-anchored and shared across profiles, so its project
+    binding has to resolve identically for the gateway (root profile) and for a
+    worker running under ``profiles/<name>`` — otherwise the same card gets an
+    isolated worktree or a shared scratch dir depending on who filed it.
+    Per-profile projects keep living in :func:`projects_db_path`.
+    """
+    return get_default_hermes_root() / "projects.db"
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +795,35 @@ def list_discovered_repos(conn: sqlite3.Connection) -> List[dict]:
 # ---------------------------------------------------------------------------
 # Resolution + naming
 # ---------------------------------------------------------------------------
+
+
+def project_for_board(
+    conn: sqlite3.Connection, board_slug: str
+) -> Optional[Project]:
+    """Return the project bound to kanban board ``board_slug``, if any.
+
+    This is the consumer side of ``projects.board_slug``: it lets every task
+    created on a board inherit the board's repo + branch convention without the
+    caller passing ``project_id`` explicitly. A board project MUST have a
+    ``primary_path`` — the binding exists to anchor task worktrees, and a
+    project with no repo has nothing to anchor.
+
+    Archived projects are ignored. When several projects bind the same board
+    (a mis-configuration, not a supported topology) the oldest wins, so the
+    resolution is deterministic rather than insertion-order dependent.
+    """
+    slug = normalize_slug(board_slug)
+    if not slug:
+        return None
+    row = conn.execute(
+        "SELECT * FROM projects WHERE board_slug = ? AND archived = 0 "
+        "AND primary_path IS NOT NULL AND primary_path != '' "
+        "ORDER BY created_at ASC, id ASC LIMIT 1",
+        (slug,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _attach_folders(conn, _project_from_row(row))
 
 
 def project_for_path(

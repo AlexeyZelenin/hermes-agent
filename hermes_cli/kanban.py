@@ -643,6 +643,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Keep the task's worktree + branch after a successful land.",
     )
 
+    p_relink = sub.add_parser(
+        "relink-workspaces",
+        help="Move a board's unstarted backlog onto its bound project's worktrees",
+        description=(
+            "Binding a project to a board only affects tasks created after the "
+            "bind — repo and branch are frozen onto each row at create time. "
+            "This converts the tasks that were already queued (triage/todo/"
+            "ready/blocked, not yet started) so the whole board is isolated and "
+            "agent_limit can safely go above 1. Started and finished tasks are "
+            "never touched."
+        ),
+    )
+    p_relink.add_argument(
+        "--dry-run", action="store_true",
+        help="List the tasks that would be converted; change nothing.",
+    )
+
     p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled tasks to ready")
     p_unblock.add_argument(
         "--reason",
@@ -1136,6 +1153,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "integrate": _cmd_integrate,
+            "relink-workspaces": _cmd_relink_workspaces,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
@@ -2289,6 +2307,19 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         )
         return 1
     return 2  # dirty anchor / error / no branch — nothing landed, nothing blocked
+
+
+def _cmd_relink_workspaces(args: argparse.Namespace) -> int:
+    """Convert a board's unstarted backlog to per-task project worktrees."""
+    dry_run = bool(getattr(args, "dry_run", False))
+    with kb.connect_closing() as conn:
+        ids = kb.relink_board_tasks(conn, dry_run=dry_run)
+    if not ids:
+        print("Nothing to relink (no bound project, or no unstarted scratch tasks).")
+        return 0
+    verb = "would relink" if dry_run else "relinked"
+    print(f"{verb} {len(ids)} task(s): {', '.join(ids)}")
+    return 0
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
