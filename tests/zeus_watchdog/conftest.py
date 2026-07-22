@@ -72,6 +72,7 @@ def cfg(tmp_path: Path, kanban_db: Path, zeus_db: Path) -> Config:
         home=home,
         gateway_pid_file=home / "gateway.pid",
         gateway_log=home / "logs" / "gateway.log",
+        roul_loop_beat=home / "roul" / "loop.beat",
         kanban_db=kanban_db,
         zeus_db=zeus_db,
         chat_id_file=home / "telegram_chat_id",

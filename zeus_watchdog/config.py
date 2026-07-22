@@ -29,6 +29,12 @@ class Config:
     home: Path
     gateway_pid_file: Path
     gateway_log: Path
+    # The Roul board dispatcher does NOT run in the gateway: it lives in a
+    # thread inside the dashboard process and stamps this file every tick
+    # (Roul plugin/roul/api.py:_dispatch_loop). gateway.log therefore says
+    # nothing about whether Roul boards are being dispatched — in either
+    # direction. Watch the beat itself.
+    roul_loop_beat: Path
     kanban_db: Path
     zeus_db: Path
     chat_id_file: Path
@@ -40,6 +46,9 @@ class Config:
 
     # Thresholds (seconds).
     dispatcher_log_stale_sec: int = 600
+    # The loop ticks every 60s (TICK_INTERVAL_S), so 5 missed beats is a real
+    # stall, not a slow tick.
+    dispatcher_beat_stale_sec: int = 300
     ready_no_run_sec: int = 600
     # Must exceed the SLOWEST executor's heartbeat cadence: ACP workers
     # (claude-code) only touch last_heartbeat_at ~hourly, so a healthy long
@@ -53,13 +62,14 @@ class Config:
 
     # Fields the JSON overlay may set directly (name -> is_path).
     _PATH_KEYS = (
-        "gateway_pid_file", "gateway_log", "kanban_db", "zeus_db",
+        "gateway_pid_file", "gateway_log", "roul_loop_beat", "kanban_db", "zeus_db",
         "chat_id_file", "state_file", "bot_token_env_file",
     )
     _STR_KEYS = ("bot_token_key", "bot_token", "chat_id")
     _INT_KEYS = (
-        "dispatcher_log_stale_sec", "ready_no_run_sec", "heartbeat_timeout_sec",
-        "resume_grace_sec", "recent_limit_window_sec", "debounce_sec", "interval_sec",
+        "dispatcher_log_stale_sec", "dispatcher_beat_stale_sec", "ready_no_run_sec",
+        "heartbeat_timeout_sec", "resume_grace_sec", "recent_limit_window_sec",
+        "debounce_sec", "interval_sec",
     )
 
 
@@ -68,6 +78,7 @@ def _defaults(home: Path) -> dict[str, Any]:
         "home": home,
         "gateway_pid_file": home / "gateway.pid",
         "gateway_log": home / "logs" / "gateway.log",
+        "roul_loop_beat": home / "roul" / "loop.beat",
         "kanban_db": home / "roul" / "kanban" / "boards" / "roul" / "kanban.db",
         "zeus_db": home / "roul" / "roul.db",
         "chat_id_file": home / "roul" / "telegram_chat_id",

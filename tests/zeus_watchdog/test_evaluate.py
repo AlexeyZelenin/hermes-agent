@@ -16,6 +16,7 @@ def _probe(**kw) -> Probe:
         gateway_pid=123,
         gateway_alive=True,
         log_age_sec=10.0,
+        beat_age_sec=None,
         ready=0,
         run=0,
         stale_heartbeats=[],
@@ -48,6 +49,31 @@ def test_dispatcher_stale_when_log_old(tmp_path):
 
 def test_dispatcher_ok_when_log_fresh(tmp_path):
     assert evaluate(_probe(log_age_sec=60), _cfg(tmp_path)) == []
+
+
+def test_roul_loop_stale_when_beat_old(tmp_path):
+    # gateway.log is fresh — the Roul loop is a separate process and must be
+    # judged on its own beat, not on the gateway's silence.
+    p = _probe(log_age_sec=10, beat_age_sec=400)  # > 300 default
+    assert "roul_loop_stale" in keys(evaluate(p, _cfg(tmp_path)))
+
+
+def test_roul_loop_ok_when_beat_fresh(tmp_path):
+    assert evaluate(_probe(log_age_sec=10, beat_age_sec=30), _cfg(tmp_path)) == []
+
+
+def test_roul_loop_absent_beat_is_not_an_alert(tmp_path):
+    # No beat file (beat_age_sec=None) means no Roul loop is expected here —
+    # a fresh install or a host with the plugin disabled must stay quiet.
+    assert evaluate(_probe(log_age_sec=10, beat_age_sec=None), _cfg(tmp_path)) == []
+
+
+def test_roul_loop_stale_fires_even_when_gateway_down(tmp_path):
+    # The two dispatchers are independent: a dead gateway must not mask a
+    # separately-stalled Roul loop, nor vice versa.
+    conds = keys(evaluate(_probe(gateway_alive=False, beat_age_sec=400), _cfg(tmp_path)))
+    assert "gateway_dead" in conds
+    assert "roul_loop_stale" in conds
 
 
 def test_ready_no_run_condition_and_sustain(tmp_path):

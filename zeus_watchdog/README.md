@@ -15,6 +15,7 @@ Each pass (default every 120 s) evaluates these conditions against the live
 | --- | --- |
 | `gateway_dead` | gateway pid file missing/empty or its pid is not alive |
 | `dispatcher_stale` | gateway alive but `gateway.log` hasn't been written for `dispatcher_log_stale_sec` (600 s) |
+| `roul_loop_stale` | the Roul board dispatcher (a thread in the dashboard process, not the gateway) hasn't stamped `roul/loop.beat` for `dispatcher_beat_stale_sec` (300 s). Checked independently of the gateway; a missing beat file is not an alert |
 | `ready_no_run` | READY (assigned) tasks > 0 but RUN = 0, sustained for `ready_no_run_sec` (600 s) |
 | `resume_stuck` | a subscription hit a limit recently, its cooldown has elapsed, yet READY > 0 / RUN = 0 (`resume_grace_sec`, 300 s) — auto-resume didn't fire |
 | `heartbeat_stale:<task>` | a `running` task's last heartbeat is older than `heartbeat_timeout_sec` (7200 s) |

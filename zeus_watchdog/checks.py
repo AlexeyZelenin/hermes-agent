@@ -38,6 +38,9 @@ class Probe:
     gateway_pid: Optional[int]
     gateway_alive: bool
     log_age_sec: Optional[float]
+    # Age of the Roul dispatch loop's heartbeat file, or None when it is absent
+    # (no Roul plugin installed / loop never started).
+    beat_age_sec: Optional[float]
     ready: int
     run: int
     stale_heartbeats: list[tuple[str, float]] = field(default_factory=list)
@@ -208,6 +211,7 @@ def gather(cfg: Config, now: Optional[float] = None) -> Probe:
         gateway_pid=pid,
         gateway_alive=pid_alive(pid),
         log_age_sec=file_age_sec(cfg.gateway_log, now),
+        beat_age_sec=file_age_sec(cfg.roul_loop_beat, now),
         ready=ready,
         run=run,
         stale_heartbeats=stale_heartbeats(cfg.kanban_db, now, cfg.heartbeat_timeout_sec),
@@ -240,6 +244,17 @@ def evaluate(probe: Probe, cfg: Config) -> list[Condition]:
                 "dispatcher_stale",
                 f"диспетчер не тикает: gateway.log молчит {_minutes(age)}м",
             ))
+
+    # The Roul board dispatcher is independent of the gateway (it runs in the
+    # dashboard process), so it is checked unconditionally — it can stall while
+    # the gateway is perfectly healthy, and stay healthy while the gateway is
+    # down. A missing beat file means no Roul loop is expected; not an alert.
+    beat = probe.beat_age_sec
+    if beat is not None and beat > cfg.dispatcher_beat_stale_sec:
+        conditions.append(Condition(
+            "roul_loop_stale",
+            f"петля Roul не тикает: loop.beat молчит {_minutes(beat)}м",
+        ))
 
     for name in probe.corrupt_dbs:
         conditions.append(Condition(
