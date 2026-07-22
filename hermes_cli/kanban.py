@@ -869,6 +869,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    p_msave = sub.add_parser(
+        "model-savings",
+        help="Size-class distribution + average run cost per class "
+             "(did cheaper-model selection actually save money?)",
+    )
+    p_msave.add_argument(
+        "--limit", type=int, default=50,
+        help="How many most-recent tasks to sample (default 50)",
+    )
+    p_msave.add_argument("--json", action="store_true")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1184,6 +1195,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
+            "model-savings": _cmd_model_savings,
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -2981,6 +2993,87 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(header)
         for entry in ready_skips:
             print(f"  {entry['task_id']:14s}  {entry['reason']}")
+    return 0
+
+
+def _cmd_model_savings(args: argparse.Namespace) -> int:
+    """Show the size-class mix and average run cost per class.
+
+    The "получилось ли" metric for size-based model selection (task
+    t_36f2761f): for the most-recent ``--limit`` non-archived tasks, read the
+    ``model_autoselected`` event to bucket each task by class
+    (small/normal/substantial, or ``manual/none`` when no auto verdict was
+    recorded), then join the zeus token ledger for each task's actual run cost.
+    A single query + a single ledger read — no separate dashboard.
+    """
+    from hermes_cli import task_sizing, zeus_tokens
+
+    limit = max(1, int(getattr(args, "limit", 50) or 50))
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT t.id AS id, "
+            "  (SELECT e.payload FROM task_events e "
+            "     WHERE e.task_id = t.id AND e.kind = 'model_autoselected' "
+            "     ORDER BY e.id LIMIT 1) AS sel "
+            "FROM tasks t WHERE t.status != 'archived' "
+            "ORDER BY t.created_at DESC, t.id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    task_class: dict[str, str] = {}
+    for r in rows:
+        cls = "manual/none"
+        if r["sel"]:
+            try:
+                cls = (json.loads(r["sel"]) or {}).get("class") or cls
+            except (ValueError, TypeError):
+                pass
+        task_class[r["id"]] = cls
+
+    zconn = zeus_tokens.connect()
+    try:
+        per_task = zeus_tokens.aggregate_by_task(zconn, list(task_class)) if zconn else {}
+    finally:
+        if zconn is not None:
+            zconn.close()
+
+    # Bucket order: known classes first, then the manual/none catch-all.
+    order = [*task_sizing.TASK_CLASSES, "manual/none"]
+    buckets: dict[str, dict] = {c: {"n": 0, "priced": 0, "cost": 0.0} for c in order}
+    for tid, cls in task_class.items():
+        b = buckets.setdefault(cls, {"n": 0, "priced": 0, "cost": 0.0})
+        b["n"] += 1
+        cost = (per_task.get(tid) or {}).get("cost_usd")
+        if cost is not None:
+            b["priced"] += 1
+            b["cost"] += float(cost)
+
+    summary = []
+    for cls in order:
+        b = buckets.get(cls) or {"n": 0, "priced": 0, "cost": 0.0}
+        avg = (b["cost"] / b["priced"]) if b["priced"] else None
+        summary.append({
+            "class": cls,
+            "tasks": b["n"],
+            "priced_tasks": b["priced"],
+            "avg_cost_usd": round(avg, 4) if avg is not None else None,
+            "total_cost_usd": round(b["cost"], 4),
+        })
+
+    if getattr(args, "json", False):
+        print(json.dumps({"sampled": len(task_class), "by_class": summary},
+                         indent=2, ensure_ascii=False))
+        return 0
+
+    print(f"Model-savings over last {len(task_class)} task(s):")
+    print(f"  {'class':14s} {'tasks':>6s} {'priced':>7s} {'avg $':>10s} {'total $':>10s}")
+    for row in summary:
+        avg = f"{row['avg_cost_usd']:.4f}" if row["avg_cost_usd"] is not None else "n/a"
+        print(f"  {row['class']:14s} {row['tasks']:>6d} {row['priced_tasks']:>7d} "
+              f"{avg:>10s} {row['total_cost_usd']:>10.4f}")
+    if not any(r["priced_tasks"] for r in summary):
+        print("\n  (no priced runs yet — the zeus token ledger has no cost rows "
+              "for these tasks)")
     return 0
 
 

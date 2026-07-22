@@ -413,6 +413,91 @@ def _warnings_summary_from_diagnostics(
     }
 
 
+def _board_model_selections(
+    conn: sqlite3.Connection, task_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Batch the per-task size-based model-selection verdict for a board.
+
+    One query over ``model_autoselected`` events + one over the tasks' frozen
+    overrides — mirrors the other batched board reads (summaries, token costs)
+    rather than an N+1 per card. Auto verdicts win; a manual pin (frozen model
+    or effort with no auto verdict) reports ``source='manual'``. Tasks with
+    neither are omitted, so the card simply carries no selection.
+    """
+    if not task_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(task_ids))
+    out: dict[str, dict[str, Any]] = {}
+    # Auto verdicts (earliest model_autoselected event per task).
+    for row in conn.execute(
+        f"SELECT task_id, payload FROM task_events "
+        f"WHERE kind = 'model_autoselected' AND task_id IN ({placeholders}) "
+        f"ORDER BY id",
+        tuple(task_ids),
+    ).fetchall():
+        if row["task_id"] in out or not row["payload"]:
+            continue  # keep the first (earliest) verdict per task
+        try:
+            data = json.loads(row["payload"])
+            if isinstance(data, dict):
+                out[row["task_id"]] = data
+        except (ValueError, TypeError):
+            pass
+    # Manual pins for tasks without an auto verdict.
+    for row in conn.execute(
+        f"SELECT id, model_override, effort_override FROM tasks "
+        f"WHERE id IN ({placeholders})",
+        tuple(task_ids),
+    ).fetchall():
+        if row["id"] in out:
+            continue
+        if row["model_override"] or row["effort_override"]:
+            out[row["id"]] = {
+                "source": "manual",
+                "model": row["model_override"],
+                "effort": row["effort_override"],
+                "reason": "model/effort pinned manually (or by project config)",
+            }
+    return out
+
+
+def _model_selection_for(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the size-based model-selection verdict for a task, or None.
+
+    Prefers the recorded ``model_autoselected`` event (auto path: carries the
+    class, role, model, effort and reason). Falls back to reporting a manual
+    pin (``source='manual'``) when the task froze a model/effort but no auto
+    verdict exists — so the drawer can always say where the model came from.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'model_autoselected' "
+        "ORDER BY id LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row and row["payload"]:
+        try:
+            data = json.loads(row["payload"])
+            if isinstance(data, dict):
+                return data
+        except (ValueError, TypeError):
+            pass
+    trow = conn.execute(
+        "SELECT model_override, effort_override FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if trow and (trow["model_override"] or trow["effort_override"]):
+        return {
+            "source": "manual",
+            "model": trow["model_override"],
+            "effort": trow["effort_override"],
+            "reason": "model/effort pinned manually (or by project config)",
+        }
+    return None
+
+
 def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     """Return {'parents': [...], 'children': [...]} for a task."""
     parents = [
@@ -530,6 +615,9 @@ def get_board(
         token_costs = _board_token_costs([t.id for t in tasks], children_map)
         # Per-card model split (own spend) for the compact card model line.
         model_splits = _board_model_splits([t.id for t in tasks])
+        # Per-card size-based selection verdict (class + source), shown only in
+        # the task detail popup — never on the card face (task t_36f2761f).
+        model_selections = _board_model_selections(conn, [t.id for t in tasks])
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -546,6 +634,9 @@ def get_board(
             ms = model_splits.get(t.id)
             if ms:
                 d["model_split"] = {"models": ms}  # omitted when no ledger rows
+            sel = model_selections.get(t.id)
+            if sel:
+                d["model_selection"] = sel  # popup-only; not rendered on the face
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
@@ -740,6 +831,12 @@ def get_task(
             task_d["token_cost"] = tc
         if model_split:
             task_d["model_split"] = model_split
+        # Size-based model selection verdict (task t_36f2761f): which model was
+        # auto-chosen and why (class + source). Pulled from the
+        # ``model_autoselected`` event so the drawer shows it without scanning
+        # the event list. Absent when the operator/project pinned the model
+        # manually (no auto verdict was recorded).
+        task_d["model_selection"] = _model_selection_for(conn, task_id)
         return {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -2465,6 +2562,9 @@ class RenameBoardBody(BaseModel):
     executor: Optional[str] = None
     models: Optional[dict] = None
     models_effort: Optional[dict] = None
+    # Per-board toggle for size-based model selection (task t_36f2761f).
+    # None leaves it unset (global config default applies).
+    auto_model_select: Optional[bool] = None
 
 
 def _board_counts(slug: str) -> dict[str, int]:
@@ -2575,6 +2675,7 @@ def rename_board(slug: str, payload: RenameBoardBody):
             executor=payload.executor,
             models=payload.models,
             models_effort=payload.models_effort,
+            auto_model_select=payload.auto_model_select,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

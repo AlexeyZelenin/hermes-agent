@@ -1019,6 +1019,32 @@ def resolve_effort_map(board: Optional[str] = None,
     return merged
 
 
+def auto_model_select_enabled(board: Optional[str] = None) -> bool:
+    """Whether size-based auto model/effort selection is on (default True).
+
+    Precedence: per-board metadata ``auto_model_select`` (a project-level knob
+    when a board is a project) wins; else global config
+    ``kanban.auto_model_select``; else default ON. See
+    :func:`hermes_cli.task_sizing.select_model_and_effort` for the rule it gates
+    and :func:`create_task` for the call site.
+
+    Fails to **False** on a read error so a transient config/metadata failure
+    keeps the current all-default-model behaviour rather than silently guessing
+    a cheaper model onto a task the operator never opted in for."""
+    try:
+        meta = read_board_metadata(board if board else get_current_board())
+        if isinstance(meta, dict) and meta.get("auto_model_select") is not None:
+            return bool(meta.get("auto_model_select"))
+    except Exception:
+        return False
+    try:
+        from hermes_cli.config import load_config
+        kcfg = (load_config() or {}).get("kanban") or {}
+        return bool(kcfg.get("auto_model_select", True))
+    except Exception:
+        return False
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -1084,6 +1110,7 @@ def write_board_metadata(
     models: Optional[dict] = None,
     models_preferred: Optional[dict] = None,
     models_effort: Optional[dict] = None,
+    auto_model_select: Optional[bool] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -1092,6 +1119,10 @@ def write_board_metadata(
     ``models`` merges role-by-role into the existing map; an empty-string
     value clears that role. ``models_preferred`` (the Claude-when-alive
     overlay) and ``models_effort`` merge the same way.
+
+    ``auto_model_select`` is the per-board toggle for size-based model
+    selection (see :func:`auto_model_select_enabled`); ``None`` leaves it
+    unset so the global config default applies.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -1132,6 +1163,8 @@ def write_board_metadata(
             meta.get("models_preferred"), models_preferred)
     if models_effort is not None:
         meta["models_effort"] = _merge_effort_map(meta.get("models_effort"), models_effort)
+    if auto_model_select is not None:
+        meta["auto_model_select"] = bool(auto_model_select)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -3752,6 +3785,47 @@ def create_task(
         (str(user_quotes).strip() or None) if user_quotes is not None else None
     )
 
+    # Size-based auto model/effort selection (task t_36f2761f). Only when the
+    # operator (or project config) pinned NEITHER model nor effort — a manual
+    # choice always wins and is never overwritten. Freezes a cheaper model +
+    # lower effort on small/normal edits so trivial changes stop running on the
+    # most expensive model. ``substantial`` freezes nothing and keeps inheriting
+    # the board default. The verdict is recorded as a ``model_autoselected``
+    # event below so the drawer can show the chosen model and *why*.
+    _autoselect_meta: Optional[dict] = None
+    if (
+        model_override is None
+        and effort_override is None
+        and auto_model_select_enabled(board)
+    ):
+        try:
+            from hermes_cli import task_sizing
+            _sel = task_sizing.select_model_and_effort(
+                title or "",
+                body or "",
+                category,
+                model_map=resolve_model_map(
+                    board, getattr(project_obj, "models", None)
+                ),
+                executor=executor,
+            )
+            if _sel.model:
+                model_override = _sel.model
+            if _sel.effort:
+                effort_override = _sel.effort
+            _autoselect_meta = {
+                "class": _sel.task_class,
+                "role": _sel.role,
+                "model": _sel.model,
+                "display_model": _sel.display_model,
+                "effort": _sel.effort,
+                "supported": _sel.supported,
+                "reason": _sel.reason,
+                "source": "auto",
+            }
+        except Exception as exc:  # never block task creation on selection
+            _log.debug("auto model-select skipped for new task: %s", exc)
+
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
     # invisibly splatter a comma-joined string into one argv slot — the
@@ -4018,6 +4092,13 @@ def create_task(
                         "routed_by_create_gate": True if create_gate_tripped else None,
                     },
                 )
+                # Record the size-based selection so the drawer can show which
+                # model was chosen and why (class + source). Emitted only when
+                # auto-selection actually ran (manual/project pins skip it).
+                if _autoselect_meta is not None:
+                    _append_event(
+                        conn, task_id, "model_autoselected", _autoselect_meta,
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

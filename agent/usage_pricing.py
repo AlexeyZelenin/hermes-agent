@@ -293,6 +293,30 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-05",
     ),
+    # ── Anthropic Claude 5 family ────────────────────────────────────────
+    # Sonnet 5 (released 2026-06-30) is the mid tier the size-based model
+    # selector picks for "normal" tasks (see hermes_cli/task_sizing.py); it
+    # MUST be priced here or those runs count as $0 and the before/after
+    # savings comparison is impossible.  Standard rate $3/$15 per 1M in/out
+    # (cache read 90% off = $0.30; cache write 1.25x = $3.75), matching the
+    # long-standing Sonnet tier.
+    # NOTE: an introductory rate of $2/$10 applies through 2026-08-31; standard
+    # $3/$15 takes effect 2026-09-01. We encode the durable standard rate so
+    # the snapshot stays valid after the promo ends (a short window of slight
+    # over-estimate before then is preferable to a figure that silently goes
+    # stale).  Source: https://platform.claude.com/docs/en/about-claude/pricing
+    (
+        "anthropic",
+        "claude-sonnet-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        cache_write_cost_per_million=Decimal("3.75"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-07",
+    ),
     # ── Anthropic Claude 4 / 4.1 ─────────────────────────────────────────
     (
         "anthropic",
