@@ -351,3 +351,21 @@ def test_ensure_security_review_job_is_idempotent(hermes_env):
     sealed = [j for j in jobs.load_jobs()
               if (j.get("origin") or {}).get("kind") == "sealed-security-review"]
     assert len(sealed) == 1
+
+
+def test_ensure_security_review_job_reheals_missing_runner(hermes_env):
+    import cron.jobs as jobs
+    job = sr.ensure_security_review_job()
+    assert job is not None
+    runner = hermes_env / "scripts" / sr._RUNNER_SCRIPT_NAME
+    # The runner script can be removed by a manual cleanup or rename sweep while
+    # the sealed job persists — the cron would then fail nightly (script not found).
+    runner.unlink()
+    assert not runner.exists()
+    # A subsequent ensure() must rewrite the missing runner, not just short-circuit.
+    again = sr.ensure_security_review_job()
+    assert again["id"] == job["id"]
+    assert runner.exists()
+    sealed = [j for j in jobs.load_jobs()
+              if (j.get("origin") or {}).get("kind") == "sealed-security-review"]
+    assert len(sealed) == 1

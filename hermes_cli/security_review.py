@@ -606,6 +606,19 @@ def _write_runner_script() -> Optional[str]:
         return None
 
 
+def _runner_script_missing() -> bool:
+    """True when the sealed runner script is absent from ``HERMES_HOME/scripts``.
+
+    Errs toward ``False`` (no heal) when the home can't be resolved, so we never
+    write spuriously.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        return not (get_hermes_home() / "scripts" / _RUNNER_SCRIPT_NAME).is_file()
+    except Exception:
+        return False
+
+
 def ensure_security_review_job(*, schedule: str = _DEFAULT_SCHEDULE
                                ) -> Optional[dict[str, Any]]:
     """Idempotently register the sealed security-review cron.
@@ -623,6 +636,13 @@ def ensure_security_review_job(*, schedule: str = _DEFAULT_SCHEDULE
     try:
         for job in cron_jobs.load_jobs():
             if (job.get("origin") or {}).get("kind") == SEALED_JOB_ORIGIN["kind"]:
+                # Self-heal: the sealed job outlives its runner script, which a
+                # manual cleanup or rename sweep can remove. An existing job
+                # short-circuits creation, so without this the script is never
+                # rewritten and the cron rots into a nightly "Script not found"
+                # failure. Rewrite it when it goes missing.
+                if _runner_script_missing():
+                    _write_runner_script()
                 return job
         script = _write_runner_script()
         if script is None:
