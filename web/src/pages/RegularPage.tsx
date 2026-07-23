@@ -50,7 +50,7 @@ function TickerHealth({ registry }: { registry: CronRegistry }) {
       ? `Пульс есть, но тики падают (успех ${formatAge(success_age)})`
       : `Планировщик активен (пульс ${formatAge(heartbeat_age)})`;
   return (
-    <Badge variant={tone} className="gap-1">
+    <Badge tone={tone} className="gap-1">
       {(stale || failing) && <AlertTriangle className="h-3 w-3" />}
       {text}
     </Badge>
@@ -74,16 +74,16 @@ function RegularRow({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className="truncate font-medium">{row.name}</span>
-            <Badge variant="outline" className="shrink-0">
+            <Badge tone="outline" className="shrink-0">
               {row.cadence_badge}
             </Badge>
             {!row.enabled && (
-              <Badge variant="secondary" className="shrink-0">
+              <Badge tone="secondary" className="shrink-0">
                 выкл
               </Badge>
             )}
             {row.anomalies.map((a) => (
-              <Badge key={a.kind} variant="destructive" className="shrink-0 gap-1">
+              <Badge key={a.kind} tone="destructive" className="shrink-0 gap-1">
                 {a.kind === "token_spike" ? (
                   <Zap className="h-3 w-3" />
                 ) : (
@@ -93,7 +93,7 @@ function RegularRow({
               </Badge>
             ))}
           </div>
-          <div className={cn("mt-1 text-sm", themedBody("muted"))}>
+          <div className={cn("mt-1 text-sm text-muted-foreground", themedBody)}>
             <span className={cn(errored && "text-destructive")}>
               {formatTime(row.last_run_at)} · исход: {outcome}
             </span>
@@ -112,7 +112,7 @@ function RegularRow({
           )}
         </div>
         <Button
-          variant={row.enabled ? "outline" : "default"}
+          outlined={row.enabled}
           size="sm"
           disabled={busy}
           onClick={() => onToggle(row)}
@@ -184,18 +184,18 @@ export default function RegularPage() {
         <H2>Регулярные</H2>
         {registry && <TickerHealth registry={registry} />}
       </div>
-      <p className={cn("text-sm", themedBody("muted"))}>
+      <p className={cn("text-sm text-muted-foreground", themedBody)}>
         Служебные процессы системы с ритмом — здоровье и расход токенов за 30 дней. Запланированные
         задачи с датой живут на доске, здесь только стоячие процессы.
       </p>
 
       {groups.length === 0 && (
-        <div className={cn("text-sm", themedBody("muted"))}>Регулярных процессов нет.</div>
+        <div className={cn("text-sm text-muted-foreground", themedBody)}>Регулярных процессов нет.</div>
       )}
 
       {groups.map((group) => (
         <section key={group.purpose} className="flex flex-col gap-2">
-          <h3 className={cn("text-sm font-semibold uppercase tracking-wide", themedBody("muted"))}>
+          <h3 className={cn("text-sm font-semibold uppercase tracking-wide text-muted-foreground", themedBody)}>
             {group.rows[0].purpose_label}
           </h3>
           {group.rows.map((row) => (
@@ -209,7 +209,7 @@ export default function RegularPage() {
         </section>
       ))}
 
-      {toast && <Toast message={toast.message} type={toast.type} />}
+      {toast && <Toast toast={toast} />}
     </div>
   );
 }
